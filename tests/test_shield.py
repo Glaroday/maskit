@@ -4005,7 +4005,9 @@ class TodayStatsTests(unittest.TestCase):
             self.assertEqual(p["clean"], 1)
             self.assertAlmostEqual(p["clean_rate"], 0.25)
             self.assertEqual(p["suffix_reused"], 1)
-            self.assertAlmostEqual(p["reuse_rate"], 0.25)
+            # 分母是 rewritten(3) 不是 masks(4)：那条零改写透传的请求没签发占位符，
+            # 算进分母会把「10 次命中 8 次复用」稀释成 8%。
+            self.assertAlmostEqual(p["reuse_rate"], 1 / 3, places=3)  # 后端 round(x, 4)
             # 均值只基于 62/68 两个有效样本，-1 被排除
             self.assertEqual(p["diff_samples"], 2)
             self.assertAlmostEqual(p["avg_first_diff"], 65.0)
@@ -4039,6 +4041,41 @@ class TodayStatsTests(unittest.TestCase):
             event_store.append_event({"type": "MASK", "ts": now, "count": 3, "host": "legacy"})
             self.assertIsNone(event_store.today_stats(now=now)["prefix"])
             self.assertIsNone(event_store.stats_range(days=7, now=now)["prefix"])
+        finally:
+            event_store._reset_writer()
+            for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            event_store.DB_PATH = old_db
+
+    def test_prefix_stats_reuse_rate_is_none_without_rewrites(self):
+        """复用率的分母是「改写过的请求」，一个占位符都没签发时给 None 而不是 0%。
+
+        零改写透传的请求没有命中、不会调 `_remember`，suffix_reused 恒为 False ——
+        把它们算进分母会把指标稀释：100 次请求 10 次命中、8 次复用，用 masks 当
+        分母显示 8%，真实是 80%，用户会据此误判「复用机制没生效」。
+        同理 `reuse_rate` 为 None 与为 0 是两件事：前者是「没签发占位符」，
+        后者是「签发了但全是新 token」，对缓存的含义完全相反。
+        """
+        import tempfile
+        old_db = event_store.DB_PATH
+        tmp = Path(tempfile.mkdtemp()) / "prefix-reuse.sqlite3"
+        event_store.DB_PATH = tmp
+        event_store._reset_writer()
+        try:
+            event_store.init_db()
+            now = time.time()
+            for _ in range(3):
+                event_store.append_event({"type": "MASK", "ts": now, "count": 0,
+                                          "body_rewritten": False, "first_diff_byte": -1})
+            p = event_store.today_stats(now=now)["prefix"]
+            self.assertEqual(p["masks"], 3)
+            self.assertEqual(p["rewritten"], 0)
+            self.assertAlmostEqual(p["clean_rate"], 1.0)
+            self.assertIsNone(p["reuse_rate"], "没签发票据时不能报 0%，那是另一种含义")
+            self.assertIsNone(p["avg_first_diff"])
         finally:
             event_store._reset_writer()
             for p in [tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")]:

@@ -466,9 +466,11 @@ export default function Dashboard() {
           suffix_reused）的聚合，用来回答「上游缓存命中率掉了，是我们改了请求
           字节还是上游自己 miss」。刻意**不塞进上面那个 6 卡网格**——它的列数
           （2/3/6）是按 6 张卡调过的，第 7 张在 ≥1536px 宽屏上会单独落一行。
-          前两列分母是 masks（全部样本）；第三列分母是 rewritten（改写过的请求）
-          ——`first_diff_byte` 只在回写分支才算，零改写透传的请求本来就没有差异
-          位，用 masks 当分母会把「全部零改写」显示成缺样本。
+          第一列分母是 masks（全部样本）；第二、三列分母是 rewritten（改写过的
+          请求）——`suffix_reused` 与 `first_diff_byte` 都只在回写分支才有意义，
+          零改写透传的请求没签发票据、也没有差异位，用 masks 当分母会把指标
+          稀释成「复用机制没生效」（实测 100 次请求 10 次命中、8 次复用，
+          用 masks 显示 8%，真实是 80%）。
           `prefix` 为 null 时按 mask_events 区分两种「没有数据」：区间内压根没
           请求 vs 有请求但都早于该统计上线（升级当天就是后者，不能说成「脱敏
           没生效」）。 */}
@@ -505,11 +507,13 @@ export default function Dashboard() {
             <div className="min-w-0">
               <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixReuse')}</div>
               <div className="text-[20px] font-bold leading-tight tabular-nums">
-                {prefix ? `${(prefix.reuse_rate * 100).toFixed(1)}%` : '—'}
+                {prefix?.reuse_rate != null ? `${(prefix.reuse_rate * 100).toFixed(1)}%` : '—'}
               </div>
-              <div className="truncate text-[11px] text-muted-foreground/80">
+              <div className="truncate text-[11px] text-muted-foreground/80" title={t('dash.prefixReuseHint')}>
                 {prefix
-                  ? `${prefix.suffix_reused.toLocaleString()} / ${prefix.masks.toLocaleString()}`
+                  ? prefix.rewritten > 0
+                    ? `${prefix.suffix_reused.toLocaleString()} / ${prefix.rewritten.toLocaleString()}`
+                    : t('dash.prefixNoPlaceholder')
                   : '—'}
               </div>
             </div>

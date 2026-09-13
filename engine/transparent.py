@@ -717,7 +717,8 @@ def _connstr_ok(orig: str, m=None, text: str = "") -> bool:
       · 豁免本身还会**放走下游规则**：CONNSTR 让路后排在后面的 EMAIL 规则会把
         「口令尾@host」整段当邮箱吃掉，输出 `postgres://app:Xk9${{EMAIL_x}}:5432/prod`
         —— 看着有占位符、实际口令前半截明文上行，最危险的一类。
-        由 mask() 里的 `exempt_conn` 集合负责避让，两处必须成对修改。
+        由 mask() / 扫描路径里的 `exempt_conn` 区间列表负责避让，两处必须成对修改
+        （判据见 `_overlaps_exempt_conn`：只跳过**与豁免区间重叠**的 EMAIL 命中）。
     """
     if not isinstance(orig, str) or not orig:
         return False
@@ -772,20 +773,32 @@ def _connstr_ok(orig: str, m=None, text: str = "") -> bool:
     return True
 
 
-def _starts_with_exempt_conn(text: str, pos: int, exempt) -> bool:
-    """pos 之前是否正好以某条「被豁免的连接串」结尾（即该命中其实是 URL 的 userinfo）。
+def _overlaps_exempt_conn(start: int, end: int, spans) -> bool:
+    """EMAIL 命中 [start, end) 是否与被豁免的连接串**重叠**。
 
-    被豁免的连接串原文不会被任何规则改写，所以在当前 text 里仍逐字存在；
-    它的结尾就是 `@`，邮箱命中的起点紧接其后。不做这层避让的话，EMAIL 规则会把
-    「口令尾@host」当邮箱吃掉，留下口令前半截明文（见 _connstr_ok 注释）。
+    为什么判「重叠」而不是「紧接其后」（2026-09-13 修正）：
+    连接串的 CONNSTR 命中止于 userinfo 结尾的 `@`（host/port 在 `m.end()` 之后由
+    `_connstr_authority` 单独解析），所以真正需要避让的 EMAIL 命中是**起点落在豁免
+    串内部**的那些——它们才是「口令尾@host」，脱掉一半会留半截口令明文。
+    而「起点正好在豁免串之后」的 EMAIL 命中是**独立的真实邮箱**（例如
+    `redis://default:{password}@zhang.san@example.com:6379` 里那个 `@example.com`
+    主机名形式的邮箱），把它一起跳掉等于新增一条漏检：实测 guard 开着时该邮箱
+    明文上行，关掉才被正常脱敏。
+
+    ⚠️ 判据必须是重叠、不能只看「前一个字符是不是 `@`」：后者既挡不住口令尾
+    （口令在 `@` 之前，前一个是 `:`），又会误伤紧跟其后的真实邮箱。
+    把本函数整体改成 `return False` 时 660 个用例仍全过 —— 说明它此前**没有任何
+    用例保护**，改这里务必同步补用例。
+
+    `spans` 由 finditer 顺序追加，天然按 start 递增且互不重叠，故一旦
+    `s_start >= end` 即可提前结束。
     """
-    # 豁免连接串恒以 `@` 结尾且邮箱起点紧接其后。若 pos 前一个字符不是 `@`，
-    # 绝不可能紧跟在任何豁免连接串后，直接 O(1) 短路，免去遍历 exempt 集合。
-    if not exempt or pos == 0 or text[pos - 1] != "@":
+    if not spans:
         return False
-    for s in exempt:
-        p = pos - len(s)
-        if p >= 0 and text.startswith(s, p):
+    for s_start, s_end in spans:
+        if s_start >= end:
+            break
+        if start < s_end and end > s_start:
             return True
     return False
 
@@ -2329,9 +2342,10 @@ def mask(text, sid):
             return fwd.get(orig_key, word)
         text = _mask_excluding_placeholders(text, cw_rx, _cw_sub)
 
-    # 被豁免的连接串原文（含结尾 `@`）：CONNSTR 排在 EMAIL 之前，本集合用于让 EMAIL
-    # 避开这些 userinfo 段，否则「口令尾@host」会被当邮箱吃掉、留下口令半明文。
-    exempt_conn = set()
+    # 被豁免的连接串**区间** [start, end)（end 即 userinfo 结尾的 `@` 之后）：
+    # RULES 里 CONNSTR 排在 EMAIL 之前，本列表用于让 EMAIL 避开与这些区间重叠的
+    # 命中，否则「口令尾@host」会被当邮箱吃掉、留下口令半明文。
+    exempt_conn = []
 
     for rx, label, group_idx in RULES:
         if not _rule_enabled(label):
@@ -2356,12 +2370,12 @@ def mask(text, sid):
             if label == "JWT" and not _jwt_ok(orig):
                 continue
             if label == "CONNSTR" and not _connstr_ok(orig, m, text):
-                # 记下被豁免的原文：CONNSTR 排在 EMAIL 之前，下面必须让 EMAIL 避开
-                # 这段 userinfo，否则「口令尾@host」会被当邮箱吃掉留下半明文。
+                # 记下被豁免的区间：CONNSTR 排在 EMAIL 之前，下面必须让 EMAIL 避开
+                # 与它重叠的命中，否则「口令尾@host」会被当邮箱吃掉留下半明文。
                 if len(exempt_conn) < _CONNSTR_EXEMPT_MAX:
-                    exempt_conn.add(m.group(0))
+                    exempt_conn.append((m.start(), m.end()))
                 continue
-            if label == "EMAIL" and _starts_with_exempt_conn(text, m.start(), exempt_conn):
+            if label == "EMAIL" and _overlaps_exempt_conn(m.start(), m.end(), exempt_conn):
                 continue
             _hit(orig, label)
             matched.append(orig)
@@ -2729,6 +2743,18 @@ def _first_diff_byte(a, b):
 # 耗时随差异位置后移暴涨（1MB/最末 14.5ms、8MB 173ms），跟着放宽等于给热路径加
 # 100ms+。后果：>1MB 的请求 splice 生效但 `first_diff_byte` 记 -1，仪表盘
 # 「平均首个差异字节」样本数为 0 —— **已知口径，不是 bug**，别重复排查。
+#
+# `_SPLICE_MAX_FORMS = 64` 是**另一条独立的退回线**：本次请求里被脱敏的**唯一原文**
+# 数上限（每个原文按「原字符 / \uXXXX」两种合法 JSON 写法各建一条交替分支，
+# 所以 64 个原文 ≈ 128 个分支）。超了 `_splice_mask` 直接返回 None，同样退回整棵
+# 重序列化 → 前缀又被改，首个差异位回到 body 开头附近。
+#   · 谁会踩到：一次性批量提交客户名单、导出日志这类「一个请求里几十上百个不同
+#     敏感值」的场景；日常对话远远到不了。
+#   · 为什么是 64：实测唯一值 1 → 64 个耗时只差 2 倍，不是分支数的线性放大，
+#     取 64 是「够用且不放大」的折中。要放宽得先补测 128 / 256 —— 别拍脑袋改。
+#   · 诊断方式：这类请求 `body_rewritten=true` 但 `first_diff_byte` **明显早于敏感值
+#     在 body 里的真实位置**（客户端用带空格排版时约在 byte 9），而 splice 生效时
+#     差异位正好落在敏感值上 —— 两者对照一眼可辨。
 _SPLICE_MAX = 8 << 20
 _SPLICE_MAX_FORMS = 64
 
@@ -3862,9 +3888,9 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
         if len(body) > _SCAN_BODY_MAX:
             body = body[:_SCAN_BODY_MAX]
         found = {}
-        # 与 mask() 同款避让：被豁免的连接串 userinfo 段不许 EMAIL 规则二次命中，
+        # 与 mask() 同款避让：被豁免的连接串区间不许 EMAIL 规则二次命中，
         # 否则模型复述的模板会被误报成「发现邮箱」（此处只影响告警，不改文本）。
-        exempt_conn = set()
+        exempt_conn = []
         for rx, label, gidx in RULES:
             if not _rule_enabled(label):
                 continue
@@ -3886,9 +3912,9 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
                     continue
                 if label == "CONNSTR" and not _connstr_ok(orig, m, body):
                     if len(exempt_conn) < _CONNSTR_EXEMPT_MAX:
-                        exempt_conn.add(m.group(0))
+                        exempt_conn.append((m.start(), m.end()))
                     continue
-                if label == "EMAIL" and _starts_with_exempt_conn(body, m.start(), exempt_conn):
+                if label == "EMAIL" and _overlaps_exempt_conn(m.start(), m.end(), exempt_conn):
                     continue
                 if orig in fwd:
                     continue  # 本会话脱敏还原回来的值，跳过

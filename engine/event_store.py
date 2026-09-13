@@ -1452,8 +1452,11 @@ def _prefix_payload(masks, rewritten, reused, diff_sum, diff_n):
 
     clean_rate：`body_rewritten=false` 的占比，即请求体一个字节都没被改动的比例。
     这正是上游 Prompt Cache 能命中的前提，也是这张卡的主指标。
-    reuse_rate：命中的占位符里沿用了复用表旧 token 的比例（全为新签 → 上游前缀
-    必然从这个位置起失效）。
+    reuse_rate：在**改写过的请求**里，沿用了复用表旧 token 的比例（全为新签 → 上游
+    前缀必然从这个位置起失效）。分母是 rewritten 不是 masks：零改写透传的请求一个
+    敏感词都没命中，压根没签发占位符，算进分母只会把指标稀释（实测：100 次请求
+    10 次有命中、8 次复用，用 masks 当分母显示 8%，真实是 80%）。
+    rewritten=0 时为 None —— 一个占位符都没签发，比率无从谈起，前端显示「—」。
     avg_first_diff：回写后与客户端原始字节首个差异位置的平均值，越小说明前缀被
     改动得越靠前、越伤缓存；样本全被上限挡掉（first_diff_byte=-1）时为 None，
     此时 diff_samples 为 0（前端把它和 masks 一起显示，避免「均值看着很好、
@@ -1471,7 +1474,9 @@ def _prefix_payload(masks, rewritten, reused, diff_sum, diff_n):
         "clean": masks - rewritten,
         "clean_rate": round((masks - rewritten) / masks, 4),
         "suffix_reused": reused,
-        "reuse_rate": round(reused / masks, 4),
+        # 分母用 rewritten：没签发票据的请求不可能「复用」，算进来只会稀释。
+        # reused ≤ rewritten 恒成立（复用发生在 _remember 里，而它只在有命中时调用）。
+        "reuse_rate": round(reused / rewritten, 4) if rewritten > 0 else None,
         "avg_first_diff": round(int(diff_sum or 0) / n, 1) if n > 0 else None,
         "diff_samples": n,
     }

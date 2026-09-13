@@ -4861,6 +4861,7 @@ class CoreChineseValidationTests(unittest.TestCase):
             masked = tr.mask(text, sid)
             self.assertEqual(masked, text, f"文档模板不应被脱敏：{masked}")
             self.assertNotIn("{{EMAIL_", masked, f"豁免段不得被 EMAIL 二次命中：{masked}")
+
             self.assertNotIn("{{CONNSTR_", masked, f"不应签发 CONNSTR：{masked}")
 
         # --- 同一 token 里的真实邮箱仍须脱敏（避让不能误伤邻居） ---
@@ -4872,6 +4873,43 @@ class CoreChineseValidationTests(unittest.TestCase):
         self.assertNotIn("zhang.san", masked_mixed, f"相邻真实邮箱必须脱敏：{masked_mixed}")
         self.assertIn("{{EMAIL_", masked_mixed, f"邮箱应签发 EMAIL 占位符：{masked_mixed}")
         self.assertEqual(tr.restore(masked_mixed, sid_mixed), mixed)
+
+    def test_connstr_guard_must_not_skip_real_email_after_exempt_conn(self):
+        """EMAIL 避让只能跳过**与豁免区间重叠**的命中，不能跳过紧随其后的真实邮箱。
+
+        `_starts_with_exempt_conn` 原本判「EMAIL 命中紧接在被豁免连接串之后」，
+        实测后果是：连接串的主机名本身是邮箱时（`redis://default:{password}@`
+        + `zhang.san@example.com`），那个**真实邮箱被整段跳过、明文上行**（2026-09-13
+        由用户探针发现）。而它想防的「EMAIL 吃掉口令尾」起点在 `@` 之前，用
+        「紧接其后」根本挡不到 —— 判据与意图是错位的。
+
+        现改为 `_overlaps_exempt_conn`：只跳过与豁免区间**重叠**的命中。
+        本用例双向锁死；该函数此前零用例覆盖（整体改成 return False 时 660 项仍全过）。
+        """
+        # --- 方向一：豁免连接串之后的真实邮箱必须脱敏（此前漏检） ---
+        cases = [
+            "redis://default:{password}@zhang.san@example.com:6379/0",
+            "mysql://user:" + "pass" + "@zhang.san@example.com:3306/db",
+            "https://user:{PORT}@zhang.san@example.com/app",
+        ]
+        mail = "zhang.san@example.com"
+        for idx, text in enumerate(cases):
+            sid = f"conn-guard-{idx}"
+            tr._new_session(sid)
+            masked = tr.mask(text, sid)
+            self.assertNotIn(mail, masked, f"[{idx}] 真实邮箱不得明文上行：{masked}")
+            self.assertIn("{{EMAIL_", masked, f"[{idx}] 真实邮箱应被 EMAIL 脱敏：{masked}")
+            # 连接串本体仍按豁免处理（模板密码不该被 CONNSTR 改写）
+            self.assertNotIn("{{CONNSTR_", masked, f"[{idx}] 模板连接串仍应豁免：{masked}")
+            self.assertEqual(tr.restore(masked, sid), text, f"[{idx}] 还原必须一致")
+
+        # --- 方向二：判据是「重叠」，不是「紧接其后」 ---
+        self.assertTrue(tr._overlaps_exempt_conn(5, 10, [(0, 8)]), "起点落在豁免区间内 = 重叠")
+        self.assertTrue(tr._overlaps_exempt_conn(0, 30, [(5, 8)]), "豁免区间被整体包含 = 重叠")
+        self.assertFalse(tr._overlaps_exempt_conn(8, 20, [(0, 8)]), "紧接其后不算重叠，不得跳过")
+        self.assertFalse(tr._overlaps_exempt_conn(20, 30, [(0, 8)]), "完全在其后不算重叠")
+        self.assertFalse(tr._overlaps_exempt_conn(0, 5, [(8, 12)]), "完全在其前不算重叠")
+        self.assertFalse(tr._overlaps_exempt_conn(3, 7, []), "空区间恒不重叠")
 
     def test_email_underscore_local_part_not_dropped(self):
         """EMAIL 回归（2026-09 复审）：本地部分以下划线开头必须照常脱敏。

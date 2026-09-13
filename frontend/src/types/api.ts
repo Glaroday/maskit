@@ -170,8 +170,10 @@ export interface LogDetailResponse {
  * 前缀保真度：MASK 事件三个诊断字段的聚合（engine/event_store._prefix_payload）。
  *
  * 回答「上游 Prompt Cache 命中率归零，是我们改了请求字节还是上游自己 miss」——
- * clean_rate 就是请求体一个字节都没被改动的比例，reuse_rate 是占位符沿用旧
- * token 的比例，avg_first_diff 是回写后与客户端原始字节首个差异位置的平均值。
+ * clean_rate 是请求体一个字节都没被改动的比例（分母 masks），reuse_rate 是
+ * **在改写过的请求里**沿用复用表旧 token 的比例（分母 rewritten —— 零改写透传的
+ * 请求没签发票据，算进来只会稀释），avg_first_diff 是回写后与客户端原始字节首个
+ * 差异位置的平均值。
  */
 export interface PrefixStats {
   /** 区间内 MASK 事件数（分母） */
@@ -184,8 +186,8 @@ export interface PrefixStats {
   clean_rate: number
   /** 命中占位符沿用复用表旧 token 的次数 */
   suffix_reused: number
-  /** 占位符复用占比（0~1） */
-  reuse_rate: number
+  /** 占位符复用占比（0~1，分母是 rewritten）；区间内无回写请求时为 null */
+  reuse_rate: number | null
   /** 首个差异字节均值；样本全被上限挡掉时为 null */
   avg_first_diff: number | null
   /** 计入 avg_first_diff 的样本数（0 表示均值不可用） */
