@@ -1,3 +1,11 @@
+# 本地可视化预览与测试辅助工具
+preview.bat
+preview.ps1
+scripts/preview-env.py
+scripts/preview_env.py
+scripts/seed-mock-data.py
+scripts/seed_mock_data.py
+
 # Python
 __pycache__/
 *.py[cod]

@@ -11,7 +11,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useVisibility } from '@/lib/useVisibility'
 import { getStatsHistory, getTodayStats, getStatsModels, getPriceSyncStatus, type StatsHistoryPoint } from '@/api/settings'
 import { BarChart3, TrendingUp, Coins, ShieldCheck, ShieldAlert, RotateCcw, Layers, Trophy, Tags, LockKeyhole } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, formatCompactNumber, formatTokensShort } from '@/lib/utils'
 import { CRED_LABELS, maskWord } from '@/lib/sensitive-word'
 import { useI18n } from '@/lib/i18n'
 import dayjs from 'dayjs'
@@ -19,6 +19,7 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { ShareCard } from '@/components/stats/ShareCard'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 
 type Granularity = 'day' | 'hour'
 
@@ -123,8 +124,8 @@ export default function StatsPage() {
         {isFetching && <span className="ml-auto text-xs text-muted-foreground">{t('stats.refreshing')}</span>}
       </div>
 
-      {/* 汇总数字卡片 */}
-      <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+      {/* 汇总数字卡片：以 4 列封顶两行排布（4+3），彻底避免 7 列挤压爆框 */}
+      <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-4">
         <SummaryCard icon={Layers} label={t('stats.totalReq')} value={totals.requests} color="#3b82f6" bg="from-blue-500/15 to-blue-500/5" />
         <SummaryCard icon={ShieldCheck} label={t('stats.totalMasked')} value={totals.mask} color="#10b981" bg="from-emerald-500/15 to-emerald-500/5" />
         <SummaryCard icon={RotateCcw} label={t('stats.totalRestored')} value={totals.restored} color="#8b5cf6" bg="from-violet-500/15 to-violet-500/5" />
@@ -236,9 +237,12 @@ function ModelRanking({ hidden }: { hidden: boolean }) {
         <>
           {/* 顶部合计 */}
           <div className="mb-4 flex flex-wrap items-center gap-2">
-            <span className="rounded-lg border bg-muted/30 px-2.5 py-1 text-xs text-muted-foreground">
+            <span
+              className="rounded-lg border bg-muted/30 px-2.5 py-1 text-xs text-muted-foreground"
+              title={`${t('stats.tokens')}: ${totalTokens.toLocaleString()}`}
+            >
               {tf('stats.modelSummary', { n: models.length, r: totalReq.toLocaleString() })}
-              {t('stats.tokens')} {totalTokens.toLocaleString()}
+              {t('stats.tokens')} {formatTokensShort(totalTokens, t('stats.unitSystem') === 'si' ? 'si' : 'cjk')}
             </span>
             <span
               className={cn(
@@ -303,7 +307,10 @@ function ModelRanking({ hidden }: { hidden: boolean }) {
                         ) : null}
                       </div>
                       <span className="shrink-0 text-[11px] text-muted-foreground">
-                        {m.requests.toLocaleString()} {t('stats.timesSuffix')} · {(toks / 1000).toFixed(1)}k {t('stats.tokens')}
+                        {m.requests.toLocaleString()} {t('stats.timesSuffix')} ·{' '}
+                        <span title={`${toks.toLocaleString()} ${t('stats.tokens')}`}>
+                          {formatTokensShort(toks, t('stats.unitSystem') === 'si' ? 'si' : 'cjk')} {t('stats.tokens')}
+                        </span>
                         {m.priced
                           ? <b className="ml-1.5 text-emerald-600 dark:text-emerald-400">${(m.cost_usd ?? 0).toFixed(3)}</b>
                           : <span className="ml-1.5 text-muted-foreground/60">{t('stats.unpriced')}</span>}
@@ -530,8 +537,22 @@ function RankCard({
   )
 }
 
-/** 汇总数字卡片 */
+/** 汇总数字卡片：大数字自动缩写进位，并提供悬停 Tooltip 显示精确原值 */
 function SummaryCard({ icon: Icon, label, value, color, bg }: { icon: typeof Layers; label: string; value: number | string; color: string; bg: string }) {
+  const { t } = useI18n()
+  const unitSystem = t('stats.unitSystem') === 'si' ? 'si' : 'cjk'
+  const { compact, full, isCompact } = formatCompactNumber(value, unitSystem)
+
+  const numElement = (
+    <div
+      className="mt-3 text-2xl font-bold tabular-nums tracking-tight truncate"
+      style={{ color }}
+      title={full}
+    >
+      {compact}
+    </div>
+  )
+
   return (
     <div className="flex flex-col rounded-xl border bg-card p-4 shadow-[var(--shadow-card)] transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow-card-hover)]">
       <div className="flex items-center justify-between">
@@ -540,9 +561,20 @@ function SummaryCard({ icon: Icon, label, value, color, bg }: { icon: typeof Lay
           <Icon className="h-4 w-4" style={{ color }} />
         </div>
       </div>
-      <div className="mt-3 text-2xl font-bold tabular-nums tracking-tight" style={{ color }}>
-        {value.toLocaleString()}
-      </div>
+      {isCompact ? (
+        <TooltipProvider delayDuration={150}>
+          <Tooltip>
+            <TooltipTrigger asChild className="cursor-default">
+              {numElement}
+            </TooltipTrigger>
+            <TooltipContent>
+              <p className="font-mono text-xs">{full}</p>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      ) : (
+        numElement
+      )}
     </div>
   )
 }

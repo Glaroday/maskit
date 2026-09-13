@@ -5288,7 +5288,7 @@ def serve_spa(path):
 def open_browser():
     import time as _t
     _t.sleep(1.2)
-    webbrowser.open(f"http://127.0.0.1:{PANEL_PORT}")
+    webbrowser.open(f"http://127.0.0.1:{PANEL_PORT}/#token={API_TOKEN}")
 
 
 # ========== 开机自启 ==========

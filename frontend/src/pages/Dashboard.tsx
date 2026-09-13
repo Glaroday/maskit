@@ -43,7 +43,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { cn } from '@/lib/utils'
+import { cn, formatCompactNumber, formatTokensShort } from '@/lib/utils'
 import { CRED_LABELS, maskWord } from '@/lib/sensitive-word'
 import { toast } from '@/lib/toast'
 import { useI18n } from '@/lib/i18n'
@@ -205,28 +205,51 @@ export default function Dashboard() {
     todayCostModels.length > 0 && todayPricedCount === 0
   const todayCostReady = Boolean(costData)
 
+  const unitSystem = t('stats.unitSystem') === 'si' ? 'si' : 'cjk'
+  const reqNum = formatCompactNumber(stats?.requests ?? 0, unitSystem)
+  const maskNum = formatCompactNumber(stats?.mask_events ?? 0, unitSystem)
+  const restoreNum = formatCompactNumber(stats?.restored ?? 0, unitSystem)
+  const alertNum = formatCompactNumber(stats?.alerts ?? 0, unitSystem)
+  const tokenNum = formatCompactNumber(tokensTotal, unitSystem)
+
   // 6 张统计卡（i18n）
   const statCards = [
     {
-      label: t('dash.reqToday'), value: (stats?.requests ?? 0).toLocaleString(), hint: t('dash.reqHint'),
+      label: t('dash.reqToday'),
+      value: reqNum.compact,
+      fullValue: reqNum.full,
+      isCompact: reqNum.isCompact,
+      hint: t('dash.reqHint'),
       icon: Activity, num: 'text-blue-600 dark:text-blue-400',
       iconBg: 'from-blue-500/15 to-blue-500/5 text-blue-600 dark:text-blue-400',
       to: '/logs',
     },
     {
-      label: t('dash.maskedReq'), value: (stats?.mask_events ?? 0).toLocaleString(), hint: `${t('dash.maskedHint')} ${(stats?.masked_items ?? 0).toLocaleString()}`,
+      label: t('dash.maskedReq'),
+      value: maskNum.compact,
+      fullValue: maskNum.full,
+      isCompact: maskNum.isCompact,
+      hint: `${t('dash.maskedHint')} ${formatTokensShort(stats?.masked_items ?? 0, unitSystem)}`,
+      hintTitle: `${t('dash.maskedHint')} ${(stats?.masked_items ?? 0).toLocaleString()}`,
       icon: Shield, num: 'text-emerald-600 dark:text-emerald-400',
       iconBg: 'from-emerald-500/15 to-emerald-500/5 text-emerald-600 dark:text-emerald-400',
       onClick: () => setMaskedOpen(true),
     },
     {
-      label: t('dash.restored'), value: (stats?.restored ?? 0).toLocaleString(), hint: t('dash.restoredHint'),
+      label: t('dash.restored'),
+      value: restoreNum.compact,
+      fullValue: restoreNum.full,
+      isCompact: restoreNum.isCompact,
+      hint: t('dash.restoredHint'),
       icon: ShieldCheck, num: 'text-emerald-600 dark:text-emerald-400',
       iconBg: 'from-teal-500/15 to-teal-500/5 text-teal-600 dark:text-teal-400',
       onClick: () => setRestoredOpen(true),
     },
     {
-      label: t('dash.alerts'), value: (stats?.alerts ?? 0).toLocaleString(),
+      label: t('dash.alerts'),
+      value: alertNum.compact,
+      fullValue: alertNum.full,
+      isCompact: alertNum.isCompact,
       sub: [
         { label: t('dash.blocked'), value: ((stats as Record<string, unknown> | undefined)?.by_type as Record<string, {events:number}> | undefined)?.BLOCK?.events ?? 0 },
         { label: t('dash.restoreFail'), value: stats?.restore_failed ?? 0 },
@@ -238,8 +261,12 @@ export default function Dashboard() {
       to: '/logs',
     },
     {
-      label: t('dash.tokenToday'), value: tokensTotal.toLocaleString(),
-      hint: `${t('dash.tokenHint')} ${(stats?.tokens.prompt ?? 0).toLocaleString()} · ${(stats?.tokens.completion ?? 0).toLocaleString()}`,
+      label: t('dash.tokenToday'),
+      value: tokenNum.compact,
+      fullValue: tokenNum.full,
+      isCompact: tokenNum.isCompact,
+      hint: `${t('dash.tokenHint')} ${formatTokensShort(stats?.tokens.prompt ?? 0, unitSystem)} · ${formatTokensShort(stats?.tokens.completion ?? 0, unitSystem)}`,
+      hintTitle: `${t('dash.tokenHint')} ${(stats?.tokens.prompt ?? 0).toLocaleString()} · ${(stats?.tokens.completion ?? 0).toLocaleString()}`,
       icon: Zap, num: 'text-violet-600 dark:text-violet-400',
       iconBg: 'from-violet-500/15 to-violet-500/5 text-violet-600 dark:text-violet-400',
       to: '/stats',
@@ -412,8 +439,8 @@ export default function Dashboard() {
           ))}
         </div>
       </div>
-      {/* 6 卡：2-3 列为主，宽屏(≥1536px)才一行六列，避免 1280-1440 屏拥挤 */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
+      {/* 6 卡：2-3 列为主，配合 max-w-[1200px] 容器保持 3 列两行优雅呈现 */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {statCards.map((c) => {
           const interactive = !!(c.to || c.onClick)
           const card = (
@@ -439,8 +466,24 @@ export default function Dashboard() {
                     <c.icon className="h-[18px] w-[18px]" />
                   </div>
                 </div>
-                <div className={cn('mt-2.5 mb-2 text-[28px] font-bold leading-tight tabular-nums tracking-tight', c.num)}>
-                  {c.value}
+                <div
+                  className={cn('mt-2.5 mb-2 text-[28px] font-bold leading-tight tabular-nums tracking-tight truncate', c.num)}
+                  title={c.fullValue || c.value}
+                >
+                  {c.isCompact ? (
+                    <TooltipProvider delayDuration={150}>
+                      <Tooltip>
+                        <TooltipTrigger asChild className="cursor-default">
+                          <span>{c.value}</span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p className="font-mono text-xs">{c.fullValue}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  ) : (
+                    c.value
+                  )}
                 </div>
                 {c.sub ? (
                   <div className="mt-auto grid grid-cols-2 gap-x-2 gap-y-0.5 border-t pt-2 text-xs text-muted-foreground" style={{ minHeight: 44 }}>
@@ -451,7 +494,7 @@ export default function Dashboard() {
                     ))}
                   </div>
                 ) : (
-                  <p className="mt-auto border-t pt-2 text-[11px] font-medium text-muted-foreground/80" style={{ minHeight: 44 }}>{c.hint}</p>
+                  <p className="mt-auto border-t pt-2 text-[11px] font-medium text-muted-foreground/80 truncate" style={{ minHeight: 44 }} title={c.hintTitle || c.hint}>{c.hint}</p>
                 )}
               </CardContent>
             </Card>

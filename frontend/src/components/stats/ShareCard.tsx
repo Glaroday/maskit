@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/dialog'
 import { toast } from '@/lib/toast'
 import { useI18n } from '@/lib/i18n'
+import { formatCompactNumber } from '@/lib/utils'
 
 interface Highlights {
   ok: boolean
@@ -48,15 +49,8 @@ const PERIODS = [
 ]
 
 function fmt(n: number): string {
-  const trim = (x: number) => x.toFixed(1).replace(/\.0$/, '')
-  if (ttf('stats.unitSystem') === 'cjk') {
-    if (n >= 100_000_000) return trim(n / 100_000_000) + ttf('stats.numUnit')
-    if (n >= 10_000) return trim(n / 10_000) + ttf('stats.tenThousandUnit')
-    return n.toLocaleString('zh-CN')
-  }
-  if (n >= 1_000_000_000) return trim(n / 1e9) + 'B'
-  if (n >= 1_000_000) return trim(n / 1e6) + 'M'
-  return n.toLocaleString('en-US')
+  const unitSystem = ttf('stats.unitSystem') === 'si' ? 'si' : 'cjk'
+  return formatCompactNumber(n, unitSystem, 10_000).compact
 }
 
 export function ShareCard() {
@@ -210,8 +204,17 @@ function draw(cv: HTMLCanvasElement, d: Highlights, days: number, t: (k: string)
 
   // 主数字**不缩写**：49,413 比「4.9 万」更有冲击力，也更像真实数据。
   // 副统计仍用 fmt 缩写，否则三个长数字会互相挤。
+  // 动态字号：超长数字动态缩小（76px -> 66px -> 56px -> 46px），确保不超出 800px 画布边界
   const main = d.masked_items.toLocaleString('zh-CN')
-  g.font = `700 76px ${FONT}`
+  let fontSize = 76
+  if (main.length >= 13) {
+    fontSize = 46
+  } else if (main.length >= 10) {
+    fontSize = 56
+  } else if (main.length >= 8) {
+    fontSize = 66
+  }
+  g.font = `700 ${fontSize}px ${FONT}`
   const grad = g.createLinearGradient(56, 190, 560, 260)
   grad.addColorStop(0, '#a5b4fc')
   grad.addColorStop(1, '#22d3ee')
