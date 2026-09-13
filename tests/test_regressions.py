@@ -622,6 +622,40 @@ class PromptCacheByteFidelityTests(unittest.TestCase):
         self.assertEqual(json.loads(out), masked_root, "大 body 的替换结果也必须过等价校验")
         self.assertNotIn("张三", out.decode("utf-8"), "原文泄漏")
 
+    def test_many_unique_originals_still_use_byte_splice(self):
+        """单请求命中 64+ 个不同原文（>旧 64 上限）仍必须走字节级替换。
+
+        `_SPLICE_MAX_FORMS` 2026-09-13 由 64 提到 128：8MB body 下 splice 生效耗时
+        与退路 dumps 同价（32 分支 21ms / 128 分支 23ms / 256 分支 27ms vs 22ms），
+        退回不省时间、只丢前缀保真，所以把日常长会话（几十个敏感值）挡在线外没有
+        任何收益。本用例构造 40 个不同中文原文（≈80 分支 > 旧 64 上限）锁住新档位；
+        同时验证 splice 生效/退回两种路径的还原都正确 —— 上限只影响写回方式，
+        不影响脱敏与还原（还原只看占位符→rev）。
+        """
+        # 词表本身也要有 40 个词才能命中 40 个不同原文
+        origins = [f"客户{chr(0x4e00 + i)}号" for i in range(40)]
+        tr.CUSTOM_WORDS.update({o: "CUSTOMER" for o in origins})
+        tr._CUSTOM_WORD_RX_CACHE.clear()
+        body_obj = {"model": "m", "messages": [{"role": "user", "content": " | ".join(origins)}]}
+        payload = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+        sid = "many-uniq"
+        tr._new_session(sid)
+        masked_root = json.loads(payload.decode("utf-8"))
+        masked_root["messages"][0]["content"] = tr.mask(" | ".join(origins), sid)
+        pairs = dict(tr.sessions[sid]["fwd"])
+        out = tr._splice_mask(payload, masked_root, pairs)
+        self.assertIsNotNone(
+            out, "80 分支被 _SPLICE_MAX_FORMS 挡在门外（长会话拿不到前缀保真）")
+        self.assertEqual(json.loads(out), masked_root, "大分支数的替换结果必须过等价校验")
+        for o in origins:
+            self.assertNotIn(o, out.decode("utf-8"), "原文泄漏")
+        # splice 生效与退回都不影响还原：还原只看占位符→rev 映射
+        self.assertEqual(
+            tr.restore(out.decode("utf-8"), sid),
+            payload.decode("utf-8"),
+            "splice 生效路径还原必须一致",
+        )
+
 
 class CredentialRedactionTests(unittest.TestCase):
     """P0-2：凭据永不明文落库。"""
