@@ -16,6 +16,7 @@
  * 6) 删掉所有 setEvents([]) 副作用 effect（数据跟着 queryKey 走，不再手动清空）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Download, Trash2, RefreshCw, Search, HelpCircle, Loader2, X } from 'lucide-react'
@@ -108,6 +109,7 @@ type LogRow = (AuditRow & { _audit: true }) | MergedEvent
 
 export default function LogsPage() {
   const { t, tf } = useI18n()
+  const [searchParams, setSearchParams] = useSearchParams()
   const queryClient = useQueryClient()
   // 页面隐藏时停止轮询；可见时自动刷新
   const { hidden } = useVisibility()
@@ -130,6 +132,23 @@ export default function LogsPage() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(50)
   const scrollRef = useRef<HTMLDivElement>(null)
+
+  // 从 URL searchParams 同步初始筛选条件（支持外部/首页携带参数跳转）
+  useEffect(() => {
+    const urlQ = (searchParams.get('q') || '').trim()
+    const urlType = (searchParams.get('type') || '').trim().toUpperCase()
+    const urlFulltext = searchParams.get('fulltext') === '1'
+    if (urlQ) {
+      setSearchInput(urlQ)
+      setQ(urlQ)
+    }
+    if (urlType) {
+      setFilterType(urlType)
+    }
+    if (urlFulltext) {
+      setFulltext(true)
+    }
+  }, [searchParams])
 
   // 保留天数配置已移至高级设置页（Logs 筛选栏只留筛选控件）
 
@@ -372,14 +391,39 @@ export default function LogsPage() {
     // 兜底还原：模型把花括号剥了，靠宽松正则捞回来的。是成功，所以用中性色不报警，
     // 但要看得见——它是「模型正在改写输出格式」的前兆信号。
     const degraded = (row.degraded ?? 0) > 0
+    // 提取本条记录捕获的敏感词类型标签（如 PHONE, CONNSTR 等），让列表直观展现脱敏项类别
+    const itemLabels = Array.from(
+      new Set(
+        (((row as MergedEvent).items || []) as { label?: string; preview?: string }[])
+          .map((it) => it.label)
+          .filter((l): l is string => Boolean(l))
+      )
+    )
+    const itemsPreviewText = (((row as MergedEvent).items || []) as { label?: string; preview?: string }[])
+      .map((it) => (it.label ? `${it.label}: ${it.preview || '—'}` : ''))
+      .filter(Boolean)
+      .join(' | ')
+
     if (masked || restored || unresolved || degraded) {
       return (
         <span
           className="flex min-w-0 items-center gap-1.5 text-[11px]"
-          title={[row.method, row.host, row.path].filter(Boolean).join(' ')}
+          title={[itemsPreviewText, row.method, row.host, row.path].filter(Boolean).join(' · ')}
         >
           {masked && <span className="text-blue-600 dark:text-blue-400">{t('logs.colMasked')} {row.count}</span>}
           {restored && <span className="text-emerald-600 dark:text-emerald-400">{t('logs.colRestored')} {row.restored}</span>}
+          {itemLabels.length > 0 && (
+            <span className="flex items-center gap-1">
+              {itemLabels.slice(0, 2).map((lb) => (
+                <span key={lb} className="rounded bg-muted px-1 py-0.2 font-mono text-[9px] text-muted-foreground">
+                  {lb}
+                </span>
+              ))}
+              {itemLabels.length > 2 && (
+                <span className="text-[9px] text-muted-foreground">+{itemLabels.length - 2}</span>
+              )}
+            </span>
+          )}
           {unresolved && (
             <span className="text-amber-600 dark:text-amber-400" title={t('logs.unresolvedHint')}>
               {t('logs.colUnresolved')} {row.unresolved}
@@ -461,7 +505,13 @@ export default function LogsPage() {
           {searchInput && (
             <button
               type="button"
-              onClick={() => setSearchInput('')}
+              onClick={() => {
+                setSearchInput('')
+                setQ('')
+                if (searchParams.toString()) {
+                  setSearchParams({}, { replace: true })
+                }
+              }}
               className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground/60 hover:text-foreground"
               title={t('common.reset')}
             >

@@ -10,7 +10,7 @@
 import { useMemo, useState } from 'react'
 import { useVisibility } from '@/lib/useVisibility'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
   ShieldCheck,
   ShieldOff,
@@ -70,6 +70,7 @@ const fmtMs = (ms?: number | null) => {
 
 export default function Dashboard() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const { t, tf, lang } = useI18n()
   // 页面隐藏时停止轮询；可见时自动刷新
   const { hidden } = useVisibility()
@@ -725,15 +726,27 @@ export default function Dashboard() {
           <div className="space-y-2">
             {(stats?.top_words ?? []).slice(0, 20).map((w) => {
               const cred = CRED_LABELS.has(w.label)
-              const display = cred || !maskedPlain ? maskWord(w.word) : w.word
+              const display = cred || !maskedPlain ? maskWord(w.word, cred) : w.word
+              const searchTerm = cred ? w.label : (w.word.startsWith('<') ? w.label : w.word)
               return (
-                <div key={`${w.label}:${w.word}`} className="flex items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
+                <div
+                  key={`${w.label}:${w.word}`}
+                  onClick={() => {
+                    setMaskedOpen(false)
+                    navigate(`/logs?q=${encodeURIComponent(searchTerm)}&fulltext=1`)
+                  }}
+                  className="group flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm transition-colors hover:border-primary/40 hover:bg-muted/60"
+                  title={t('dash.clickToFilterLogs')}
+                >
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{w.label}</span>
                     <span className="truncate font-mono text-xs" title={display}>{display}</span>
                     {cred && <LockKeyhole className="h-3 w-3 shrink-0 text-muted-foreground" aria-label={t('stats.credHint')} />}
                   </div>
-                  <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{w.count.toLocaleString()}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{w.count.toLocaleString()}</span>
+                    <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />
+                  </div>
                 </div>
               )
             })}
@@ -759,14 +772,26 @@ export default function Dashboard() {
           <div className="space-y-2">
             {(restoreItems?.items ?? []).map((it, i) => {
               const display = it.cred || !restoredPlain ? it.preview : (it.original ?? it.preview)
+              const searchTerm = it.cred ? it.label : (it.original ?? it.preview)
               return (
-                <div key={it.label + i} className="flex items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
+                <div
+                  key={it.label + i}
+                  onClick={() => {
+                    setRestoredOpen(false)
+                    navigate(`/logs?q=${encodeURIComponent(searchTerm)}&fulltext=1`)
+                  }}
+                  className="group flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm transition-colors hover:border-primary/40 hover:bg-muted/60"
+                  title={t('dash.clickToFilterLogs')}
+                >
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{it.label}</span>
                     <span className="truncate font-mono text-xs" title={display}>{display}</span>
                     {it.cred && <LockKeyhole className="h-3 w-3 shrink-0 text-muted-foreground" aria-label={t('stats.credHint')} />}
                   </div>
-                  <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{it.events}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{it.events}</span>
+                    <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />
+                  </div>
                 </div>
               )
             })}

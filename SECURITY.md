@@ -69,6 +69,7 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 | `MASKIT_DISABLE_ORIGIN_CHECK` | `0` | 关闭 `/api/*` 的 Origin 同源校验 | 跨源防御降级为仅令牌单层，启动会打警告 |
 | `MASKIT_ACCESS_LOG` | `0` | 打开 werkzeug 逐请求访问日志 | 默认关闭：面板每 2.5s 轮询一次，开启后 `engine-stdout.log` 会快速增长 |
 | `MASKIT_START_READY_TIMEOUT` | `60` | 代理冷启动就绪等待上限（秒） | 只影响启动判定 |
+| `MASKIT_BYTE_SPLICE` | `1` | 命中敏感词时只就地替换被脱敏的字符串字面量（保住客户端 body 排版与上游前缀缓存）；设 `0` 退回整棵重序列化 | 只影响回写字节与 CPU，**不改变发往上游的内容**：替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验，不过即退回重序列化 |
 | `MASKIT_BIND_HOST` | `127.0.0.1` | `docker-compose.yml` 的主机侧绑定地址 | 公网部署必须显式确认 |
 | `LLM_SHIELD_DATA_DIR` | 平台约定 | 覆盖数据目录（配置、事件库、日志、`proxy_token`） | 指向共享目录会削弱文件权限隔离 |
 | `LLM_SHIELD_PANEL_PORT` | `5801` | 覆盖面板端口 | 壳层与前端据此探活，改了要一并放通防火墙 |

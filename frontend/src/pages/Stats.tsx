@@ -398,7 +398,7 @@ function Leaderboards({ days, granularity, hidden }: { days: number; granularity
             <div>
               <div className="mb-1 text-xs font-semibold text-muted-foreground">{t('stats.original')}</div>
               <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-muted/60 p-3 font-mono text-xs leading-relaxed">
-                {viewWord?.cred ? maskWord(viewWord.name) : viewWord?.name}
+                {viewWord?.cred ? maskWord(viewWord.name, true) : viewWord?.name}
               </pre>
             </div>
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -472,7 +472,7 @@ function RankCard({
           {rows.map((r, i) => {
             // 只有敏感词才需要打码；如果不是敏感词（如规则标签/类型分布），直接显示原名！
             const masked = onTogglePlain ? (r.cred || !showPlain) : false
-            const display = masked ? maskWord(r.name) : r.name
+            const display = masked ? maskWord(r.name, r.cred) : r.name
             return (
               <li key={r.key} className="flex h-9 items-center gap-2.5">
                 <span
@@ -489,8 +489,8 @@ function RankCard({
                   <span className="flex items-center gap-1.5">
                     {onView ? (
                       r.cred ? (
-                        <span className="truncate font-mono text-[12px] text-muted-foreground" title={maskWord(r.name)}>
-                          {maskWord(r.name)}
+                        <span className="truncate font-mono text-[12px] text-muted-foreground" title={maskWord(r.name, true)}>
+                          {maskWord(r.name, true)}
                         </span>
                       ) : (
                         <button

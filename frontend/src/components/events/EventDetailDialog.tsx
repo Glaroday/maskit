@@ -220,6 +220,51 @@ export function EventDetailDialog({
               </div>
             )}
 
+            {/* 顶栏链路全景图：直观告知用户本条请求是 脱敏请求(出站) 还是 还原回复(入站) */}
+            <div className="rounded-lg border bg-muted/20 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-muted-foreground">{t('detail.pipelineStage')}</span>
+                  <Badge
+                    variant={event.type === 'RESTORE' ? 'default' : 'secondary'}
+                    className={cn(
+                      'text-xs font-mono',
+                      event.type === 'RESTORE'
+                        ? 'bg-emerald-600 text-white hover:bg-emerald-600'
+                        : 'bg-blue-600 text-white hover:bg-blue-600'
+                    )}
+                  >
+                    {event.type === 'RESTORE' ? t('detail.stageRestore') : t('detail.stageMask')}
+                  </Badge>
+                </div>
+                <div className="flex items-center gap-3 text-xs">
+                  {(event.count ?? 0) > 0 && (
+                    <span className="text-blue-600 dark:text-blue-400">
+                      {t('logs.colMasked')} <strong>{event.count}</strong>
+                    </span>
+                  )}
+                  {(event.restored ?? 0) > 0 && (
+                    <span className="text-emerald-600 dark:text-emerald-400">
+                      {t('logs.colRestored')} <strong>{event.restored}</strong>
+                    </span>
+                  )}
+                  {(event.unresolved ?? 0) > 0 && (
+                    <span className="text-amber-600 dark:text-amber-400">
+                      {t('logs.colUnresolved')} <strong>{event.unresolved}</strong>
+                    </span>
+                  )}
+                  {(event.degraded ?? 0) > 0 && (
+                    <span className="text-muted-foreground">
+                      {t('logs.colDegraded')} <strong>{event.degraded}</strong>
+                    </span>
+                  )}
+                </div>
+              </div>
+              <p className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
+                {event.type === 'RESTORE' ? t('detail.stageRestoreDesc') : t('detail.stageMaskDesc')}
+              </p>
+            </div>
+
             {/* 脱敏/还原项目对照（明文 → 占位符 / 占位符 → 明文） */}
             {event.items && event.items.length > 0 && (
               <div>
@@ -255,31 +300,31 @@ export function EventDetailDialog({
                           </div>
                           <div className="mt-2 space-y-1.5 font-mono text-xs leading-relaxed">
                             {item.original != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.original')}</span>
-                                <span className="break-all">{item.original}</span>
+                              <div className="flex items-start gap-2">
+                                <span className="w-12 shrink-0 text-muted-foreground">{t('detail.original')}</span>
+                                <span className="break-all font-semibold text-foreground">{item.original}</span>
                               </div>
                             )}
                             {item.preview != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.preview')}</span>
+                              <div className="flex items-start gap-2">
+                                <span className="w-12 shrink-0 text-muted-foreground">{t('detail.preview')}</span>
                                 <span className="break-all text-muted-foreground">{item.preview}</span>
                               </div>
                             )}
                             {item.tok != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.placeholder')}</span>
-                                <span className="break-all text-blue-600 dark:text-blue-400">
+                              <div className="flex items-start gap-2">
+                                <span className="w-12 shrink-0 text-muted-foreground">{t('detail.placeholder')}</span>
+                                <span className="break-all rounded bg-blue-500/10 px-1 text-blue-600 dark:text-blue-400">
                                   {item.tok}
                                 </span>
                               </div>
                             )}
                             {item.hash != null && (
-                              <div className="flex gap-2">
-                                <span className="w-10 shrink-0 text-muted-foreground">{t('detail.hash')}</span>
-                                <span className="break-all text-muted-foreground">{item.hash}</span>
+                              <div className="flex items-start gap-2 text-muted-foreground">
+                                <span className="w-12 shrink-0">{t('detail.hash')}</span>
+                                <span className="break-all">{item.hash}</span>
                                 {item.length != null && (
-                                  <span className="text-muted-foreground">{tf('detail.length', { n: item.length })}</span>
+                                  <span className="shrink-0">({tf('detail.length', { n: item.length })})</span>
                                 )}
                               </div>
                             )}
