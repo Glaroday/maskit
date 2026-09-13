@@ -15,7 +15,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
-import { EventTypeIcon } from '@/components/events/EventTypeIcon'
+import { EventTypeIcon, getEventTypeMeta } from '@/components/events/EventTypeIcon'
 import { CheckCircle2 } from 'lucide-react'
 import type { ShieldEvent } from '@/types/api'
 import dayjs from 'dayjs'
@@ -130,6 +130,49 @@ export function EventDetailDialog({
     [event],
   )
 
+  const stageInfo = useMemo(() => {
+    if (!event) return null
+    const meta = getEventTypeMeta(event.type)
+    switch (event.type) {
+      case 'RESTORE':
+        return {
+          label: t('detail.stageRestore'),
+          className: 'bg-emerald-600 text-white hover:bg-emerald-600',
+          desc: t('detail.stageRestoreDesc'),
+        }
+      case 'MASK':
+        return {
+          label: t('detail.stageMask'),
+          className: 'bg-blue-600 text-white hover:bg-blue-600',
+          desc: t('detail.stageMaskDesc'),
+        }
+      case 'BLOCK':
+        return {
+          label: t('evt.block'),
+          className: 'bg-red-600 text-white hover:bg-red-600',
+          desc: t('detail.stageBlockDesc'),
+        }
+      case 'ERR':
+        return {
+          label: t('evt.err'),
+          className: 'bg-red-600 text-white hover:bg-red-600',
+          desc: t('detail.stageErrDesc'),
+        }
+      case 'SCAN_WARN':
+        return {
+          label: t('evt.scanWarn'),
+          className: 'bg-amber-600 text-white hover:bg-amber-600',
+          desc: t('detail.stageScanWarnDesc'),
+        }
+      default:
+        return {
+          label: meta.labelKey ? t(meta.labelKey) : (meta.label || event.type),
+          className: 'bg-slate-600 text-white hover:bg-slate-600',
+          desc: t('detail.stageOtherDesc'),
+        }
+    }
+  }, [event, t])
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
@@ -220,50 +263,49 @@ export function EventDetailDialog({
               </div>
             )}
 
-            {/* 顶栏链路全景图：直观告知用户本条请求是 脱敏请求(出站) 还是 还原回复(入站) */}
-            <div className="rounded-lg border bg-muted/20 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-semibold text-muted-foreground">{t('detail.pipelineStage')}</span>
-                  <Badge
-                    variant={event.type === 'RESTORE' ? 'default' : 'secondary'}
-                    className={cn(
-                      'text-xs font-mono',
-                      event.type === 'RESTORE'
-                        ? 'bg-emerald-600 text-white hover:bg-emerald-600'
-                        : 'bg-blue-600 text-white hover:bg-blue-600'
+            {/* 顶栏链路全景图：直观告知用户本条请求是 脱敏请求(出站) 还是 还原回复(入站) 或 异常/直连 */}
+            {stageInfo && (
+              <div className="rounded-lg border bg-muted/20 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-muted-foreground">{t('detail.pipelineStage')}</span>
+                    <Badge
+                      className={cn(
+                        'text-xs font-mono',
+                        stageInfo.className
+                      )}
+                    >
+                      {stageInfo.label}
+                    </Badge>
+                  </div>
+                  <div className="flex items-center gap-3 text-xs">
+                    {(event.count ?? 0) > 0 && (
+                      <span className="text-blue-600 dark:text-blue-400">
+                        {t('logs.colMasked')} <strong>{event.count}</strong>
+                      </span>
                     )}
-                  >
-                    {event.type === 'RESTORE' ? t('detail.stageRestore') : t('detail.stageMask')}
-                  </Badge>
+                    {(event.restored ?? 0) > 0 && (
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        {t('logs.colRestored')} <strong>{event.restored}</strong>
+                      </span>
+                    )}
+                    {(event.unresolved ?? 0) > 0 && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        {t('logs.colUnresolved')} <strong>{event.unresolved}</strong>
+                      </span>
+                    )}
+                    {(event.degraded ?? 0) > 0 && (
+                      <span className="text-muted-foreground">
+                        {t('logs.colDegraded')} <strong>{event.degraded}</strong>
+                      </span>
+                    )}
+                  </div>
                 </div>
-                <div className="flex items-center gap-3 text-xs">
-                  {(event.count ?? 0) > 0 && (
-                    <span className="text-blue-600 dark:text-blue-400">
-                      {t('logs.colMasked')} <strong>{event.count}</strong>
-                    </span>
-                  )}
-                  {(event.restored ?? 0) > 0 && (
-                    <span className="text-emerald-600 dark:text-emerald-400">
-                      {t('logs.colRestored')} <strong>{event.restored}</strong>
-                    </span>
-                  )}
-                  {(event.unresolved ?? 0) > 0 && (
-                    <span className="text-amber-600 dark:text-amber-400">
-                      {t('logs.colUnresolved')} <strong>{event.unresolved}</strong>
-                    </span>
-                  )}
-                  {(event.degraded ?? 0) > 0 && (
-                    <span className="text-muted-foreground">
-                      {t('logs.colDegraded')} <strong>{event.degraded}</strong>
-                    </span>
-                  )}
-                </div>
+                <p className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
+                  {stageInfo.desc}
+                </p>
               </div>
-              <p className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed">
-                {event.type === 'RESTORE' ? t('detail.stageRestoreDesc') : t('detail.stageMaskDesc')}
-              </p>
-            </div>
+            )}
 
             {/* 脱敏/还原项目对照（明文 → 占位符 / 占位符 → 明文） */}
             {event.items && event.items.length > 0 && (

@@ -2,6 +2,7 @@
  * 控制台（对标旧版概览仪表盘）：
  * - 大状态横幅：过滤状态 + 捕获模式 + 运行时长
  * - 6 张统计卡：今日请求 / 已脱敏 / 已还原回复 / 告警(4子项) / Token(输入输出) / 今日费用估算
+ * - 前缀保真度卡：零改写透传率 / 占位符复用率 / 平均首个差异字节（MASK 事件诊断字段）
  * - 网关管理快捷操作：启停 / CA证书 / 健康检查 / 紧急恢复
  * - 核心安全防护策略：failClosed / responseScan / SSE / 流式排除 / 自启 / 自启代理
  * - 最近事件 7 列表格
@@ -25,6 +26,7 @@ import {
   ArrowRight,
   HelpCircle,
   Coins,
+  Gauge,
   Loader2,
   LockKeyhole,
 } from 'lucide-react'
@@ -183,6 +185,10 @@ export default function Dashboard() {
   }
 
   const tokensTotal = (stats?.tokens.prompt ?? 0) + (stats?.tokens.completion ?? 0)
+
+  // 前缀保真度：null = 本区间一条 MASK 事件都没有（空库 / 老库刚升级）。
+  // 与「有样本但零改写率 0%」必须分开渲染——前者是没数据，后者是数据很差。
+  const prefix = stats?.prefix ?? null
 
   // 最近事件：合并 MASK/RESTORE 成「一次请求一行」并取最新 10 行（与 Logs 页同口径）
   const recentMerged = useMemo(
@@ -455,6 +461,74 @@ export default function Dashboard() {
             : <div key={c.label} className="h-full">{card}</div>
         })}
       </div>
+
+      {/* 前缀保真度：MASK 事件三个诊断字段（body_rewritten / first_diff_byte /
+          suffix_reused）的聚合，用来回答「上游缓存命中率掉了，是我们改了请求
+          字节还是上游自己 miss」。刻意**不塞进上面那个 6 卡网格**——它的列数
+          （2/3/6）是按 6 张卡调过的，第 7 张在 ≥1536px 宽屏上会单独落一行。
+          前两列分母是 masks（全部样本）；第三列分母是 rewritten（改写过的请求）
+          ——`first_diff_byte` 只在回写分支才算，零改写透传的请求本来就没有差异
+          位，用 masks 当分母会把「全部零改写」显示成缺样本。
+          `prefix` 为 null 时按 mask_events 区分两种「没有数据」：区间内压根没
+          请求 vs 有请求但都早于该统计上线（升级当天就是后者，不能说成「脱敏
+          没生效」）。 */}
+      <Card className="border bg-card shadow-[var(--shadow-card)]">
+        <CardContent className="p-5">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-sky-500/15 to-sky-500/5 text-sky-600 dark:text-sky-400">
+              <Gauge className="h-[18px] w-[18px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-semibold leading-5 text-foreground/80">{t('dash.prefixFidelity')}</div>
+              <div className="text-[11px] font-medium text-muted-foreground/80">{t('dash.prefixHint')}</div>
+            </div>
+            {prefix && (
+              <span className="shrink-0 rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-0.5 text-[11px] font-medium text-sky-600 dark:text-sky-400">
+                {tf('dash.prefixSamples', { n: prefix.masks.toLocaleString() })}
+              </span>
+            )}
+          </div>
+          <div className="mt-4 grid grid-cols-3 gap-3 border-t pt-3">
+            <div className="min-w-0">
+              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixClean')}</div>
+              <div className="text-[20px] font-bold leading-tight tabular-nums text-sky-600 dark:text-sky-400">
+                {prefix ? `${(prefix.clean_rate * 100).toFixed(1)}%` : '—'}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground/80">
+                {prefix
+                  ? `${prefix.clean.toLocaleString()} / ${prefix.masks.toLocaleString()}`
+                  : (stats?.mask_events ?? 0) > 0
+                    ? t('dash.prefixNoSamples')
+                    : t('dash.prefixNoData')}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixReuse')}</div>
+              <div className="text-[20px] font-bold leading-tight tabular-nums">
+                {prefix ? `${(prefix.reuse_rate * 100).toFixed(1)}%` : '—'}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground/80">
+                {prefix
+                  ? `${prefix.suffix_reused.toLocaleString()} / ${prefix.masks.toLocaleString()}`
+                  : '—'}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixDiff')}</div>
+              <div className="text-[20px] font-bold leading-tight tabular-nums">
+                {prefix?.avg_first_diff != null ? prefix.avg_first_diff.toFixed(1) : '—'}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground/80" title={t('dash.prefixDiffHint')}>
+                {prefix
+                  ? prefix.rewritten > 0
+                    ? `${prefix.diff_samples.toLocaleString()} / ${prefix.rewritten.toLocaleString()}`
+                    : t('dash.prefixNoRewrite')
+                  : '—'}
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
 
 {/* 核心安全防护策略 */}

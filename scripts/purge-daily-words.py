@@ -30,7 +30,7 @@
 脚本总会先打印实际选中的库，选错了就在第一行看出来。
 
 写库前会：① 检查引擎是否在运行（`shield.pid`），在跑就拒绝，除非 `--force`；
-② 把库文件整份复制成 `<库名>.bak-purge-<时间戳>`，复制失败即中止。
+② 通过 SQLite 在线备份（`conn.backup`）生成自洽快照 `<库名>.bak-purge-<时间戳>`（WAL 模式安全），失败即中止。
 """
 import argparse
 import os
@@ -149,9 +149,22 @@ def main() -> int:
             return 0
 
         backup = db.with_name(f"{db.name}.bak-purge-{time.strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(db, backup)
-        if not backup.exists() or backup.stat().st_size != stat.st_size:
-            print("!! 备份校验失败，已中止（未写库）")
+        try:
+            bck_conn = sqlite3.connect(backup)
+            with bck_conn:
+                conn.backup(bck_conn)
+            bck_conn.close()
+        except Exception as e:
+            print(f"!! 备份失败: {e}，已中止（未写库）")
+            if backup.exists():
+                try:
+                    backup.unlink()
+                except OSError:
+                    pass
+            return 4
+
+        if not backup.exists() or backup.stat().st_size == 0:
+            print("!! 备份校验失败（产物为空），已中止（未写库）")
             return 4
         print(f"\n已备份: {backup}")
 

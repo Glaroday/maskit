@@ -587,6 +587,41 @@ class PromptCacheByteFidelityTests(unittest.TestCase):
         finally:
             tr._SPLICE_MAX = old_max
 
+    def test_long_conversation_body_still_uses_byte_splice(self):
+        """长会话（>1MB）必须走字节级替换，不能退回整棵重序列化。
+
+        `_SPLICE_MAX` 早先是 1MB，恰好把长会话挡在外面 —— 而那恰恰是上游
+        Prompt Cache 收益最大的场景（上下文越长，前缀 miss 一次越贵）。实测放宽
+        到 8MB 后，完整路径（含调用方的 `json.loads` 等价校验）对退路 `json.dumps`
+        只多 4ms（8MB 28.0ms vs 23.9ms），所以没有理由把长会话排除掉。
+
+        这里直接调 `_splice_mask` 而不走 `request()`：1.5MB 文本再跑一遍脱敏正则
+        要几百毫秒，单测里不划算；「`request()` 会调用它」由本类其余走 `_run`
+        的用例覆盖。
+
+        ⚠️ 两个上限**故意不联动**，别顺手把 `_FIRST_DIFF_MAX` 也放宽：那值是每次
+        回写都要算的纯诊断数据，耗时随差异位置后移暴涨（1MB/最末 14.5ms、
+        8MB 173ms），跟着放宽等于给热路径加 100ms+。
+        """
+        self.assertGreater(
+            tr._SPLICE_MAX, tr._FIRST_DIFF_MAX,
+            "两个上限故意不联动：_FIRST_DIFF_MAX 跟着放宽会拖慢热路径",
+        )
+        item = {"role": "user", "content": "我叫张三 " + "y" * 200}
+        one = len(json.dumps(item, separators=(",", ":")).encode("utf-8"))
+        rows = max(2, (1 << 20) // one + 1)
+        raw = json.dumps({"model": "m", "messages": [item] * rows},
+                         separators=(",", ":")).encode("utf-8")
+        self.assertGreater(len(raw), 1 << 20, "用例本身没构造出超过旧上限（1MB）的 body")
+        masked_root = json.loads(raw.decode("utf-8"))
+        for m in masked_root["messages"]:
+            m["content"] = m["content"].replace("张三", "{{NAME_bcdfgh}}")
+        out = tr._splice_mask(raw, masked_root, {"张三": "{{NAME_bcdfgh}}"})
+        self.assertIsNotNone(
+            out, f"{len(raw) / 1048576:.1f}MB 被上限挡在外面了（长会话拿不到前缀保真）")
+        self.assertEqual(json.loads(out), masked_root, "大 body 的替换结果也必须过等价校验")
+        self.assertNotIn("张三", out.decode("utf-8"), "原文泄漏")
+
 
 class CredentialRedactionTests(unittest.TestCase):
     """P0-2：凭据永不明文落库。"""

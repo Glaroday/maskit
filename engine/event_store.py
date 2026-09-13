@@ -191,6 +191,26 @@ def _connect(schema=False):
             conn.execute("ALTER TABLE daily_models ADD COLUMN errors INTEGER DEFAULT 0")
     except Exception:
         pass
+    # 前缀保真度日摘要：只收 MASK 事件（只有它带 body_rewritten /
+    # first_diff_byte / suffix_reused 三个诊断字段，见 transparent.request）。
+    # 回答「上游 Prompt Cache 命中率归零，是我们改了请求字节还是上游自己 miss」：
+    #   masks/rewritten → 零改写透传占比（rewritten=0 表示一个字节都没动）；
+    #   reused          → 占位符后缀复用次数（沿用旧 token 上游前缀才有机会命中）；
+    #   diff_sum/diff_n → 首个差异字节的均值（越接近敏感值真实位置越不伤前缀）。
+    # 不做历史回填：升级前的 MASK 事件 payload 里压根没有这三个字段，
+    # 硬算会把「零改写率」算高。本表升级当天为空、只累积新事件，故口径天然干净。
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_prefix (
+            day TEXT PRIMARY KEY,
+            masks INTEGER DEFAULT 0,
+            rewritten INTEGER DEFAULT 0,
+            reused INTEGER DEFAULT 0,
+            diff_sum INTEGER DEFAULT 0,
+            diff_n INTEGER DEFAULT 0
+        )
+        """
+    )
     # 内部元数据（迁移标记等）：daily_stats 摘要表上线时，升级前写入的事件
     # 没有摘要——用 meta 标记做一次性回填，保证升级当天统计不丢（审计 DATA-002）。
     conn.execute(
@@ -213,6 +233,10 @@ def _migrate_daily_stats(conn, now):
     - daily_stats_migrated：回填完成的标记（= created）。已标记则不再回填，
       否则会对"已同步过摘要的新事件"重复累加（ON CONFLICT cnt+1 会翻倍，
       且 day 边界变化后第二次触发就是重复）。
+
+    ⚠️ 重放必须传 replay=True：这些事件早已计入过摘要，daily_prefix 这类
+    「只进不退」的计数器再写一次就是翻倍（daily_stats 的翻倍属历史既有行为，
+    不在本次范围内）。
     """
     try:
         row = conn.execute("SELECT value FROM meta WHERE key='daily_stats_created'").fetchone()
@@ -231,7 +255,7 @@ def _migrate_daily_stats(conn, now):
                 rec["ts"] = ts
             except Exception:
                 continue
-            _update_stats(conn, rec)
+            _update_stats(conn, rec, replay=True)
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('daily_stats_migrated', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -260,14 +284,23 @@ def set_record_plaintext_words(enabled) -> None:
     RECORD_PLAINTEXT_WORDS = bool(enabled)
 
 
-def _update_stats(conn, rec):
+def _update_stats(conn, rec, replay=False):
     """增量维护日统计摘要（与 events 同事务提交，失败静默——事件照常落库）。
+
+    `replay=True` 表示这次调用是**重放已入过库的事件**（目前只有
+    `_migrate_daily_stats` 会传）。重放不能喂给「只进不退」的计数器：
+    daily_prefix 就是这样一个计数器，回填条件 `ts < daily_stats_created`
+    会把 ts 早于建表时刻的事件再算一遍（实测：today_stats 触发一次回填，
+    昨天那行 masks 从 1 变 2）。daily_stats 有同样的隐患但属历史既有行为，
+    不在本次范围内 —— 本函数只保证 daily_prefix 不被重放污染。
 
     口径与旧实现完全一致（审计 DATA-001）：
     - daily_stats：所有事件类型计数（MASK/RESTORE/PASS/BLOCK/...）；
     - daily_status：只收 RESTORE 事件的状态分布；
     - daily_words：只收 MASK 事件 items（旧 today_stats 只扫 MASK payload，
       若 RESTORE 也收会把同一脱敏项记两次——实测 MASK+RESTORE 计为 PHONE=2）。
+    - daily_prefix：只收 MASK 事件的前缀诊断字段（同前一条理由：RESTORE 不带
+      body_rewritten/first_diff_byte，收进来只会把分母撑大）。
     """
     try:
         ts = float(rec.get("ts") or time.time())
@@ -348,6 +381,28 @@ def _update_stats(conn, rec):
                 "INSERT INTO daily_words(day, label, word, cnt) VALUES(?,?,?,1) "
                 "ON CONFLICT(day,label,word) DO UPDATE SET cnt=cnt+1",
                 (day, lbl, word),
+            )
+        # 前缀保真度：MASK 事件的三个诊断字段聚合（口径见 daily_prefix 建表注释）。
+        # 两个前置条件缺一不可：
+        #   · 事件自己带 body_rewritten —— 老代码写的 MASK 事件没有这个键，
+        #     导入它们（import_legacy_jsonl_once 导 legacy jsonl）会把 masks 撑大
+        #     却把 rewritten 记 0，凭空拉低零改写率；
+        #   · 不是重放 —— 重放的事件早已计入过一次，再写就是翻倍。
+        # first_diff_byte 为 -1 表示超上限没算（transparent._FIRST_DIFF_MAX），
+        # 只跳过均值、不影响分母。
+        if "body_rewritten" in rec and not replay:
+            rewritten = 1 if rec.get("body_rewritten") else 0
+            reused = 1 if rec.get("suffix_reused") else 0
+            diff = _int_or_none(rec.get("first_diff_byte"))
+            has_diff = diff is not None and diff >= 0
+            conn.execute(
+                "INSERT INTO daily_prefix(day, masks, rewritten, reused, diff_sum, diff_n) "
+                "VALUES(?,1,?,?,?,?) "
+                "ON CONFLICT(day) DO UPDATE SET "
+                "masks=masks+1, rewritten=rewritten+excluded.rewritten, "
+                "reused=reused+excluded.reused, "
+                "diff_sum=diff_sum+excluded.diff_sum, diff_n=diff_n+excluded.diff_n",
+                (day, rewritten, reused, diff if has_diff else 0, 1 if has_diff else 0),
             )
     except Exception as e:
         # 摘要失败不能拖垮同事务的事件落库，所以仍不抛出。但必须留痕：
@@ -1317,7 +1372,8 @@ def prune_events(now=None, retention_days=RETENTION_DAYS):
         cur = conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
         removed = cur.rowcount
         # 统计摘要表策略（用户要求：统计永久保存）：
-        #   daily_stats / daily_status / daily_tokens：纯数字计数，永久保留，不随保留期裁剪。
+        #   daily_stats / daily_status / daily_tokens / daily_prefix：纯数字计数，
+        #   永久保留，不随保留期裁剪。
         #   daily_words：存 PII 打码 preview，随保留期裁剪（与事件明细一致，防词级 PII 超期留存）。
         # 曾统一按 day_cutoff 裁剪四张表 → 7 天后统计卡/图表全部归零，用户以为数据丢了。
         day_cutoff = time.strftime("%Y-%m-%d", time.localtime(cutoff))
@@ -1335,8 +1391,8 @@ def clear_events():
     1) 置 cutoff（cutoff 前入队的事件由写线程丢弃）；2) 排空当前未写队列；
     3) 同一事务删除 `events` + `daily_words`——**数字摘要表一律保留**
     （用户明确要求「清日志不清统计」）。判据是含不含 PII：daily_words 存词级
-    打码 preview 属于日志明细，daily_stats/daily_status/daily_tokens 是纯数字计数，
-    清掉等于把用户几个月的趋势图归零，而他只是想清日志；
+    打码 preview 属于日志明细，daily_stats/daily_status/daily_tokens/daily_prefix
+    是纯数字计数，清掉等于把用户几个月的趋势图归零，而他只是想清日志；
     4) 按 cutoff 补删一次兜住写线程正在写旧事件的窗口。清空之后的新事件正常写入。
 
     这段 docstring 曾写「删除 events + 三个日统计摘要表」，与下面的实现相反——
@@ -1360,6 +1416,7 @@ def clear_events():
         #   daily_stats    每日请求/脱敏/还原/告警计数（纯数字，无 PII）
         #   daily_status   还原状态计数（纯数字，无 PII）
         #   daily_tokens   token 用量（纯数字，无 PII）
+        #   daily_prefix   前缀保真度计数（纯数字，无 PII）
         # 仅删 daily_words：它存 PII 打码 preview（曾存原文，已迁移为 preview），
         # 清日志时一并清掉词级明细，与「清空日志=真删除」语义一致。
         # conn.execute("DELETE FROM daily_stats")
@@ -1384,6 +1441,40 @@ def clear_events():
 def _day_start(now):
     lt = time.localtime(now)
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def _prefix_payload(masks, rewritten, reused, diff_sum, diff_n):
+    """前缀保真度摘要（MASK 事件三个诊断字段的聚合，仪表盘「前缀保真度」卡数据源）。
+
+    返回 None 表示本区间没有任何 MASK 事件——老库刚升级、或用户还没跑过脱敏请求
+    时就是这个状态。**不返回全 0 的字典**：一排 0 会被读成「一次都没零改写」，
+    而真相是「还没有样本」，两者对用户的意义完全相反。
+
+    clean_rate：`body_rewritten=false` 的占比，即请求体一个字节都没被改动的比例。
+    这正是上游 Prompt Cache 能命中的前提，也是这张卡的主指标。
+    reuse_rate：命中的占位符里沿用了复用表旧 token 的比例（全为新签 → 上游前缀
+    必然从这个位置起失效）。
+    avg_first_diff：回写后与客户端原始字节首个差异位置的平均值，越小说明前缀被
+    改动得越靠前、越伤缓存；样本全被上限挡掉（first_diff_byte=-1）时为 None，
+    此时 diff_samples 为 0（前端把它和 masks 一起显示，避免「均值看着很好、
+    其实只有一个样本」）。
+    """
+    masks = int(masks or 0)
+    if masks <= 0:
+        return None
+    rewritten = max(0, min(int(rewritten or 0), masks))
+    reused = max(0, int(reused or 0))
+    n = int(diff_n or 0)
+    return {
+        "masks": masks,
+        "rewritten": rewritten,
+        "clean": masks - rewritten,
+        "clean_rate": round((masks - rewritten) / masks, 4),
+        "suffix_reused": reused,
+        "reuse_rate": round(reused / masks, 4),
+        "avg_first_diff": round(int(diff_sum or 0) / n, 1) if n > 0 else None,
+        "diff_samples": n,
+    }
 
 
 def today_stats(now=None):
@@ -1411,6 +1502,10 @@ def today_stats(now=None):
         ).fetchall()
         token_row = conn.execute(
             "SELECT prompt, completion FROM daily_tokens WHERE day=?", (day,)
+        ).fetchone()
+        prefix_row = conn.execute(
+            "SELECT masks, rewritten, reused, diff_sum, diff_n FROM daily_prefix WHERE day=?",
+            (day,),
         ).fetchone()
     tokens = {}
     if token_row:
@@ -1462,6 +1557,7 @@ def today_stats(now=None):
         "requests": requests,
         "alerts": alerts,
         "tokens": tokens,
+        "prefix": _prefix_payload(*(prefix_row or (0, 0, 0, 0, 0))),
         "by_type": by_type,
         "restore_by_status": restore_by_status,
         "by_label": by_label,
@@ -1502,6 +1598,11 @@ def stats_range(days=1, now=None):
         ).fetchall()
         token_row = conn.execute(
             f"SELECT SUM(prompt), SUM(completion) FROM daily_tokens WHERE day IN ({placeholders})",
+            days_list,
+        ).fetchone()
+        prefix_row = conn.execute(
+            f"SELECT SUM(masks), SUM(rewritten), SUM(reused), SUM(diff_sum), SUM(diff_n) "
+            f"FROM daily_prefix WHERE day IN ({placeholders})",
             days_list,
         ).fetchone()
     tokens = {"prompt": int(token_row[0] or 0), "completion": int(token_row[1] or 0)}
@@ -1556,6 +1657,7 @@ def stats_range(days=1, now=None):
         "errs": _ev("ERR"),
         "scan_warns": _ev("SCAN_WARN"),
         "tokens": tokens,
+        "prefix": _prefix_payload(*(prefix_row or (0, 0, 0, 0, 0))),
         "by_type": by_type,
         "restore_by_status": restore_by_status,
         "by_label": by_label,
@@ -1766,6 +1868,9 @@ def _today_stats_legacy_range(now=None, since=None):
         "errs": _ev("ERR"),
         "scan_warns": _ev("SCAN_WARN"),
         "tokens": {"prompt": 0, "completion": 0},
+        # legacy 路径读的是升级前写的事件，payload 里没有前缀诊断字段
+        # → 明确给 None（前端显示「暂无样本」），不冒充 0。
+        "prefix": None,
         "by_type": by_type,
         "restore_by_status": dict(status_map),
         "by_label": {},
@@ -1873,6 +1978,8 @@ def _today_stats_legacy(now=None, day_start=None):
         "requests": requests,
         "alerts": alerts,
         "tokens": tokens,
+        # 同 _today_stats_legacy_range：legacy 事件没有前缀诊断字段。
+        "prefix": None,
         "by_type": by_type,
         "restore_by_status": restore_by_status,
         "by_label": by_label,

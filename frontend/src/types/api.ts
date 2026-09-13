@@ -166,6 +166,32 @@ export interface LogDetailResponse {
 }
 
 // ========== 今日统计（/api/stats/today） ==========
+/**
+ * 前缀保真度：MASK 事件三个诊断字段的聚合（engine/event_store._prefix_payload）。
+ *
+ * 回答「上游 Prompt Cache 命中率归零，是我们改了请求字节还是上游自己 miss」——
+ * clean_rate 就是请求体一个字节都没被改动的比例，reuse_rate 是占位符沿用旧
+ * token 的比例，avg_first_diff 是回写后与客户端原始字节首个差异位置的平均值。
+ */
+export interface PrefixStats {
+  /** 区间内 MASK 事件数（分母） */
+  masks: number
+  /** 其中回写过请求体的次数 */
+  rewritten: number
+  /** body_rewritten=false 的次数（零改写透传） */
+  clean: number
+  /** 零改写透传占比（0~1） */
+  clean_rate: number
+  /** 命中占位符沿用复用表旧 token 的次数 */
+  suffix_reused: number
+  /** 占位符复用占比（0~1） */
+  reuse_rate: number
+  /** 首个差异字节均值；样本全被上限挡掉时为 null */
+  avg_first_diff: number | null
+  /** 计入 avg_first_diff 的样本数（0 表示均值不可用） */
+  diff_samples: number
+}
+
 export interface TodayStats {
   requests: number
   alerts: number
@@ -177,6 +203,11 @@ export interface TodayStats {
   restore_ok: number
   restore_failed: number
   tokens: { prompt: number; completion: number }
+  /**
+   * 前缀保真度。**null = 本区间没有 MASK 事件样本**（空库 / 老库升级当天），
+   * 与「有样本但零改写率为 0」是两回事，渲染时必须分开。
+   */
+  prefix?: PrefixStats | null
   by_label: Record<string, number>
   top_words: { label: string; word: string; count: number }[]
   [key: string]: unknown
