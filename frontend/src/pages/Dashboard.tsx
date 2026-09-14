@@ -878,10 +878,21 @@ export default function Dashboard() {
       </div>
 
       {/* 出口代理提示 */}
-      {(status?.egress_proxy_users ?? []).length > 0 && (
+      {Boolean(status?.egress_proxy?.enabled) && (status?.egress_proxy_users ?? []).length > 0 && (
         <div className="flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-2.5 text-xs text-amber-600 dark:text-amber-400">
           <Globe className="h-3.5 w-3.5 shrink-0" />
           <span>{t('dash.egressOn')}{status!.egress_proxy_users.join(lang === 'en' ? ', ' : '、')}</span>
+        </div>
+      )}
+      {!status?.egress_proxy?.enabled && (status?.egress_proxy_users ?? []).length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-700 dark:text-amber-300">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <span>{tf('dash.egressNotConfiguredNotice', { list: status!.egress_proxy_users.join(lang === 'en' ? ', ' : '、') })}</span>
+          </div>
+          <Link to="/settings" className="shrink-0 font-medium underline hover:text-foreground">
+            {t('settings.clients.goToEgressSetting')}
+          </Link>
         </div>
       )}
 

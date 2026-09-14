@@ -2082,6 +2082,17 @@ class EgressProxyTests(unittest.TestCase):
         self.assertTrue(cfg["egress_proxy"]["enabled"])
         self.assertTrue(any("没有任何客户端" in w for w in warns), warns)
 
+    def test_normalize_config_warns_when_upstream_uses_proxy_but_egress_disabled(self):
+        """客户端勾选了走代理，但全局出口代理未启用 —— 提醒用户将以直连运行。"""
+        warns = []
+        cfg = panel.normalize_config({
+            "egress_proxy": {"enabled": False, "url": ""},
+            "upstreams": [{"name": "oai", "base_path": "/oai", "port": 18701,
+                           "target": "https://api.openai.com", "use_proxy": True}],
+        }, warns)
+        self.assertFalse(cfg["egress_proxy"]["enabled"])
+        self.assertTrue(any("全局出口代理尚未启用" in w and "oai" in w for w in warns), warns)
+
     def test_normalize_config_keeps_use_proxy_per_upstream(self):
         cfg = panel.normalize_config({
             "egress_proxy": {"enabled": True, "url": "http://127.0.0.1:7890"},

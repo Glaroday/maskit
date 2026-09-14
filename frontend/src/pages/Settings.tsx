@@ -30,6 +30,8 @@ import {
   HelpCircle,
   ExternalLink,
   Check,
+  CheckCircle2,
+  AlertCircle,
   Search,
   ChevronRight,
 } from 'lucide-react'
@@ -163,11 +165,15 @@ function UpstreamForm({
   onSave,
   onClose,
   captureMode,
+  egressProxy,
+  onGoToEgress,
 }: {
   initial: UpstreamConfig
   onSave: (u: UpstreamConfig) => void
   onClose: () => void
   captureMode: string
+  egressProxy?: { enabled?: boolean; url?: string }
+  onGoToEgress?: () => void
 }) {
   const [form, setForm] = useState<UpstreamConfig>({ ...initial })
   const set = (k: keyof UpstreamConfig, v: unknown) => setForm((f) => ({ ...f, [k]: v }))
@@ -373,10 +379,39 @@ function UpstreamForm({
             </div>
           )}
 
-          <label className="flex cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground transition-colors hover:text-foreground">
-            <Switch checked={!!form.use_proxy} onCheckedChange={(v) => set('use_proxy', v)} />
-            {t('settings.upstream.useEgress')}
-          </label>
+          <div className="space-y-2">
+            <label className="flex cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground transition-colors hover:text-foreground">
+              <Switch checked={!!form.use_proxy} onCheckedChange={(v) => set('use_proxy', v)} />
+              {t('settings.upstream.useEgress')}
+            </label>
+            {form.use_proxy && (
+              (egressProxy?.enabled && egressProxy?.url) ? (
+                <div className="flex items-center gap-1.5 rounded-md border border-emerald-500/20 bg-emerald-500/5 px-2.5 py-1.5 text-[11px] text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                  <span>{tf('settings.upstream.egressActiveHint', { url: egressProxy?.url ?? '' })}</span>
+                </div>
+              ) : (
+                <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-300">
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                  <div className="flex-1 space-y-1">
+                    <p className="font-medium leading-none">{t('settings.upstream.egressNotConfiguredTitle')}</p>
+                    <p className="text-[11px] leading-relaxed text-muted-foreground">{t('settings.upstream.egressNotConfiguredDesc')}</p>
+                    {onGoToEgress && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="mt-1 h-6 border-amber-500/30 bg-background px-2 text-[11px] text-amber-700 hover:bg-amber-500/10 dark:text-amber-300"
+                        onClick={onGoToEgress}
+                      >
+                        {t('settings.upstream.goToEgressSettings')}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              )
+            )}
+          </div>
         </div>
         <DialogFooter>
           <Button size="sm" variant="outline" onClick={onClose}>{t('settings.upstream.cancel')}</Button>
@@ -714,6 +749,35 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   })
 
   const upstreams = useMemo(() => cfg?.upstreams ?? [], [cfg?.upstreams])
+  const egressActive = Boolean(cfg?.egress_proxy?.enabled && cfg?.egress_proxy?.url)
+  const hasUnconfiguredEgress = useMemo(
+    () => upstreams.some((u) => u.use_proxy) && !egressActive,
+    [upstreams, egressActive],
+  )
+
+  const handleGoToEgress = () => {
+    setEditing(null)
+    setAdding(false)
+    if (embeddedTab) {
+      navigate('/settings?tab=advanced#egress-proxy')
+    } else {
+      setActiveTab('advanced')
+      setTimeout(() => {
+        document.getElementById('egress-proxy')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 100)
+    }
+  }
+
+  useEffect(() => {
+    if (window.location.hash === '#egress-proxy') {
+      if (!embeddedTab && activeTab !== 'advanced') {
+        setActiveTab('advanced')
+      }
+      setTimeout(() => {
+        document.getElementById('egress-proxy')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }, 150)
+    }
+  }, [activeTab, embeddedTab])
   const nextPort = useMemo(() => {
     const used = new Set(upstreams.map((u) => u.port))
     for (let p = 18704; p <= 18799; p++) {
@@ -809,7 +873,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
       })
       setTestResult((m) => ({
         ...m,
-        [u.name]: r.ok ? `✓ ${r.message ?? t('settings.toast.testOk')}` : `✗ ${r.error ?? t('settings.toast.testFailed')}`,
+        [u.name]: r.ok ? `✓ ${r.message ?? (testMode === 'port' ? t('settings.toast.portListenOk') : t('settings.toast.testOk'))}` : `✗ ${r.error ?? t('settings.toast.testFailed')}`,
       }))
       if (!r.ok) toast(`${t('settings.toast.testFailed')}：${r.error}`, 'error')
       else toast(t('settings.toast.testPassed'))
@@ -1020,6 +1084,23 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   <Input className="h-7 w-24 font-mono text-xs" placeholder={t('settings.clients.pathPrefixPh')} value={testPathPrefix} onChange={(e) => setTestPathPrefix(e.target.value)} />
           </div>
 
+          {hasUnconfiguredEgress && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-700 dark:text-amber-300">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                <span>{t('settings.clients.egressGlobalWarning')}</span>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 border-amber-500/30 bg-background text-xs text-amber-700 hover:bg-amber-500/10 dark:text-amber-300"
+                onClick={handleGoToEgress}
+              >
+                {t('settings.clients.goToEgressSetting')}
+              </Button>
+            </div>
+          )}
+
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3" style={{ alignItems: 'stretch' }}>
             {upstreams.filter((u) => !clientSearch || u.name.includes(clientSearch) || String(u.port).includes(clientSearch) || (u.target ?? '').includes(clientSearch)).map((u) => {
               const baseUrl = `http://127.0.0.1:${u.port}`
@@ -1039,9 +1120,23 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                       :{u.port}
                     </Badge>
                     {u.use_proxy && (
-                      <Badge className="bg-amber-500/10 px-1.5 text-[10px] font-medium text-amber-600 hover:bg-amber-500/10 dark:text-amber-400">
-                        {t('settings.clients.egress')}
-                      </Badge>
+                      egressActive ? (
+                        <Badge
+                          className="bg-amber-500/10 px-1.5 text-[10px] font-medium text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
+                          title={tf('settings.clients.egressActiveTip', { url: cfg?.egress_proxy?.url ?? '' })}
+                        >
+                          {t('settings.clients.egress')}
+                        </Badge>
+                      ) : (
+                        <Badge
+                          variant="outline"
+                          className="gap-1 border-amber-500/40 bg-amber-500/10 px-1.5 text-[10px] font-medium text-amber-600 dark:text-amber-400"
+                          title={t('settings.clients.egressDisabledTip')}
+                        >
+                          <AlertCircle className="h-3 w-3" />
+                          {t('settings.clients.egress')} ({t('settings.clients.egressNotConfigured')})
+                        </Badge>
+                      )
                     )}
                     <code className="ml-auto truncate font-mono text-[11px] text-muted-foreground" title={u.target}>
                       {u.target}
@@ -1987,7 +2082,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
         </DialogContent>
       </Dialog>
 
-          <Card className="border bg-card">
+          <Card id="egress-proxy" className="border bg-card scroll-mt-6">
             <CardHeader>
               <CardTitle className="text-sm font-semibold">{t('settings.advanced.egress')}</CardTitle>
             </CardHeader>
@@ -2379,6 +2474,8 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
           onSave={onSaveUpstream}
           onClose={() => { setEditing(null); setAdding(false) }}
           captureMode={cfg?.capture_mode ?? 'reverse'}
+          egressProxy={cfg?.egress_proxy}
+          onGoToEgress={handleGoToEgress}
         />
       )}
     </div>
