@@ -108,6 +108,15 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 > Windows 本地若 `bash` 被解析成 WSL 垫片，用 `MASKIT_BASH=<PortableGit>\usr\bin\bash.exe` 覆盖；
 > 找不到时脚本会跳过 shell 校验并告警（CI 在 ubuntu 上必跑）。
 
+> **Windows 本地 Python 解释器**：裸 `python` 可能解析到未装 flask/mitmproxy 的版本
+> （实测 3.14），导致 python 组门禁直接 ImportError。跑本地门禁时显式指定 3.13
+> 解释器（已装齐 flask + mitmproxy + pyinstaller）：
+> ```powershell
+> python scripts/verify-all.py --python "D:\software\work\Python\Python313\python.exe"
+> ```
+> 或先 `$env:MASKIT_PYTHON = "D:\software\work\Python\Python313\python.exe"` 再直接跑；
+> 解释器路径变化时以 `py -3.13 -c "import sys; print(sys.executable)"` 的实际输出为准。
+
 ### 运行时文件约定
 
 - `engine/config.example.json` 是随包分发的配置模板；源码态首次运行在 `engine/` 生成 `config.json`（已 gitignore），打包态生成到用户数据目录。**不要把 `engine/config.json` 提交进仓库。**

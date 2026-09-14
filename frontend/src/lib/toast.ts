@@ -17,7 +17,7 @@ function ensureHost(): HTMLElement {
   return host
 }
 
-export function toast(message: string, kind: ToastKind = 'success', duration = 2500) {
+export function toast(message: string, kind: ToastKind = 'success', duration?: number) {
   const el = document.createElement('div')
   const color =
     kind === 'error'
@@ -28,9 +28,25 @@ export function toast(message: string, kind: ToastKind = 'success', duration = 2
   el.className = `pointer-events-auto flex items-center gap-2 rounded-lg border bg-card px-3.5 py-2.5 text-sm shadow-lg animate-[toast-in_0.2s_ease] ${color}`
   el.textContent = message
   ensureHost().appendChild(el)
-  setTimeout(() => {
+
+  // 停留时长：错误消息带原因详情，需要比成功提示更长的阅读时间；
+  // 未显式传 duration 时按 kind 取默认值（原统一 2.5s 太短，长文案看不完就消失）
+  const wait = duration ?? (kind === 'error' ? 6000 : 3500)
+
+  const beginDismiss = () => {
     el.style.opacity = '0'
     el.style.transition = 'opacity 0.2s'
     setTimeout(() => el.remove(), 220)
-  }, duration)
+  }
+  let removeTimer = setTimeout(beginDismiss, wait)
+
+  // 鼠标悬停时冻结倒计时（未开始淡出则保持原样），移开后给 1.5s 缓冲再走淡出，
+  // 保证「没看完」的场景可以一直按住阅读
+  el.addEventListener('mouseenter', () => {
+    clearTimeout(removeTimer)
+    if (el.style.opacity !== '0') el.style.transition = ''
+  })
+  el.addEventListener('mouseleave', () => {
+    removeTimer = setTimeout(beginDismiss, 1500)
+  })
 }
