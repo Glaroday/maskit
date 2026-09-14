@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "maskit"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "log",
  "reqwest 0.12.28",

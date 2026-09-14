@@ -43,7 +43,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { cn, formatCompactNumber, formatTokensShort } from '@/lib/utils'
+import { cn, formatCompactNumber, formatTokensShort, formatBytes } from '@/lib/utils'
 import { CRED_LABELS, maskWord } from '@/lib/sensitive-word'
 import { toast } from '@/lib/toast'
 import { useI18n } from '@/lib/i18n'
@@ -524,7 +524,19 @@ export default function Dashboard() {
               <Gauge className="h-[18px] w-[18px]" />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-[13px] font-semibold leading-5 text-foreground/80">{t('dash.prefixFidelity')}</div>
+              <div className="flex items-center gap-1.5 text-[13px] font-semibold leading-5 text-foreground/80">
+                <span>{t('dash.prefixFidelity')}</span>
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <HelpCircle className="h-3.5 w-3.5 cursor-help text-muted-foreground/60 hover:text-muted-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-[280px] text-xs leading-relaxed">
+                      {t('dash.prefixFidelityTooltip')}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
               <div className="text-[11px] font-medium text-muted-foreground/80">{t('dash.prefixHint')}</div>
             </div>
             {prefix && (
@@ -535,7 +547,19 @@ export default function Dashboard() {
           </div>
           <div className="mt-4 grid grid-cols-3 gap-3 border-t pt-3">
             <div className="min-w-0">
-              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixClean')}</div>
+              <div className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                <span className="truncate">{t('dash.prefixClean')}</span>
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <HelpCircle className="h-3 w-3 shrink-0 cursor-help text-muted-foreground/50 hover:text-muted-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-[260px] text-xs leading-relaxed">
+                      {t('dash.prefixCleanTooltip')}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
               <div className="text-[20px] font-bold leading-tight tabular-nums text-sky-600 dark:text-sky-400">
                 {prefix ? `${(prefix.clean_rate * 100).toFixed(1)}%` : '—'}
               </div>
@@ -548,11 +572,23 @@ export default function Dashboard() {
               </div>
             </div>
             <div className="min-w-0">
-              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixReuse')}</div>
-              <div className="text-[20px] font-bold leading-tight tabular-nums">
+              <div className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                <span className="truncate">{t('dash.prefixReuse')}</span>
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <HelpCircle className="h-3 w-3 shrink-0 cursor-help text-muted-foreground/50 hover:text-muted-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-[260px] text-xs leading-relaxed">
+                      {t('dash.prefixReuseTooltip')}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
+              <div className="text-[20px] font-bold leading-tight tabular-nums text-emerald-600 dark:text-emerald-400">
                 {prefix?.reuse_rate != null ? `${(prefix.reuse_rate * 100).toFixed(1)}%` : '—'}
               </div>
-              <div className="truncate text-[11px] text-muted-foreground/80" title={t('dash.prefixReuseHint')}>
+              <div className="truncate text-[11px] text-muted-foreground/80">
                 {prefix
                   ? prefix.rewritten > 0
                     ? `${prefix.suffix_reused.toLocaleString()} / ${prefix.rewritten.toLocaleString()}`
@@ -561,11 +597,28 @@ export default function Dashboard() {
               </div>
             </div>
             <div className="min-w-0">
-              <div className="truncate text-[11px] font-medium text-muted-foreground">{t('dash.prefixDiff')}</div>
-              <div className="text-[20px] font-bold leading-tight tabular-nums">
-                {prefix?.avg_first_diff != null ? prefix.avg_first_diff.toFixed(1) : '—'}
+              <div className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                <span className="truncate">{t('dash.prefixDiff')}</span>
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <HelpCircle className="h-3 w-3 shrink-0 cursor-help text-muted-foreground/50 hover:text-muted-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-[260px] text-xs leading-relaxed">
+                      <div>{t('dash.prefixDiffTooltip')}</div>
+                      {prefix?.avg_first_diff != null && (
+                        <div className="mt-1 border-t border-border/50 pt-1 text-[10px] text-muted-foreground">
+                          {tf('dash.prefixDiffExact', { n: prefix.avg_first_diff.toLocaleString() })}
+                        </div>
+                      )}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </div>
-              <div className="truncate text-[11px] text-muted-foreground/80" title={t('dash.prefixDiffHint')}>
+              <div className="text-[20px] font-bold leading-tight tabular-nums">
+                {prefix?.avg_first_diff != null ? formatBytes(prefix.avg_first_diff) : '—'}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground/80">
                 {prefix
                   ? prefix.rewritten > 0
                     ? `${prefix.diff_samples.toLocaleString()} / ${prefix.rewritten.toLocaleString()}`
