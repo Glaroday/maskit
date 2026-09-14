@@ -112,9 +112,9 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 > （实测 3.14），导致 python 组门禁直接 ImportError。跑本地门禁时显式指定 3.13
 > 解释器（已装齐 flask + mitmproxy + pyinstaller）：
 > ```powershell
-> python scripts/verify-all.py --python "D:\software\work\Python\Python313\python.exe"
+> python scripts/verify-all.py --python "C:\Python313\python.exe"
 > ```
-> 或先 `$env:MASKIT_PYTHON = "D:\software\work\Python\Python313\python.exe"` 再直接跑；
+> 或先 `$env:MASKIT_PYTHON = "C:\Python313\python.exe"` 再直接跑；
 > 解释器路径变化时以 `py -3.13 -c "import sys; print(sys.executable)"` 的实际输出为准。
 
 ### 运行时文件约定
