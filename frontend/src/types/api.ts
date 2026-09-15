@@ -69,6 +69,8 @@ export interface ProxyStatus {
   needs_ca: boolean
   wizard_recommended: boolean
   last_error: string
+  /** MASKIT_PANEL_TOKEN 太短/非 ASCII 被忽略（面板改用随机 token），前端弹一次性提醒 */
+  panel_token_env_rejected?: boolean
 }
 
 // ========== 事件（/api/logs） ==========

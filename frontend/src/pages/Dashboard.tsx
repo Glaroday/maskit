@@ -381,6 +381,14 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* 环境变量 token 被忽略：Docker 无头用户翻不到启动日志，必须首屏可见 */}
+      {status?.panel_token_env_rejected && (
+        <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="min-w-0 flex-1">{t('dash.panelTokenRejected')}</span>
+        </div>
+      )}
+
       {/* 自动恢复横幅 */}
       {status?.auto_recovered_at && !status.auto_recover_fail && (
         <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-600 dark:text-emerald-400">
@@ -898,6 +906,19 @@ export default function Dashboard() {
         <div className="flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-2.5 text-xs text-amber-600 dark:text-amber-400">
           <Globe className="h-3.5 w-3.5 shrink-0" />
           <span>{t('dash.egressOn')}{status!.egress_proxy_users.join(lang === 'en' ? ', ' : '、')}</span>
+        </div>
+      )}
+      {/* egress 开了但没有任何客户端勾选：状态型提示常驻展示（不再走保存 toast，
+          那样每存一次任意配置都会重复弹一遍，用户反馈被骚扰） */}
+      {Boolean(status?.egress_proxy?.enabled) && (status?.egress_proxy_users ?? []).length === 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-700 dark:text-amber-300">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <span>{t('dash.egressNoUserNotice')}</span>
+          </div>
+          <Link to="/settings" className="shrink-0 font-medium underline hover:text-foreground">
+            {t('settings.clients.goToEgressSetting')}
+          </Link>
         </div>
       )}
       {!status?.egress_proxy?.enabled && (status?.egress_proxy_users ?? []).length > 0 && (

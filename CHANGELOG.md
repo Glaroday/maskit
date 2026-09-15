@@ -2,6 +2,28 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 新增 / Added
+- 内网 IPv6 规则（`IPV6_PRIVATE`，默认关）：fe80:: 链路本地与 fc00::/7 ULA，语义校验排除公网/文档段与 MAC 地址。
+  *Private IPv6 rule (`IPV6_PRIVATE`, default off): fe80:: link-local and fc00::/7 ULA, with semantic validation excluding public/doc ranges and MAC addresses.*
+- USCC 校验位验证（GB 32100-2015 MOD31）：开启规则后误伤率压至 1/31。
+  *USCC check-digit validation (GB 32100-2015 MOD31): false-positive rate down to 1/31 when the rule is enabled.*
+- README 部署章节补单端口模式（5802 路径前缀路由）说明。
+  *README deployment docs: single-port mode (5802 path-prefix routing) section.*
+- 仪表盘新增「出口代理已启用但无客户端勾选」状态横幅与「MASKIT_PANEL_TOKEN 被忽略」提醒（stderr 双写 + 面板可见）。
+  *Dashboard banners for "egress enabled but unused" and "MASKIT_PANEL_TOKEN rejected" (now also double-written to stderr).*
+
+### 修复 / Bug Fixes
+- 透传兜底层：https 出口代理按 TLS 编排 CONNECT（原明文直连必握手失败）；上游空闲超时 900s→300s，mid-stream 失败不再叠加错误状态行；同名多值请求头合并转发不再丢值；恢复透传 accept-encoding（gzip/deflate 流式解压后再还原）。
+  *Passthrough: https egress proxies now do TLS-then-CONNECT (was plaintext and always failed); upstream idle timeout 900s→300s with no status-line corruption on mid-stream failures; duplicate request headers joined instead of dropped; Accept-Encoding passthrough restored (gzip/deflate stream-decompressed before restore).*
+- /v1 通配卡片不再同时展示两个相同的 Base URL 复制项。
+  */v1 wildcard cards no longer show two identical Base URL copy entries.*
+
+### 优化 / Changed
+- 「出口代理已启用但没人勾选」不再在每次保存配置时弹 toast（改为仪表盘常驻状态横幅）。
+  *"Egress enabled but unused" no longer toasts on every config save (persistent dashboard banner instead).*
+
 ## [0.2.12] - 2026-09-15
 
 ### 新增 / Added

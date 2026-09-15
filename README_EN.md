@@ -216,6 +216,30 @@ Open `http://<server-ip>:5801` directly in your browser and enter your configure
 > }
 > ```
 
+#### Advanced: Single-Port Mode (one proxy port for Docker)
+
+Prefer not to map one port per client? Use **single-port prefix mode**: all clients share port 5802 and are distinguished by path prefix. In the console's "Clients" page, each client's **Path Prefix (base_path)** becomes the path part of the client's `base_url`:
+
+```bash
+docker run -d \
+  --name maskit \
+  --restart unless-stopped \
+  -p 127.0.0.1:5801:5801 \
+  -p 127.0.0.1:5802:5802 \
+  -v maskit_data:/data \
+  -e MASKIT_PANEL_TOKEN="YourSecretToken123456" \
+  ghcr.io/xiayutian11/maskit:latest
+```
+
+Given two clients (path prefixes `/openai` and `/anthropic`), point external tools at:
+
+| Client | Base URL |
+|---|---|
+| OpenAI protocol (prefix `/openai`) | `http://<server-ip>:5802/openai/v1` |
+| Anthropic protocol (prefix `/anthropic`) | `http://<server-ip>:5802/anthropic` |
+
+> 💡 **Multi-port vs single-port**: multi-port (18701+) gives each client a dedicated port and the shortest `base_url` — ideal for local personal use; single-port maps just 5802 — ideal when container ports are constrained or you route everything through one Nginx prefix. Both modes coexist: prefix routing on 5802 and each client's dedicated port work simultaneously.
+
 ---
 
 ### Option C: Run from Source

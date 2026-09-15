@@ -2022,6 +2022,45 @@ class ShieldEngineTests(unittest.TestCase):
             self.assertIn("13911112222", got)
         self._with_no_reload(run)
 
+    def test_response_scan_does_not_warn_on_restored_historical_pii(self):
+        """多轮对话防误报：第 2 轮请求未发 PII，模型回复还原了历史占位符，不触发 SCAN_WARN。"""
+        def run():
+            tr.CAPTURE_MODE = "reverse"
+            tr.UPSTREAMS = list(tr.DEFAULT_UPSTREAMS)
+            tr.RESPONSE_SCAN = True
+            emitted = []
+            old_emit = tr._emit
+            tr._emit = lambda typ, **kw: emitted.append((typ, kw))
+            try:
+                # 第 1 轮：脱敏手机号
+                flow1 = self._reverse_flow("/openai/v1/chat/completions", {
+                    "messages": [{"role": "user", "content": "联系人张三电话13812345678"}]
+                })
+                tr.request(flow1)
+                req_content = json.loads(flow1.request.content)["messages"][0]["content"]
+                m_tokens = tr._PLACEHOLDER_RX.findall(req_content)
+                self.assertTrue(m_tokens, "首轮必须完成脱敏生成占位符")
+                token = next(tok for tok in m_tokens if "PHONE" in tok)
+
+                # 第 2 轮：新会话/新请求，不发 PII，模型回复里引用了历史占位符
+                flow2 = self._reverse_flow("/openai/v1/chat/completions", {
+                    "messages": [{"role": "user", "content": "请告诉我张三的联系方式"}]
+                })
+                tr.request(flow2)
+                flow2.response = SimpleNamespace(
+                    headers={"content-type": "application/json"},
+                    content=json.dumps({"choices": [{"message": {"content": "张三的电话是" + token}}]}, ensure_ascii=False).encode("utf-8"),
+                )
+                tr.response(flow2)
+            finally:
+                tr._emit = old_emit
+                tr.RESPONSE_SCAN = False
+            warns = [kw for typ, kw in emitted if typ == "SCAN_WARN"]
+            self.assertEqual(len(warns), 0, "还原历史占位符绝不得误触发 SCAN_WARN")
+            got2 = json.loads(flow2.response.content)["choices"][0]["message"]["content"]
+            self.assertIn("13812345678", got2, "历史占位符必须成功还原")
+        self._with_no_reload(run)
+
     def test_filter_disabled_routes_but_does_not_mask(self):
         """过滤开关关闭：reverse 仍路由（改 host），但不脱敏，body 原样转发。"""
         def run():
@@ -4730,11 +4769,15 @@ class NewRulesTests(unittest.TestCase):
         r = self._mask("序列 12 34 56 78 90 ab")
         self.assertIn("12 34 56 78 90 ab", r, "空格分隔不应命中 MAC")
 
-    # ---- USCC（默认关，手动开启验证）----
+    # ---- USCC（默认关，手动开启验证；MOD31 校验位，GB 32100-2015）----
     def test_uscc_masked_when_enabled(self):
         tr.BUILTIN_RULES["USCC"] = True
-        r = self._mask("信用代码 91110108MA01ABCD2E")
-        self.assertNotIn("91110108MA01ABCD2E", r, "USCC 应脱敏")
+        # 91100000100003962T 为真实公示码（有效 MOD31 校验位）
+        r = self._mask("信用代码 91100000100003962T")
+        self.assertNotIn("91100000100003962T", r, "有效 USCC 应脱敏")
+        # 校验位错误（尾位 A）必须原样放行：随机字母数字串误伤率压到 1/31
+        r2 = self._mask("信用代码 91100000100003962A")
+        self.assertIn("91100000100003962A", r2, "错校验位 USCC 不得误伤")
 
     # ---- re: 正则词 ----
     def test_regex_word_matches(self):

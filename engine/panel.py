@@ -34,6 +34,7 @@ import socket
 import subprocess
 import threading
 import webbrowser
+import zlib
 from pathlib import Path
 from collections import deque
 from urllib.parse import urlparse, urlsplit, unquote
@@ -223,9 +224,17 @@ LISTEN_HOST = os.environ.get("MASKIT_LISTEN_HOST", "127.0.0.1").strip() or "127.
 # API token 每次启动随机；远程模式下用户无法读容器内 proxy_token 文件，
 # 允许 MASKIT_PANEL_TOKEN 固定（≥16 位，太短直接忽略并回退随机，宁可拒绝也不弱化）。
 _MIN_PANEL_TOKEN_LEN = 16
+# 环境变量 token 被拒绝的标志：仅作 /api/status 展示（Docker 无头用户翻不到
+# 启动日志，必须能在面板首屏看到「我设置的 token 没生效」）。
+PANEL_TOKEN_ENV_REJECTED = False
 _env_token = os.environ.get("MASKIT_PANEL_TOKEN", "").strip()
 if _env_token and (len(_env_token) < _MIN_PANEL_TOKEN_LEN or not _env_token.isascii()):
-    print(f"[panel] MASKIT_PANEL_TOKEN 无效（需 ≥{_MIN_PANEL_TOKEN_LEN} 位 ASCII），已忽略并改用随机 token")
+    msg = (f"[panel] MASKIT_PANEL_TOKEN 无效（需 ≥{_MIN_PANEL_TOKEN_LEN} 位 ASCII），"
+           f"已忽略并改用随机 token")
+    # stdout + stderr 双写：容器日志采集器常只挂 stderr，单写 stdout 等于没写
+    print(msg)
+    print(msg, file=sys.stderr, flush=True)
+    PANEL_TOKEN_ENV_REJECTED = True
     _env_token = ""
 API_TOKEN = _env_token or secrets.token_urlsafe(24)
 INTERNET_SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -928,16 +937,17 @@ _PT_BUF_MAX = 4 << 20
 
 
 def _pt_should_restore(ct_lower, encoding):
-    """PT 还原启用判据：JSON/SSE/NDJSON 且响应未压缩。
+    """PT 还原启用判据：JSON/SSE/NDJSON 且响应编码可还原。
 
-    压缩字节流不是 UTF-8 文本，errors="replace" 解码再回写会把整条响应损坏
-    （脱敏路径 transparent 的 responseheaders 有同款守卫）。请求侧虽已剥
-    accept-encoding，但上游是否配合不受控。
+    gzip/deflate 由调用方配 zlib 流式解压器后再进还原链路（请求侧已恢复
+    透传 accept-encoding，不再强制全站非压缩）；brotli 等 stdlib 解不了的
+    编码返回 False——压缩字节流不是 UTF-8 文本，errors="replace" 解码再
+    回写会把整条响应损坏（脱敏路径 transparent 的 responseheaders 有同款守卫）。
     """
     if "json" not in ct_lower and "text/event-stream" not in ct_lower:
         return False
     enc = (encoding or "").lower().strip()
-    return not enc or enc == "identity"
+    return not enc or enc in ("identity", "gzip", "deflate")
 
 
 def _pt_restore_map():
@@ -1070,6 +1080,77 @@ def _pt_restore_chunk(state, data, rmap, stats, final):
     return out
 
 
+# PT 上游空闲读超时（秒）：socket timeout 是「单次 recv 的上限」而非总时长，
+# 900s 意味着上游静默挂死时客户端要干等 15 分钟才拿 502。SSE 正常事件间隔是
+# 秒级，300s 静默基本等于挂死；真有超长思考的模型用户可在上游侧配心跳。
+_PT_UPSTREAM_TIMEOUT = 300
+
+
+def _pt_connect_via_proxy(proxy_host, proxy_port, proxy_is_tls, host, port, timeout, target_tls):
+    """经出口代理建到目标 host:port 的连接（CONNECT 隧道）。
+
+    http 代理：http.client 自带 set_tunnel 即可；https 代理（与代理本身先 TLS
+    握手再发 CONNECT）http.client 不支持双层 TLS，必须手工编排 socket：
+    TCP 连代理 → TLS(代理) → 发 CONNECT → 读 2xx → 目标是 https 再套一层 TLS。
+    此前 https:// 出口代理被当明文 TCP 对待，代理期待 TLS 握手却收到明文
+    CONNECT，必握手失败（与 mitmproxy via 行为分叉，审计 P1）。
+    返回已就绪的 http.client 连接（sock 已注入）；CONNECT 被拒抛 OSError。
+    """
+    if not proxy_is_tls:
+        # https 目标必须用 HTTPSConnection：connect() 在 _tunnel() 后对目标
+        # wrap TLS（SNI=目标）；HTTPConnection 的隧道内是明文 HTTP，https 上游
+        # 期待 TLS 握手却收到明文，全部请求失败（复审 #1——此前回归于此）
+        conn_cls = http.client.HTTPSConnection if target_tls else http.client.HTTPConnection
+        conn = conn_cls(proxy_host, proxy_port, timeout=timeout)
+        conn.set_tunnel(host, port)
+        return conn
+    import socket as _socket
+    import ssl as _ssl
+    raw = _socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    sock = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT).wrap_socket(raw, server_hostname=proxy_host)  # 与代理本身的 TLS 层
+    try:
+        sock.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode("ascii"))
+        # 响应行 + 头部读完为止（只要状态行就够判断，头部按行吃到空行丢弃）
+        status_line = b""
+        while b"\r\n" not in status_line:
+            b_ = sock.recv(1)
+            if not b_:
+                raise OSError("egress proxy closed connection during CONNECT")
+            status_line += b_
+        try:
+            status_code = int(status_line.split()[1])
+        except (IndexError, ValueError):
+            status_code = 0
+        if status_code < 200 or status_code >= 300:
+            raise OSError(f"egress proxy CONNECT rejected: {status_line.decode('latin-1', 'replace').strip()}")
+        while True:  # 吃掉剩余响应头直到空行
+            line = b""
+            while b"\r\n" not in line:
+                b_ = sock.recv(1)
+                if not b_:
+                    break
+                line += b_
+            if line in (b"\r\n", b"\n", b""):
+                break
+        if target_tls:
+            sock = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT).wrap_socket(sock, server_hostname=host)  # 隧道内目标 TLS 层
+        # 连接类按目标协议选（wrap 后的 sock 是 TLS/明文都与目标匹配）；
+        # 必须补 set_tunnel：sock 已注入时 connect() 被跳过、不会重发 CONNECT，
+        # 但 putrequest 生成 Host 头读的是 _tunnel_host——漏了它目标会收到
+        # 「Host: 代理地址」，按 Host 路由的 CDN（Cloudflare 等）直接 403/421
+        conn_cls = http.client.HTTPSConnection if target_tls else http.client.HTTPConnection
+        conn = conn_cls(proxy_host, proxy_port, timeout=timeout)
+        conn.set_tunnel(host, port)
+        conn.sock = sock  # 注入手工建好的连接，后续 request() 直接复用
+        return conn
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
+
+
 def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
     parsed = urlparse(target)
     use_https = parsed.scheme == "https"
@@ -1116,6 +1197,7 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
         def _do_forward(self, head=False):
             _fwd_t0 = time.perf_counter()
             _first_byte_ms = None
+            headers_sent = False  # mid-stream 失败时禁止再 send_error（会叠状态行损坏响应）
             # Content-Length 缺失/畸形/为 0（GET、无 body POST）→ 空 body；
             # chunked 请求手动解码后按完整 body 转发（http.client 不支持直接透传 chunk 帧）
             try:
@@ -1160,25 +1242,69 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
             client_port = self.client_address[1] if self.client_address and len(self.client_address) > 1 else None
             client_str = f"{client_host}:{client_port}" if client_host and client_port else client_host
 
-            # 原样转发客户端头，UA 必须保留（Cloudflare 会按 UA 拦 Python-urllib）
+            # 原样转发客户端头，UA 必须保留（Cloudflare 会按 UA 拦 Python-urllib）。
+            # 同名多值头不再互相覆盖：dict 只留最后一个会丢多值语义（mitmproxy
+            # 模式保留多值，兜底层丢，两模式行为分叉）。HTTP/1.1 头语义下 ", "
+            # 合并等价于逐条发送；Cookie 例外——RFC 6265 的分隔符是 "; "，
+            # 用 ", " 合并会让上游把 'sid=1,' 当畸形 cookie，会话静默失效。
             headers = {}
             for k, v in self.headers.items():
                 lk = k.lower()
-                if lk in ("host", "content-length", "transfer-encoding", "connection", "proxy-connection", "accept-encoding"):
+                if lk in ("host", "content-length", "transfer-encoding", "connection", "proxy-connection"):
                     continue
-                headers[k] = v
-            headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            if proxy_host and proxy_port:
-                # 走出口代理 CONNECT 隧道（境内中转直连，境外官方 API 走代理）
-                if use_https:
-                    conn = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=900)
-                    conn.set_tunnel(host, port)
+                if k in headers:
+                    headers[k] = headers[k] + ("; " if lk == "cookie" else ", ") + v
                 else:
-                    conn = http.client.HTTPConnection(proxy_host, proxy_port, timeout=900)
-                    conn.set_tunnel(host, port)
-            else:
-                conn = (http.client.HTTPSConnection(host, port, timeout=900)
-                        if use_https else http.client.HTTPConnection(host, port, timeout=900))
+                    headers[k] = v
+            headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            # 还原映射非空时把 accept-encoding 限定到可解编码（gzip/deflate/identity）：
+            # 上游若选 br/zstd，压缩字节流 stdlib 解不了，占位符会原样透传给用户
+            # 且无任何事件留痕，换回 gzip 又正常——完全无法归因。透传期无还原
+            # 期望（映射为空）时不改写，保留完整压缩协商。
+            try:
+                _may_restore = bool(_pt_restore_map())
+            except Exception:
+                _may_restore = False
+            if _may_restore:
+                _ae_key = next((k for k in headers if k.lower() == "accept-encoding"), None)
+                if _ae_key:
+                    _tokens = [t.strip() for t in headers[_ae_key].split(",") if t.strip()]
+                    _ok = ("gzip", "deflate", "identity", "x-gzip")
+                    if any(t.split(";")[0].strip() not in _ok for t in _tokens):
+                        headers[_ae_key] = "gzip, deflate"
+            try:
+                if proxy_host and proxy_port:
+                    # 走出口代理 CONNECT 隧道（境内中转直连，境外官方 API 走代理）；
+                    # https 代理（与代理先 TLS）由 _pt_connect_via_proxy 手工编排
+                    conn = _pt_connect_via_proxy(
+                        proxy_host, proxy_port,
+                        (proxy_parsed.scheme or "http").lower() == "https",
+                        host, port, _PT_UPSTREAM_TIMEOUT, use_https)
+                else:
+                    conn = (http.client.HTTPSConnection(host, port, timeout=_PT_UPSTREAM_TIMEOUT)
+                            if use_https else http.client.HTTPConnection(host, port, timeout=_PT_UPSTREAM_TIMEOUT))
+            except Exception as e:
+                # 建链失败（代理拒绝/不可达）：与转发失败同款 502 + ERR 落库
+                try:
+                    enqueue_event({
+                        "ts": time.time(), "type": "ERR", "host": host, "method": self.command,
+                        "path": self.path.split("?")[0], "status": 502, "http_status": 502,
+                        "upstream": up_val, "model": req_model or None,
+                        "client": client_str, "client_host": client_host, "client_port": client_port,
+                        "msg": f"passthrough-connect: {type(e).__name__}: {_safe_public_text(e, 120)}",
+                        "upstream_ms": round((time.perf_counter() - _fwd_t0) * 1000, 1),
+                        "passthrough": True,
+                    })
+                except Exception:
+                    pass
+                # 此处不得 _drain_request_body()：请求体在上方已全量读入内存，
+                # rfile 已排空，再按 Content-Length 读会阻塞到 socket 超时
+                # （300s）——代理宕机期间每个带 body 的 POST 都白等 5 分钟
+                try:
+                    self.send_error(502, "透传连接失败，请查看面板日志")
+                except Exception:
+                    pass
+                return
             try:
                 # 合并 Target 与客户端请求的 Query 参数，绝不丢失 api-version 等必要参数
                 if "?" in self.path:
@@ -1191,10 +1317,19 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 conn.request(self.command, upstream_path, body=body, headers=headers)
                 resp = conn.getresponse()
                 ct_lower = (resp.getheader("Content-Type") or "").lower()
-                # 占位符还原（透传体验闭环）：JSON / SSE / NDJSON、未压缩且映射非空
-                # 时启用。失败兜底：还原链路任何异常都退回原样透传，绝不搞断连接。
-                resp_encoding = resp.getheader("Content-Encoding") or ""
+                # 占位符还原（透传体验闭环）：JSON / SSE / NDJSON 且映射非空时启用。
+                # 失败兜底：还原链路任何异常都退回原样透传，绝不搞断连接。
+                # gzip/deflate 由下面的解压器处理（请求侧已恢复透传 accept-encoding，
+                # 不再为了还原把全站响应都打成非压缩——大响应透传变慢，审计 P2）。
+                # 解压器只在还原激活（映射非空）时创建：纯解压透传没有任何收益，
+                # 却强制剥 Content-Length 改 EOF 定界，把 keep-alive 也一起打断。
+                resp_encoding = (resp.getheader("Content-Encoding") or "").lower().strip()
                 rmap = _pt_restore_map() if _pt_should_restore(ct_lower, resp_encoding) else {}
+                gzip_decomp = None
+                if rmap and resp_encoding in ("gzip", "deflate"):
+                    gzip_decomp = (zlib.decompressobj(16 + zlib.MAX_WBITS)
+                                   if resp_encoding == "gzip"
+                                   else zlib.decompressobj())
                 pt_state = None
                 pt_stats = {}
                 if rmap:
@@ -1216,8 +1351,8 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 is_streaming = resp.getheader("Transfer-Encoding", "").lower() == "chunked" or \
                     "text/event-stream" in ct_lower or \
                     not resp.getheader("Content-Length")
-                if pt_state is not None:
-                    # 还原会改变 body 长度：必须剥掉原 Content-Length 改用 EOF 定界
+                if pt_state is not None or gzip_decomp is not None:
+                    # 还原/解压会改变 body 字节与长度：必须剥原 Content-Length 改 EOF 定界
                     is_streaming = True
                 for k, v in resp.getheaders():
                     lk = k.lower()
@@ -1225,9 +1360,17 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                         continue
                     if lk == "content-length" and is_streaming:
                         continue
+                    if lk == "content-encoding" and gzip_decomp is not None:
+                        continue  # 解压后不再是 gzip，转发该头会让客户端二次解压出错
                     self.send_header(k, v)
-                self.send_header("Connection", "close" if is_streaming else "keep-alive")
+                # 客户端请求 Connection: close 时响应必须同款 close，否则客户端
+                # 按头等 EOF 永远等不到（BaseHTTPRequestHandler 已解析进
+                # self.close_connection，但响应头的 Connection 是这里手发的）。
+                client_wants_close = bool(getattr(self, "close_connection", False))
+                self.send_header("Connection",
+                                 "close" if (is_streaming or client_wants_close) else "keep-alive")
                 self.end_headers()
+                headers_sent = True  # mid-stream 失败只能断流，不得再 send_error 叠加状态行
                 # 流式逐块回传（SSE 兼容：不缓存整段）。
                 # 必须用 read1()：read(n) 会攒满 n 字节才返回，LLM SSE 单事件只有
                 # 几十~几百字节永远攒不满 64KB → 客户端等整个生成结束才见首字节
@@ -1238,12 +1381,30 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                                 else None)
                 resp_tail_chunks = []
                 tail_len = 0
+                raw_deflate_tried = False  # deflate 有 zlib 包装/raw 两种流（HTTP 歧义）
                 while True:
                     chunk = resp.read1(65536)
                     if not chunk:
                         break
                     if _first_byte_ms is None:
                         _first_byte_ms = (time.perf_counter() - _fwd_t0) * 1000
+                    if gzip_decomp is not None:
+                        # gzip/deflate 增量解压：解出的明文进还原/下发链路。
+                        # deflate 首块解压失败（zlib.error）时回退 raw 解压器重试
+                        # 一次——IIS 等服务器常发非合规 raw deflate，硬抛会让
+                        # 客户端收到 200 + 空 body 的静默损坏响应
+                        raw_chunk = chunk
+                        try:
+                            chunk = gzip_decomp.decompress(raw_chunk)
+                        except zlib.error:
+                            if resp_encoding == "deflate" and not raw_deflate_tried:
+                                raw_deflate_tried = True
+                                gzip_decomp = zlib.decompressobj(-zlib.MAX_WBITS)
+                                chunk = gzip_decomp.decompress(raw_chunk)
+                            else:
+                                raise
+                        if not chunk:
+                            continue  # zlib 内部攒头部/字典时可能整块吃掉不出货
                     if pt_state is not None:
                         # 还原后可能为空串（帧不完整/半截占位符被扣留），跳过写入
                         try:
@@ -1356,8 +1517,16 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                     })
                 except Exception:
                     pass
+                # headers 已发出时（mid-stream 上游挂死/超时）只能断流：send_error 会
+                # 往已发 200 头的流里再写一个 502 状态行，客户端看到的是损坏响应。
+                # 必须显式置 close_connection：非流式路径已发 Connection: keep-alive，
+                # 不置的话 handler 返回后还在等下一个请求，客户端却在等剩余 body，
+                # 双方互等到客户端自身超时（表现为无限转圈而非快速失败）
                 try:
-                    self.send_error(502, "透传转发失败，请查看面板日志")
+                    if not headers_sent:
+                        self.send_error(502, "透传转发失败，请查看面板日志")
+                    else:
+                        self.close_connection = True
                 except Exception:
                     pass
             finally:
@@ -3494,8 +3663,12 @@ def normalize_config(raw, warnings=None):
         warn.append("出口代理已勾选启用但未填地址，已停用")
         egress_enabled = False
     egress = {"enabled": egress_enabled, "url": egress_url}
-    if egress_enabled and not any(u.get("use_proxy") for u in ups):
-        warn.append("出口代理已启用，但没有任何客户端勾选「走代理」，当前不会生效")
+    # egress 状态提示与动作型 warning 分流（2026-09-15 用户反馈「随便干什么都弹」）：
+    # 「启用了但没人勾」「勾了但全局没启用」是配置的**持续状态**，每次保存任意
+    # 配置都会重复生成，前端 toast 弹一遍就烦一遍。这类状态改由 /api/status 的
+    # egress_proxy + egress_proxy_users 驱动页面内联提示（Settings egress 卡 /
+    # Dashboard 横幅已有），不再进 warnings。动作型 warning（地址被丢弃、被
+    # 连带停用）保留——那才是「本次保存改写了什么」的一次性告知。
     proxy_ups = [u.get("name") for u in ups if u.get("use_proxy")]
     if proxy_ups and not egress_enabled:
         warn.append(f"客户端「{', '.join(proxy_ups)}」勾选了「走代理」，但全局出口代理尚未启用或未填地址，将以直连方式转发")
@@ -4331,6 +4504,9 @@ def api_status():
         })
     return jsonify({
         "version": __version__,
+        # 环境变量 token 被拒绝（太短/非 ASCII）：前端据此弹一次性横幅提醒
+        # Docker 用户「设置的 MASKIT_PANEL_TOKEN 没生效」，否则只能翻容器日志
+        "panel_token_env_rejected": PANEL_TOKEN_ENV_REJECTED,
         "panel_pid": os.getpid(),
         "proxy_running": running,
         "proxy_starting": bool(state.get("proxy_starting")),

@@ -218,6 +218,30 @@ docker run -d \
 > }
 > ```
 
+#### 进阶：单端口模式（Docker 只开一个反代端口）
+
+如果不想为每个客户端映射一个端口，可以用**单端口前缀模式**：所有客户端共用 5802 反代端口，靠路径前缀区分。在控制台「客户端管理」中，每个客户端的 **路径前缀（base_path）** 就是客户端 `base_url` 的路径部分：
+
+```bash
+docker run -d \
+  --name maskit \
+  --restart unless-stopped \
+  -p 127.0.0.1:5801:5801 \
+  -p 127.0.0.1:5802:5802 \
+  -v maskit_data:/data \
+  -e MASKIT_PANEL_TOKEN="YourSecretToken123456" \
+  ghcr.io/xiayutian11/maskit:latest
+```
+
+假设你配置了两个客户端（路径前缀分别为 `/openai` 与 `/anthropic`），外部工具的 Base URL 填：
+
+| 客户端 | Base URL |
+|---|---|
+| OpenAI 协议（前缀 `/openai`） | `http://<服务器IP>:5802/openai/v1` |
+| Anthropic 协议（前缀 `/anthropic`） | `http://<服务器IP>:5802/anthropic` |
+
+> 💡 **多端口 vs 单端口怎么选**：多端口（18701 起）每个客户端独立端口、`base_url` 最短，适合个人本机使用；单端口只映射一个 5802，适合容器端口受限或统一走 Nginx 前缀转发的场景。两种模式可以并存——5802 上的前缀路由与各客户端独立端口同时生效。
+
 ---
 
 ### 方式 C：从源码运行与开发

@@ -430,6 +430,52 @@ class MaskPathAwarenessTests(unittest.TestCase):
         self._with_no_reload(run)
 
 
+class Ipv6AndUsccRuleTests(unittest.TestCase):
+    """IPv6 私网脱敏与 USCC 校验位（GB 32100-2015 MOD31）——审计 P3 落地。"""
+
+    def setUp(self):
+        tr.sessions.clear()
+        tr.BUILTIN_RULES = dict(tr.DEFAULT_BUILTIN_RULES)
+        tr.BUILTIN_RULES["IPV6_PRIVATE"] = True
+        tr.BUILTIN_RULES["USCC"] = True
+
+    def tearDown(self):
+        tr.BUILTIN_RULES = dict(tr.DEFAULT_BUILTIN_RULES)
+
+    def test_ipv6_private_masked(self):
+        """ULA（fd00::/8）与链路本地（fe80::/10，含 zone id）必须命中。"""
+        out = tr.mask("LAN fd00:1234:5678::1 link fe80::1%eth0", "v6-a")
+        self.assertNotIn("fd00", out)
+        self.assertNotIn("fe80", out)
+        self.assertIn("{{IPV6PRIVATE_", out)
+
+    def test_ipv6_public_and_doc_ranges_kept(self):
+        """公网与文档段（2001:db8::/32）必须放行。
+
+        不能用 IPv6Address.is_private 判定——它把文档段/环回全算 private，
+        实测 2001:db8::1 被误脱（讨论网络拓扑的正常文本被打码）。
+        """
+        out = tr.mask("public 2001:db8::1 and 240e:1a2b::9 stays", "v6-b")
+        self.assertIn("2001:db8::1", out)
+        self.assertIn("240e:1a2b::9", out)
+
+    def test_mac_not_confused_with_ipv6(self):
+        """MAC（冒号 hex 串）进宽正则候选但必须被语义校验拒绝。"""
+        out = tr.mask("MAC aa:bb:cc:dd:ee:ff here", "v6-c")
+        self.assertIn("aa:bb:cc:dd:ee:ff", out)
+
+    def test_uscc_valid_masked_and_invalid_kept(self):
+        """有效校验位命中、错校验位放行（真实公示码：国家电网/浦发银行）。"""
+        self.assertTrue(tr._uscc_ok("91100000100003962T"))   # 国家电网
+        self.assertTrue(tr._uscc_ok("91310000631295002H"))   # 浦发银行
+        self.assertFalse(tr._uscc_ok("91100000100003962A"))  # 篡改校验位
+        out = tr.mask("code 91100000100003962T here", "uscc-a")
+        self.assertNotIn("91100000100003962T", out)
+        self.assertIn("{{USCC_", out)
+        out2 = tr.mask("bad 91100000100003962A here", "uscc-b")
+        self.assertIn("91100000100003962A", out2, "错校验位必须原样放行")
+
+
 class PromptCacheByteFidelityTests(unittest.TestCase):
     """命中敏感词时，**只允许被脱敏的那一段字节**发生变化。
 
@@ -1524,12 +1570,16 @@ class PassthroughRestoreTests(unittest.TestCase):
         self.assertEqual(stats.get("restored"), 1)
 
     def test_pt_restore_skips_compressed_responses(self):
-        """压缩响应绝不能进还原链路：字节流不是 UTF-8，解码回写会损坏整条响应。"""
+        """不可解压的编码（br 等）绝不进还原链路：字节流不是 UTF-8，解码回写会
+        损坏整条响应。gzip/deflate 例外——调用方先挂 zlib 流式解压器，明文再进还原。"""
         self.assertTrue(panel._pt_should_restore("application/json", ""))
         self.assertTrue(panel._pt_should_restore("text/event-stream", "identity"))
         self.assertTrue(panel._pt_should_restore("application/x-ndjson", ""))
-        self.assertFalse(panel._pt_should_restore("application/json", "gzip"))
-        self.assertFalse(panel._pt_should_restore("text/event-stream", "br"))
+        self.assertTrue(panel._pt_should_restore("application/json", "gzip"),
+                        "gzip 可解压，必须允许还原（配合 zlib 流式解压）")
+        self.assertTrue(panel._pt_should_restore("text/event-stream", "deflate"))
+        self.assertFalse(panel._pt_should_restore("text/event-stream", "br"),
+                         "brotli stdlib 解不了，必须跳过还原")
         self.assertFalse(panel._pt_should_restore("text/plain", ""))
 
     def test_clear_cutoff_persists_for_cross_process_writer(self):
@@ -2505,8 +2555,9 @@ class EgressProxyTests(unittest.TestCase):
         self.assertTrue(any("socks5" in w or "出口代理" in w for w in warns),
                         "必须给出 warning：静默丢弃会让用户以为配好了")
 
-    def test_normalize_config_warns_when_enabled_but_nobody_uses(self):
-        """配了代理却没有客户端勾选 use_proxy —— 看着「已启用」实际一条流量不走。"""
+    def test_normalize_config_no_toast_for_egress_state_notice(self):
+        """「egress 开了但没人勾」是持续状态，不进 warnings（否则每存一次任意配置
+        都弹一遍 toast 骚扰用户）；由 /api/status 驱动页面内联提示兜底展示。"""
         warns = []
         cfg = panel.normalize_config({
             "egress_proxy": {"enabled": True, "url": "http://127.0.0.1:7890"},
@@ -2514,7 +2565,10 @@ class EgressProxyTests(unittest.TestCase):
                            "target": "https://api.example.com"}],
         }, warns)
         self.assertTrue(cfg["egress_proxy"]["enabled"])
-        self.assertTrue(any("没有任何客户端" in w for w in warns), warns)
+        self.assertFalse(any("没有任何客户端" in w for w in warns),
+                         f"状态型提示不得进保存 warnings：{warns}")
+        # 反向（有客户端勾了 use_proxy）是配置状态留痕，见
+        # test_normalize_config_warns_when_upstream_uses_proxy_but_egress_disabled
 
     def test_normalize_config_warns_when_upstream_uses_proxy_but_egress_disabled(self):
         """客户端勾选了走代理，但全局出口代理未启用 —— 提醒用户将以直连运行。"""

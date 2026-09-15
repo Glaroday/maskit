@@ -189,6 +189,12 @@ RULES = [
     # 第二段限定 64-127，避免把 100.0.x / 100.200.x 这类普通数字串卷进来。
     (re.compile(ID_BOUND_L + r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}" + IP_BOUND_R), "IP_PRIVATE", 0),
     (re.compile(ID_BOUND_L + r"(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})" + IP_BOUND_R), "IP_INTERNAL", 0),
+    # IPv6 私网地址（fe80:: 链路本地 / fc00::/7 ULA，默认关——IP 系规则全部
+    # 默认关，防含冒号 hex 串误伤）：宽正则抓候选（≥2 个冒号的 hex 串），
+    # 语义校验 _ipv6_private_ok 保证只脱私网段。公网 IPv6（2001:... 等）不做
+    # ——误伤面与 IP_PUBLIC 同源（版本号/UUID 形态），有真实需求再评估。
+    # UUID 含 4 个连字符无冒号，不会进候选。
+    (re.compile(r"(?<![0-9A-Fa-f:.])[0-9A-Fa-f:]{2,45}(?![0-9A-Fa-f:])"), "IPV6_PRIVATE", 0),
     # 公网 IPv4：放 network 规则末尾（IP_INTERNAL 之后），作为泛化规则兜底。
     # 严格限定各段 0-255，语义校验由 _ip_public_ok 剔除私网保留段、组播与知名公共 DNS。
     (re.compile(IP_PUBLIC_BOUND_L + r"(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?|[1-9])(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})" + IP_PUBLIC_BOUND_R), "IP_PUBLIC", 0),
@@ -250,6 +256,12 @@ _RULE_MARKERS = {
     # 预检特征也必须跟着加，否则整条规则被跳过、新规则等于没写（实测踩过）。
     "IP_PRIVATE": ("192.", "169.", "100."),
     "IP_INTERNAL": ("10.", "172."),
+    # IPv6 私网首组必是 fe80-febf（fe8/fe9/fea/feb）或 fc00-fdff（fc/fd），
+    # 用前缀做特征比 ":" 保守得多——':' 在任何 URL/JSON 里都命中，启用该规则
+    # 后等于每条消息全量跑宽正则 + 海量 ipaddress 异常（31KB 文本实测 ~3400 次）。
+    # 大小写两种形态都要列（marker 是大小写敏感子串）。
+    "IPV6_PRIVATE": ("fe8", "fe9", "fea", "feb", "fc", "fd",
+                     "FE8", "FE9", "FEA", "FEB", "FC", "FD"),
 }
 
 
@@ -414,6 +426,7 @@ def _new_session(sid, source=None):
         "flush_tmpl": {},
         "restored": 0,
         "restored_tokens": set(),
+        "restored_origs": set(),
         "unresolved": 0,
         # 靠宽松兜底修回来的占位符数（模型把 {{}} 剥掉/写残，_LOOSE_PLACEHOLDER_RX
         # 捞回来的那些）。是成功路径，但值得看见：它说明模型在改写输出格式，
@@ -845,6 +858,50 @@ def _ip_public_ok(orig: str) -> bool:
             return False
         addr = ipaddress.IPv4Address(orig)
         return addr.is_global and not addr.is_multicast
+    except ValueError:
+        return False
+
+
+# USCC（统一社会信用代码）字符集与 MOD31 权重：GB 32100-2015。
+# 权重因子 31^i mod 31 不会循环出 0（31 是素数），官方即用 1..31 直接乘。
+_USCC_CHARS = "0123456789ABCDEFGHJKLMNPQRTUWXY"
+_USCC_WEIGHTS = (1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28)
+
+
+def _ipv6_private_ok(orig: str) -> bool:
+    """IPv6 私网校验：仅 fe80::/10（链路本地）与 fc00::/7（ULA）算命中。
+
+    宽正则抓来的候选绝大多数不是 IPv6（MAC、时间、端口号串），先靠
+    ipaddress 解析剔除；解析成功的再看是否私网段。注意不能用
+    IPv6Address.is_private——它把 2001:db8::/32（文档段）、::1（环回）等
+    全算 private，公网讨论文本里的这些地址会被误脱（实测 2001:db8::1
+    被 is_private 放行进打码）。只认 ULA 与链路本地两段，其余一律放行。
+    带 zone id（fe80::1%eth0）的解析会失败——剥掉 % 后缀再试一次，
+    链路本地地址带 zone 是 Linux 网络配置的常态写法。
+    """
+    if not isinstance(orig, str) or orig.count(":") < 2:
+        return False
+    candidate = orig.split("%", 1)[0]
+    try:
+        addr = ipaddress.IPv6Address(candidate)
+    except ValueError:
+        return False
+    return addr.is_link_local or (addr in ipaddress.IPv6Network("fc00::/7"))
+
+
+def _uscc_ok(orig: str) -> bool:
+    """USCC 校验位验证（GB 32100-2015 MOD31）。
+
+    18 位 = 登记管理部门(1) + 机构类别(1) + 登记管理机关(6) + 主体标识(9) +
+    校验位(1)。前 17 位加权求和 mod 31，映射到字符集取校验位比对。
+    规则默认关；开启后校验位把随机字母数字串的误伤率压到 1/31 以下。
+    """
+    if not isinstance(orig, str) or len(orig) != 18:
+        return False
+    try:
+        total = sum(_USCC_WEIGHTS[i] * _USCC_CHARS.index(orig[i]) for i in range(17))
+        check = (31 - total % 31) % 31
+        return _USCC_CHARS[check] == orig[17]
     except ValueError:
         return False
 
@@ -2437,6 +2494,10 @@ def mask(text, sid):
                 continue
             if label == "IP_PUBLIC" and not _ip_public_ok(orig):
                 continue
+            if label == "IPV6_PRIVATE" and not _ipv6_private_ok(orig):
+                continue
+            if label == "USCC" and not _uscc_ok(orig):
+                continue
             if label == "CONNSTR" and not _connstr_ok(orig, m, text):
                 # 记下被豁免的区间：CONNSTR 排在 EMAIL 之前，下面必须让 EMAIL 避开
                 # 与它重叠的命中，否则「口令尾@host」会被当邮箱吃掉留下半明文。
@@ -2615,6 +2676,7 @@ def restore(text, sid, channel="", escape=False, final=False):
             return token
         s["restored"] = s.get("restored", 0) + 1
         s["restored_tokens"].add(token)
+        s.setdefault("restored_origs", set()).add(orig)
         if via_suffix:
             # 靠改写容错救回来的，与宽松兜底同性质：是成功路径，但说明模型在
             # 改写占位符，属于「哪天彻底还原不回来」的前兆，要能看见。
@@ -2643,6 +2705,7 @@ def restore(text, sid, channel="", escape=False, final=False):
                 return whole
             s["restored"] = s.get("restored", 0) + 1
             s["degraded"] = s.get("degraded", 0) + 1
+            s.setdefault("restored_origs", set()).add(orig)
             # 记账用真实 token：RESTORE 明细按签发时的 token 比对 restored 标记，
             # 存模型改写后的形态会查不到，该项被误标成「未还原」（假阴性）。
             s["restored_tokens"].add(real)
@@ -2667,6 +2730,7 @@ def restore(text, sid, channel="", escape=False, final=False):
                 return whole
             s["restored"] = s.get("restored", 0) + 1
             s["degraded"] = s.get("degraded", 0) + 1
+            s.setdefault("restored_origs", set()).add(orig)
             return json.dumps(orig, ensure_ascii=False)[1:-1] if escape else orig
         out = _LOOSE_PLACEHOLDER_RX.sub(_loose_sub, out)
     return out
@@ -3948,6 +4012,18 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
             return
         s = sessions.get(sid) or {}
         fwd = s.get("fwd", {})
+        restored_origs = s.get("restored_origs") or set()
+        now = time.time()
+        recent_ttl = _recent_ttl()
+
+        def _is_known_orig(val):
+            if val in fwd or val in restored_origs:
+                return True
+            rec = _RECENT_FWD.get(val)
+            if rec and (now - rec[2] <= recent_ttl):
+                return True
+            return False
+
         # 流式接管时 flow.response.content 不可用，用回调累积文本
         if streamed_text is not None:
             body = streamed_text
@@ -3993,14 +4069,18 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
                     continue
                 if label == "IP_PUBLIC" and not _ip_public_ok(orig):
                     continue
+                if label == "IPV6_PRIVATE" and not _ipv6_private_ok(orig):
+                    continue
+                if label == "USCC" and not _uscc_ok(orig):
+                    continue
                 if label == "CONNSTR" and not _connstr_ok(orig, m, body):
                     if len(exempt_conn) < _CONNSTR_EXEMPT_MAX:
                         exempt_conn.append((m.start(), m.end()))
                     continue
                 if label == "EMAIL" and _overlaps_exempt_conn(m.start(), m.end(), exempt_conn):
                     continue
-                if orig in fwd:
-                    continue  # 本会话脱敏还原回来的值，跳过
+                if _is_known_orig(orig):
+                    continue  # 本会话/跨轮次脱敏或本次还原回来的值，跳过
                 found.setdefault(label, {})[orig] = None
         # 用户配置的前缀规则（sk-/ah- 等）不在 RULES 里，响应侧同样要扫
         if _rule_enabled("API_KEY"):
@@ -4008,7 +4088,7 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
             if prefix_rx:
                 for m in prefix_rx.finditer(body):
                     orig = m.group()
-                    if orig in fwd:
+                    if _is_known_orig(orig):
                         continue
                     found.setdefault("API_KEY", {})[orig] = None
         if found:

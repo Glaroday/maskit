@@ -90,7 +90,7 @@ const BUILTIN_RULE_GROUPS: { key: string; labelKey: string; rules: string[] }[] 
   {
     key: 'network',
     labelKey: 'settings.words.groupNetwork',
-    rules: ['IP_PRIVATE', 'IP_INTERNAL', 'IP_PUBLIC', 'MAC'],
+    rules: ['IP_PRIVATE', 'IP_INTERNAL', 'IP_PUBLIC', 'IPV6_PRIVATE', 'MAC'],
   },
   {
     key: 'entities',
@@ -1120,7 +1120,10 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               const isStandardOpenAI = (cType === 'openai' || (u.paths ?? []).some((p) => p === '/v1'))
                 && (u.paths ?? []).some((p) => p.startsWith('/v1'))
               const standardBaseUrl = isStandardOpenAI ? `${baseUrl}/v1` : baseUrl
-              const paths: string[] = (u.paths ?? []).length > 0 ? (u.paths as string[]) : ['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses']
+              // Base URL 已含 /v1 时 path chips 不再重复渲染 /v1：同一卡片出现
+              // 「OpenAI 带 /v1」+「/v1 复制项」两个入口，用户不知道点哪个
+              const paths: string[] = ((u.paths ?? []).length > 0 ? (u.paths as string[]) : ['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses'])
+                .filter((p) => !(isStandardOpenAI && p === '/v1'))
               return (
               <Card key={u.port} className="flex h-full flex-col border bg-card shadow-[var(--shadow-card)] transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow-card-hover)]">
                 <CardContent className="flex flex-1 flex-col gap-2.5 p-3.5">
@@ -1185,9 +1188,16 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                       )}
                     </Button>
                   </div>
-                  {/* 支持路径：点击复制带路径的完整地址 */}
+                  {/* 支持路径：点击复制带路径的完整地址。/v1 通配被 Base URL 行
+                      覆盖后 chips 可能为空（general 预设 paths 恰为 ['/v1']），
+                      但 base_path / 注入头徽章仍需展示，故按三者任一存在渲染 */}
+                  {(paths.length > 0
+                    || ((cfg?.capture_mode ?? 'reverse') !== 'reverse' && Boolean(u.base_path))
+                    || Object.keys(u.extra_headers ?? {}).length > 0) && (
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="shrink-0 text-[10px] font-medium text-muted-foreground">{t('settings.clients.supportPaths')}</span>
+                    {paths.length > 0 && (
+                      <span className="shrink-0 text-[10px] font-medium text-muted-foreground">{t('settings.clients.supportPaths')}</span>
+                    )}
                     {paths.map((p) => {
                       const isCopied = !!copiedMap[`path:${u.name}:${p}`]
                       return (
@@ -1216,6 +1226,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                       </Badge>
                     )}
                   </div>
+                  )}
                   {testResult[u.name] && (
                     <div className={cn('truncate text-[11px]', testResult[u.name].startsWith('✓') ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400')}>
                       {testResult[u.name]}
