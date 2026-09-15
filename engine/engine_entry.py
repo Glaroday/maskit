@@ -69,6 +69,12 @@ def _autostart() -> None:
             panel._start_fallback("未开启代理自启")
     except Exception as e:  # noqa: BLE001 —— 自启失败绝不能让引擎进程退出
         panel._emit_log(f"[panel] 代理自启异常: {e}")
+        # 异常同样要挂兜底：对比上面的失败分支，这里漏掉的话所有 upstream
+        # 端口无人监听，客户端连接被拒且引擎不会自愈（审计 P2）。
+        try:
+            panel._start_fallback("代理自启异常")
+        except Exception:  # noqa: BLE001 —— 兜底失败也不让线程带栈退出
+            pass
 
 
 def main() -> None:

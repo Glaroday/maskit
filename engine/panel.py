@@ -15,8 +15,9 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.2.11'
+__version__ = '0.2.12'
 import json
+import codecs
 import copy
 import hashlib
 import logging
@@ -168,6 +169,7 @@ from event_store import (
     stats_range,
     set_record_plaintext_words,
     fetch_restore_items,
+    db_max_event_id,
     _ensure_db,
 )
 import audit_engine as audit_eng
@@ -868,19 +870,22 @@ def _read_chunked_body(rfile, limit=64 * 1024 * 1024):
     分配并阻塞读取。以前是「先读后判」（读完再比 limit），一个 `FFFFFFFF` 的 chunk
     头就能让进程分配几个 GB 或长时间挂住。透传层在 Docker 下会监听
     0.0.0.0（MASKIT_LISTEN_HOST），是网络可达的，所以这条要按不可信输入处理。
+
+    畸形 chunk 头（非十六进制）/ 中途 EOF 一律 raise：曾静默 break 返回半截 body，
+    截断的 JSON 被转发上游报 400——错误被移花接木，排障困难（审计 P2）。
     """
     body = b""
     while True:
         try:
             line = rfile.readline()
         except Exception:
-            break
+            raise ValueError("chunked_read_error")
         if not line:
-            break
+            raise ValueError("chunked_body_truncated")  # 客户端中途断连，body 不完整
         try:
             size = int(line.split(b";", 1)[0].strip(), 16)
         except ValueError:
-            break
+            raise ValueError("malformed_chunk_header")
         if size == 0:
             # 吃掉 trailing headers 到空行
             while True:
@@ -893,9 +898,176 @@ def _read_chunked_body(rfile, limit=64 * 1024 * 1024):
             break
         if size < 0 or len(body) + size > limit:
             raise ValueError("request body too large")
-        body += rfile.read(size)
+        chunk = rfile.read(size)
+        if len(chunk) < size:
+            raise ValueError("chunked_body_truncated")
+        body += chunk
         rfile.read(2)  # 块尾 CRLF
     return body
+
+
+# ===== 透传模式的占位符还原（stop_mode=passthrough 的体验闭环）=====
+# 背景：脱敏管线（mitmdump）停掉后，客户端对话历史里的占位符随请求原样上行
+# （这是特性：上游本来看到的就是占位符），但模型回复里复述的占位符此前会
+# 原样落到客户端——agent 拿占位符当真值执行命令直接失败，且无任何事件可归因。
+#
+# 数据源：事件库 MASK 事件的 items（与引擎侧 _warmup_recent_from_db 同款、同过滤）。
+# 凭据类在库里只有 digest + preview、没有 original，天然不会被还原——
+# 「凭据原文永不落盘」红线不动，凭据占位符在透传模式维持不还原（可见性靠
+# PASS 事件里的 unresolved 计数）。
+_PT_RESTORE_TTL = 60.0        # 映射缓存刷新周期：透传期间引擎仍在写 MASK 事件
+_PT_RESTORE_MAX_EVENTS = 5000  # 与引擎侧 _WARMUP_MAX_EVENTS 对齐
+_PT_RESTORE = {"map": {}, "loaded_at": 0.0, "lock": threading.Lock()}
+# 只认严格形态：兜底路径不做标签改写容错（IP_PUBLIC/全小写等变体留给脱敏管线）
+_PT_TOKEN_RX = re.compile(r"\{\{[A-Z0-9]{1,12}_[a-z0-9]{6}\}\}")
+# 尾部疑似被 TCP 边界切开的半截占位符（"{{IPPR" / "{{IPPUBLIC_qz"）：
+# 先扣住等下一块，流末（final=True）再处理
+_PT_PARTIAL_RX = re.compile(r"\{\{[A-Za-z0-9_]{1,18}$")
+# 缓冲硬顶：上游持续推送无帧边界的巨型数据时防无界累积，超限强制按 final 清空
+_PT_BUF_MAX = 4 << 20
+
+
+def _pt_should_restore(ct_lower, encoding):
+    """PT 还原启用判据：JSON/SSE/NDJSON 且响应未压缩。
+
+    压缩字节流不是 UTF-8 文本，errors="replace" 解码再回写会把整条响应损坏
+    （脱敏路径 transparent 的 responseheaders 有同款守卫）。请求侧虽已剥
+    accept-encoding，但上游是否配合不受控。
+    """
+    if "json" not in ct_lower and "text/event-stream" not in ct_lower:
+        return False
+    enc = (encoding or "").lower().strip()
+    return not enc or enc == "identity"
+
+
+def _pt_restore_map():
+    """token -> original 映射（只读事件库，60s 缓存；失败返回旧值并留日志）。
+
+    与引擎侧预热同款口径：48h 窗口、凭据类剔除、原文是占位符的剔除。
+    事件按 id 倒序（最新在前），setdefault 保证同一 token 以最新事件为准。
+    空映射同样吃满 60s 缓存：无 MASK 事件的实例若每次都查库，透传期间
+    每请求一次 SELECT 纯属浪费（曾因条件写成 `_PT_RESTORE["map"] and ...`
+    而空表永不缓存）。
+    """
+    with _PT_RESTORE["lock"]:
+        now = time.time()
+        if _PT_RESTORE["loaded_at"] and now - _PT_RESTORE["loaded_at"] < _PT_RESTORE_TTL:
+            return _PT_RESTORE["map"]
+        m = {}
+        try:
+            import sqlite3
+            # 数据目录只认一处，不做候选回落：回落等于隔离环境读生产库
+            env_dir = os.environ.get("LLM_SHIELD_DATA_DIR")
+            if env_dir:
+                db_path = os.path.join(env_dir, "shield-events.sqlite3")
+            else:
+                appdata = os.environ.get("APPDATA")
+                db_path = (os.path.join(appdata, "Maskit", "shield-events.sqlite3")
+                           if appdata else "shield-events.sqlite3")
+            if os.path.isfile(db_path):
+                cutoff = now - 48 * 3600
+                # 注意：sqlite3 的 with 只管事务不关连接，Windows 下句柄不释放
+                # 会锁住数据目录（隔离测试实例 cleanup 直接 PermissionError）。
+                conn = sqlite3.connect(db_path, timeout=5)
+                try:
+                    rows = conn.execute(
+                        "SELECT payload FROM events WHERE ts >= ? AND type = 'MASK' "
+                        "ORDER BY id DESC LIMIT ?",
+                        (cutoff, _PT_RESTORE_MAX_EVENTS),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                for (payload_str,) in rows:
+                    try:
+                        p = json.loads(payload_str)
+                        for it in p.get("items", []) or []:
+                            tok = it.get("tok")
+                            orig = it.get("original")
+                            label = it.get("label") or ""
+                            if not tok or not orig or not _PT_TOKEN_RX.fullmatch(tok):
+                                continue
+                            if label in CREDENTIAL_LABELS or _PT_TOKEN_RX.fullmatch(orig):
+                                continue
+                            m.setdefault(tok, orig)
+                    except Exception:
+                        pass
+            # 成功才刷新缓存内容；失败保留旧映射。loaded_at 两种情况都刷新：
+            # 失败若不刷新，DB 持续故障时每个透传请求都重查一次库 + 刷一条日志。
+            _PT_RESTORE["map"] = m
+            _PT_RESTORE["loaded_at"] = now
+        except Exception as e:
+            _PT_RESTORE["loaded_at"] = now
+            _emit_log(f"[panel] 透传还原映射加载失败(继续用旧值): {e}")
+        return _PT_RESTORE["map"]
+
+
+def _pt_restore_text(text, rmap, stats):
+    """占位符还原（尽力而为）：查不到的计入 unresolved 并原样放行。
+
+    替换值按 JSON 字符串转义（json.dumps 去引号）：LLM 响应里占位符出现在
+    JSON 字符串值内，原文含引号/换行时必须转义，否则客户端 JSON 解析直接
+    报错。纯文本上下文里遇到含引号的原文会多出 \\\" —— 透传兜底可接受的
+    残余风险（PII 原文极少含引号）。
+    """
+    def _sub(m):
+        tok = m.group(0)
+        orig = rmap.get(tok)
+        if orig is None:
+            stats.setdefault("unresolved", set()).add(tok)
+            return tok
+        stats["restored"] = stats.get("restored", 0) + 1
+        return json.dumps(orig, ensure_ascii=False)[1:-1]
+    return _PT_TOKEN_RX.sub(_sub, text)
+
+
+def _pt_restore_frames(buf, delim, rmap, stats, final):
+    """按帧边界（delim，如 "\\n\\n"/"\\n"）还原 buf 中的完整帧，返回 (输出, 剩余缓冲)。
+
+    delim=None（整包 JSON）：无帧边界可依，靠尾部「疑似半截占位符」扣留
+    （_PT_PARTIAL_RX）保证跨 64KB read1 边界切开的占位符等到下一块再还原——
+    曾整段直接吐出，占位符跨读边界时既不还原也不计 unresolved。
+    剩余缓冲只在非 final 时保留，流末（final=True）全量处理。
+    """
+    if delim is None:
+        if final:
+            return _pt_restore_text(buf, rmap, stats), ""
+        m = _PT_PARTIAL_RX.search(buf)
+        if m:
+            return _pt_restore_text(buf[: m.start()], rmap, stats), buf[m.start():]
+        return _pt_restore_text(buf, rmap, stats), ""
+    out = []
+    while True:
+        idx = buf.find(delim)
+        if idx < 0:
+            break
+        frame, buf = buf[:idx], buf[idx + len(delim):]
+        # 分隔符必须随帧回填，否则 SSE 事件边界（\n\n）被吞、相邻事件粘连
+        out.append(_pt_restore_text(frame, rmap, stats) + delim)
+    if final:
+        if buf:
+            out.append(_pt_restore_text(buf, rmap, stats))
+        return "".join(out), ""
+    # 尾部疑似半截占位符：扣住等下一块，其余照常下发
+    m = _PT_PARTIAL_RX.search(buf)
+    if m:
+        out.append(buf[: m.start()])
+        return "".join(out), buf[m.start():]
+    return "".join(out), buf
+
+
+def _pt_restore_chunk(state, data, rmap, stats, final):
+    """PT 流式回调的增量入口：state 是调用方持有的 {decoder, buf, delim}。"""
+    text = state["decoder"].decode(data, final=final)
+    state["buf"] += text
+    if state["delim"] == "\n\n":
+        # SSE 允许 CRLF；统一成 LF 再切帧（与脱敏管线同款归一化）
+        state["buf"] = state["buf"].replace("\r\n", "\n")
+    if len(state["buf"]) > _PT_BUF_MAX:
+        # 无帧边界的巨型数据：强制按 final 清空，防止缓冲无界增长
+        out, state["buf"] = _pt_restore_frames(state["buf"], state["delim"], rmap, stats, True)
+        return out
+    out, state["buf"] = _pt_restore_frames(state["buf"], state["delim"], rmap, stats, final)
+    return out
 
 
 def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
@@ -915,11 +1087,33 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
 
     class PT(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # socket 读超时：半开连接（断电/无 FIN）会永久阻塞 handler 线程，
+        # ThreadingHTTPServer 线程按连接无上限 → 线程/内存缓慢泄漏（审计 P2）。
+        timeout = 300
+        # 小块 SSE 立刻下发：Nagle 攒包会把首字节延迟放大几十毫秒
+        disable_nagle_algorithm = True
 
         def log_message(self, *a):
             pass
 
-        def _do_forward(self):
+        def _drain_request_body(self, max_bytes=1 << 20):
+            """回错误前尽量读掉请求体：Windows 上关闭带未读数据的 socket 发 RST，
+            客户端可能看不到 413/503 响应而是连接重置（注释里描述过的老坑）。"""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                return
+            remaining = min(length, max_bytes)
+            try:
+                while remaining > 0:
+                    got = self.rfile.read(min(remaining, 65536))
+                    if not got:
+                        break
+                    remaining -= len(got)
+            except Exception:
+                pass
+
+        def _do_forward(self, head=False):
             _fwd_t0 = time.perf_counter()
             _first_byte_ms = None
             # Content-Length 缺失/畸形/为 0（GET、无 body POST）→ 空 body；
@@ -930,12 +1124,14 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 length = -1
             # 请求体上限：防声明超大正文占满线程/内存（审计性能观察项）
             if length > _MAX_PASSTHROUGH_BODY:
+                self._drain_request_body()
                 self.send_error(413, "Request body too large")
                 return
             if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
                 try:
                     body = _read_chunked_body(self.rfile)
                     if len(body) > _MAX_PASSTHROUGH_BODY:
+                        self._drain_request_body()
                         self.send_error(413, "Request body too large")
                         return
                     length = len(body)
@@ -994,13 +1190,35 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 upstream_path = merged_path + ("?" + "&".join(queries) if queries else "")
                 conn.request(self.command, upstream_path, body=body, headers=headers)
                 resp = conn.getresponse()
+                ct_lower = (resp.getheader("Content-Type") or "").lower()
+                # 占位符还原（透传体验闭环）：JSON / SSE / NDJSON、未压缩且映射非空
+                # 时启用。失败兜底：还原链路任何异常都退回原样透传，绝不搞断连接。
+                resp_encoding = resp.getheader("Content-Encoding") or ""
+                rmap = _pt_restore_map() if _pt_should_restore(ct_lower, resp_encoding) else {}
+                pt_state = None
+                pt_stats = {}
+                if rmap:
+                    if "text/event-stream" in ct_lower:
+                        _delim = "\n\n"  # SSE 事件以空行分隔
+                    elif any(t in ct_lower for t in ("x-ndjson", "ndjson", "jsonl", "jsonlines")):
+                        _delim = "\n"    # NDJSON 一行一帧
+                    else:
+                        _delim = None    # 整包 JSON：无帧边界，靠半截占位符扣留
+                    pt_state = {
+                        "decoder": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+                        "buf": "", "delim": _delim,
+                    }
+                    pt_stats = {"restored": 0}
                 self.send_response(resp.status)
                 # 响应定界策略：上游给了 Content-Length（非流式）→ 原样保留，
                 # 客户端可 keep-alive 复用连接；SSE/chunked/无长度 → 剥 TE 头 +
                 # Connection: close 以 EOF 定界（http.client 已解 chunked 成纯 body）。
                 is_streaming = resp.getheader("Transfer-Encoding", "").lower() == "chunked" or \
-                    "text/event-stream" in resp.getheader("Content-Type", "").lower() or \
+                    "text/event-stream" in ct_lower or \
                     not resp.getheader("Content-Length")
+                if pt_state is not None:
+                    # 还原会改变 body 长度：必须剥掉原 Content-Length 改用 EOF 定界
+                    is_streaming = True
                 for k, v in resp.getheaders():
                     lk = k.lower()
                     if lk == "transfer-encoding" or lk == "connection":
@@ -1016,7 +1234,7 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 # （实测 read=2.0s 一次性返回 vs read1=0s 逐块返回）。
                 sent = 0
                 usage_stream = (SSEUsageAccumulator()
-                                if "text/event-stream" in resp.getheader("Content-Type", "").lower()
+                                if "text/event-stream" in ct_lower
                                 else None)
                 resp_tail_chunks = []
                 tail_len = 0
@@ -1026,6 +1244,21 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                         break
                     if _first_byte_ms is None:
                         _first_byte_ms = (time.perf_counter() - _fwd_t0) * 1000
+                    if pt_state is not None:
+                        # 还原后可能为空串（帧不完整/半截占位符被扣留），跳过写入
+                        try:
+                            chunk = _pt_restore_chunk(pt_state, chunk, rmap, pt_stats, final=False).encode("utf-8")
+                        except Exception:
+                            # 还原失败退回原样透传：先吐出已扣住的缓冲（半截帧/占位符
+                            # 残片，不吐就丢字），本块再原样下发；后续块不再尝试还原
+                            held = (pt_state.get("buf") or "").encode("utf-8", errors="replace")
+                            pt_state = None
+                            if held:
+                                sent += len(held)
+                                self.wfile.write(held)
+                                self.wfile.flush()
+                    if not chunk:
+                        continue
                     sent += len(chunk)
                     self.wfile.write(chunk)
                     self.wfile.flush()
@@ -1041,6 +1274,20 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                         tail_len += len(chunk)
                         while tail_len > 65536 and resp_tail_chunks:
                             tail_len -= len(resp_tail_chunks.pop(0))
+                # 流末收尾：扣住的不完整帧 / 半截占位符全部按 final 吐出，
+                # 否则客户端丢最后几个字（占位符永不闭合时原样放行并计入 unresolved）
+                if pt_state is not None:
+                    try:
+                        tail = _pt_restore_chunk(pt_state, b"", rmap, pt_stats, final=True).encode("utf-8")
+                    except Exception:
+                        tail = b""
+                    if tail:
+                        sent += len(tail)
+                        self.wfile.write(tail)
+                        self.wfile.flush()
+                        if usage_stream is None:
+                            resp_tail_chunks.append(tail)
+                            tail_len += len(tail)
                 self.wfile.flush()
                 # SSE 保留独立的累计用量；兼容末行没有换行的上游。
                 resp_usage = usage_stream.usage if usage_stream is not None else {}
@@ -1055,7 +1302,7 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 # 透传期间记 PASS 事件：不脱敏时段的流量也要留痕
                 # （此前透传完全不记日志，用户无法确认流量经过了自己）
                 try:
-                    enqueue_event({
+                    ev = {
                         "ts": time.time(), "type": "PASS", "host": host, "method": self.command,
                         "path": self.path.split("?")[0], "status": resp.status,
                         "http_status": resp.status,
@@ -1070,7 +1317,14 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                         # 透传耗时（毫秒）：upstream_ms=总耗时；first_byte_ms=首字节
                         "upstream_ms": round((time.perf_counter() - _fwd_t0) * 1000, 1),
                         "first_byte_ms": round(_first_byte_ms or 0, 1),
-                    })
+                    }
+                    # 占位符还原计数（并入 PASS 而不是另发 RESTORE：usage 统计收
+                    # RESTORE 与带 usage 的 PASS 各一次，两发会把 token 用量双计）。
+                    # unresolved>0 时用户能从日志看出「回复里有占位符没还原」。
+                    if pt_stats:
+                        ev["restored"] = pt_stats.get("restored", 0)
+                        ev["unresolved"] = len(pt_stats.get("unresolved") or ())
+                    enqueue_event(ev)
                 except Exception:
                     pass
             except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
@@ -1114,6 +1368,14 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
         do_PUT = _do_forward
         do_PATCH = _do_forward
         do_DELETE = _do_forward
+        # CORS 预检直接转发上游（此前落 BaseHTTPRequestHandler 默认 501，
+        # 兜底模式反而制造新故障形态——浏览器客户端在兜底期间预检全挂）
+        do_OPTIONS = _do_forward
+
+        def do_HEAD(self):
+            # 健康检查：响应头原样转发、不带 body（上游对 HEAD 本就不回 body，
+            # read1 循环自然为空）；此前落默认 501，探活全部误报。
+            self._do_forward(head=True)
 
     return PT
 
@@ -1165,6 +1427,8 @@ def _make_error_handler(upstream_name=None):
 
     class ERR(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # 同 PT：半开连接不能永久占用 handler 线程（审计 P2）
+        timeout = 300
 
         def log_message(self, *a):
             pass
@@ -1176,7 +1440,14 @@ def _make_error_handler(upstream_name=None):
             except (ValueError, TypeError):
                 length = 0
             body = b""
-            if length > 0:
+            if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                # chunked 请求体也要读干净（上限内），否则回 503 后未读数据
+                # 触发 RST，客户端看到的是连接重置而不是错误信息
+                try:
+                    body = _read_chunked_body(self.rfile, limit=1 << 20)
+                except Exception:
+                    body = b""
+            elif length > 0:
                 try:
                     body = self.rfile.read(min(length, _MAX_PASSTHROUGH_BODY))
                 except Exception:
@@ -2511,7 +2782,7 @@ def _free_upstream_ports():
     return freed
 
 
-def _stop_proxy_locked():
+def _stop_proxy_locked(skip_fallback=False):
     state["stop_requested"] = True  # 让 watchdog 知道这是主动停止，不要自动拉起
     state["generation"] = int(state.get("generation", 0)) + 1
     p = proc["p"]
@@ -2561,16 +2832,26 @@ def _stop_proxy_locked():
     _emit_log("[panel] 停止本地代理")
     # 停止后行为按 stop_mode（见 _stop_mode）：error（默认）= 端口继续监听并回
     # 503 shield_unavailable；passthrough = 明文直连；block = 端口释放、客户端断连。
-    _start_fallback("已停止代理")
+    if skip_fallback:
+        # App 退出专用（skip_fallback=1）：整个引擎进程几秒后就会被壳终止，兜底
+        # 监听活不过那几秒、只会把未脱敏明文放出去。用户语义是「我退出了脱敏
+        # 网关」，端口释放、客户端 connection refused 才是诚实的行为。
+        # 「绝不断网」红线约束的是引擎还在跑的场景（手动停止/崩溃自愈），不约束退出。
+        _emit_log("[panel] 已停止代理（退出流程：不挂兜底监听，端口释放、客户端将断连）")
+    else:
+        _start_fallback("已停止代理")
     return True, None
 
 
-def stop_proxy():
-    """停止代理：杀 mitmdump 进程树 + 释放 187xx 端口，避免「停止后再启动端口被占用」。"""
+def stop_proxy(skip_fallback=False):
+    """停止代理：杀 mitmdump 进程树 + 释放 187xx 端口，避免「停止后再启动端口被占用」。
+
+    skip_fallback=True 仅用于 App 退出流程：不挂兜底监听（见 _stop_proxy_locked 尾部注释）。
+    """
     with lock:
         state["proxy_stopping"] = True
         try:
-            return _stop_proxy_locked()
+            return _stop_proxy_locked(skip_fallback=skip_fallback)
         finally:
             state["proxy_stopping"] = False
 
@@ -3402,7 +3683,11 @@ def _load_config_locked():
             # stop_mode 默认恢复为 passthrough，确保软件开着未启动代理时直接转发不中断
             meta = cfg.get("meta") or {}
             if isinstance(meta, dict) and not meta.get("stop_mode_passthrough_default_v2"):
-                if str(cfg.get("stop_mode") or "").strip().lower() in ("error", "block"):
+                # 只补默认值，绝不覆盖用户显式选择。曾把用户显式配置的
+                # stop_mode=error/block 静默改回 passthrough——明确选择 fail-closed
+                # 的用户被换成「停止即明文直连」，隐私语义被无声改写（审计 P2）。
+                # 缺省键由 normalize_config / default_config 兜成 passthrough。
+                if "stop_mode" not in raw:
                     cfg["stop_mode"] = "passthrough"
                 cfg["auto_start_proxy"] = True
                 cfg["meta"] = dict(meta, stop_mode_passthrough_default_v2=True)
@@ -3624,6 +3909,34 @@ def _build_allow_hosts(domains):
     return "|".join(parts) if parts else ""
 
 
+def _allow_hosts_of(cfg):
+    """取某份配置派生出的 --allow-hosts 参数；解析失败返回 None（跳过重启判定）。"""
+    try:
+        return _build_allow_hosts(enabled_domains(cfg or {}))
+    except Exception:
+        return None
+
+
+def _maybe_restart_for_allow_hosts(cfg, allow_before):
+    """explicit 模式目标域名变化时重启代理，使新 --allow-hosts 生效。
+
+    --allow-hosts 是 mitmdump 启动期参数：transparent.py 的热重载只更新路由
+    变量，MITM 范围仍按旧白名单走——新增域名静默不脱敏、连 SKIP 事件都没有，
+    用户无法归因（曾以为「域名热重载即时生效」）。其余捕获模式不受此影响
+    （reverse 由 addon 路由、local 不用 --allow-hosts），不重启。
+    返回是否执行了重启。
+    """
+    if allow_before is None or (cfg or {}).get("capture_mode") != "explicit":
+        return False
+    if not (proc["p"] and proc["p"].poll() is None):
+        return False
+    if _allow_hosts_of(cfg) == allow_before:
+        return False
+    _emit_log("[panel] explicit 模式目标域名变化，自动重启代理使 --allow-hosts 生效"
+              "（MITM 域名白名单是启动参数，热重载改不到）")
+    return bool(_restart_proxy_locked("explicit 模式域名变化"))
+
+
 # ========== API ==========
 @app.get("/api/config")
 def api_get_config():
@@ -3651,6 +3964,13 @@ def api_set_config():
         incoming = request.get_json(force=True)
         if not isinstance(incoming, dict):
             return jsonify({"ok": False, "error": "配置必须是 JSON 对象"}), 400
+        # 保存前的 explicit 模式 --allow-hosts 参数：与端口一样是启动期派生参数，
+        # 域名/禁用域名变化后不重启就永远不生效（transparent 热重载只更新路由变量，
+        # mitmproxy 的 MITM 范围仍按旧白名单走，新域名流量静默不脱敏）。
+        try:
+            allow_before = _build_allow_hosts(enabled_domains(load_config()))
+        except Exception:
+            allow_before = None
         # 整个「读当前配置 → 合并字段 → 校验写盘 → 同步内存」必须在 cfg_lock 临界区内原子完成！
         # 避免并发请求各自拿到旧快照后互相覆盖（实测两个并发 POST 各改一字段会丢掉一个更新）。
         with cfg_lock:
@@ -3677,6 +3997,8 @@ def api_set_config():
             _emit_log(f"[panel] upstream 端口变化 {sorted(ports_before)} -> {sorted(ports_after)}，"
                       f"自动重启代理使新端口生效")
             restarted = bool(_restart_proxy_locked("upstream 端口变化"))
+        if not restarted:
+            restarted = _maybe_restart_for_allow_hosts(cfg, allow_before)
     except Exception as e:
         _emit_log(f"[panel] 端口变化检测失败: {_safe_public_text(e, 240)}")
     # warnings 回传前端提示，避免用户输入被静默丢弃/改写却毫无解释
@@ -3848,9 +4170,11 @@ def api_patch_config():
         return jsonify({"ok": False, "error": "缺少 value"}), 400
     path = body.get("path", [])
     warnings = []
+    allow_before = None
     try:
         with cfg_lock:
             cfg = _load_config_locked()
+            allow_before = _allow_hosts_of(cfg)
             cfg = _apply_config_patch(cfg, key, op, path, body["value"], body.get("match"))
             cfg = save_config(cfg, warnings)
     except Exception as e:
@@ -3866,6 +4190,8 @@ def api_patch_config():
             _emit_log(f"[panel] upstream 端口变化 {sorted(ports_before)} -> {sorted(ports_after)}，"
                       f"自动重启代理使新端口生效")
             restarted = bool(_restart_proxy_locked("upstream 端口变化"))
+        if not restarted:
+            restarted = _maybe_restart_for_allow_hosts(cfg, allow_before)
     except Exception as e:
         _emit_log(f"[panel] 端口变化检测失败: {_safe_public_text(e, 240)}")
     return jsonify({"ok": True, "config": cfg, "warnings": warnings,
@@ -3931,6 +4257,7 @@ def api_config_restore():
         ports_before = set(_expected_listen_ports())
     except Exception:
         ports_before = set()
+    allow_before = _allow_hosts_of(load_config())
     try:
         # 回滚是显式的整份替换，必须绕过批量缩减护栏——否则「从 9 个回滚到 3 个」
         # 会被护栏挡下，用户永远滚不回去。备份机制本身是这里的安全网。
@@ -3944,6 +4271,8 @@ def api_config_restore():
         running = bool(proc["p"] and proc["p"].poll() is None)
         if running and ports_after != ports_before:
             restarted = bool(_restart_proxy_locked("配置回滚"))
+        if not restarted:
+            restarted = _maybe_restart_for_allow_hosts(cfg, allow_before)
     except Exception as e:
         _emit_log(f"[panel] 回滚后端口检测失败: {e}")
     return jsonify({"ok": True, "config": cfg, "warnings": warnings,
@@ -4227,6 +4556,20 @@ def _sync_prices_now(background=True, force=False):
         threading.Thread(target=_do, daemon=True).start()
     else:
         _do()
+
+
+def _price_sync_loop():
+    """价格定期复查循环：每 6h 调一次 _maybe_auto_sync_prices（内部自判是否过期）。
+
+    用 Timer 自续期而不是常驻 while 循环：单次检查抛异常也不会杀死循环线程。
+    """
+    try:
+        _maybe_auto_sync_prices()
+    except Exception:
+        pass
+    t = threading.Timer(6 * 3600, _price_sync_loop)
+    t.daemon = True
+    t.start()
 
 
 def _maybe_auto_sync_prices():
@@ -4578,7 +4921,14 @@ def api_start():
 
 @app.post("/api/proxy/stop")
 def api_stop():
-    ok, err = stop_proxy()
+    # skip_fallback=1：App 退出专用——不挂兜底监听（见 _stop_proxy_locked 尾部注释），
+    # 消除「退出后 3 秒明文直连窗口」。用户在面板/托盘手动停止不带此参数，
+    # 仍走完整 stop_mode 语义（兜底直连 / 503 / 断连）。
+    skip = request.args.get("skip_fallback") == "1"
+    if not skip:
+        body = request.get_json(silent=True)
+        skip = isinstance(body, dict) and body.get("skip_fallback") is True
+    ok, err = stop_proxy(skip_fallback=skip)
     return jsonify({"ok": ok, "error": err})
 
 
@@ -4655,6 +5005,14 @@ def api_logs():
         retention = _normalize_retention(load_config().get("log_retention_days", LOG_RETENTION_DAYS))
     except Exception:
         retention = LOG_RETENTION_DAYS
+    # 游标重置检测：清空日志（sqlite_sequence 重置）或损坏库隔离重建后 id 从 1
+    # 重新开始，已打开的 Logs 页 cursor 仍是旧的高值 → `id > since` 永远空集，
+    # 新日志一条不显示、用户误判代理不工作。给前端一个 reset 标志重新从 0 拉取。
+    reset = False
+    try:
+        reset = incremental and next_since <= since and db_max_event_id() < since
+    except Exception:
+        reset = False
     return jsonify({
         "events": ev,
         "tail": tail,
@@ -4665,6 +5023,7 @@ def api_logs():
         "total": len(ev),
         "has_more": has_more,
         "next_since": next_since,
+        "reset": reset,
     })
 
 
@@ -5851,6 +6210,12 @@ def start_panel_server(open_browser_on_start=True):
     preload_events()
     # 价格目录后台自动同步（启动时 + 每 7 天过期刷新；失败静默，不阻塞启动）
     _maybe_auto_sync_prices()
+    # 定期复查：桌面壳常驻数周不重启，只在启动时判断一次的话，开了
+    # price_sync_enabled 的用户在进程生命周期内价格也永不刷新（审计 P2）。
+    # 每 6 小时复查一次（_maybe_auto_sync_prices 内部自判是否超过同步间隔）。
+    _price_sync_timer = threading.Timer(6 * 3600, _price_sync_loop)
+    _price_sync_timer.daemon = True
+    _price_sync_timer.start()
     # 把本次 token 写文件，供壳层/外部脚本读取。
     # 显式 0600：默认 umask 022 会落成 0644，同机其他本地用户即可读到面板令牌
     # —— 拿到它等于拿到代理开关与配置读写权限。Windows 上 mode 只影响只读位，

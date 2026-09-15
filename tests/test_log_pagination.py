@@ -49,6 +49,22 @@ class LogPaginationTests(unittest.TestCase):
         self.assertFalse(second["has_more"])
         self.assertTrue(all("dialog" not in e for e in first["events"]))
 
+    def test_cursor_reset_flag_after_clear(self):
+        """清空日志后 id 从 1 重新开始：旧游标必须拿到 reset 标志，否则已打开的
+        日志页 `id > since` 永远空集，新日志一条不显示（用户误判代理不工作）。"""
+        high = self.append()  # 先记一个高 id 游标
+        self.assertGreater(high, 200)
+        event_store.clear_events()
+        fresh = self.append()
+        # 旧游标（清空前的高值）轮询：必须报 reset，前端据此丢弃游标从 0 重拉
+        stale = self.get(since=high, limit=200)
+        self.assertEqual(stale["events"], [])
+        self.assertTrue(stale["reset"], "id 序列重置后必须回传 reset=true")
+        # 重拉后正常看到新事件
+        after = self.get(since=0, limit=200)
+        self.assertEqual([e["seq"] for e in after["events"]], [fresh])
+        self.assertFalse(after["reset"])
+
     def test_initial_snapshot_and_default_store_query_still_show_latest(self):
         first = self.get(limit=200)
         self.assertEqual([e["seq"] for e in first["events"]], list(range(3, 203)))

@@ -37,7 +37,7 @@ interface Highlights {
 const LABEL_KEYS: Record<string, string> = {
   PHONE: 'share.labelPhone', EMAIL: 'share.labelEmail', IDCARD: 'share.labelIdcard',
   CARD: 'share.labelCard', IBAN: 'share.labelIban', PLATE: 'share.labelPlate', LANDLINE: 'share.labelLandline',
-  HKID: 'share.labelHkid', IP_PRIVATE: 'share.labelIp', IP_INTERNAL: 'share.labelIp', MAC: 'share.labelMac',
+  HKID: 'share.labelHkid', IP_PRIVATE: 'share.labelIp', IP_INTERNAL: 'share.labelIp', IP_PUBLIC: 'share.labelIpPublic', MAC: 'share.labelMac',
   USCC: 'share.labelUscc', API_KEY: 'share.labelApiKey', ACCESS_KEY: 'share.labelAccessKey', JWT: 'share.labelJwt',
   TOKEN: 'share.labelToken', SECRET: 'share.labelSecret', PRIVATE_KEY: 'share.labelPrivateKey',
   CONNSTR: 'share.labelConnstr',

@@ -66,6 +66,65 @@ fn no_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// 校验 pid 是否本产品的引擎进程，返回三态：
+/// `Some(true)` = 确认引擎；`Some(false)` = 确认非本产品（或进程已不存在）；
+/// `None` = 无法确认身份（查询工具缺失/权限不足）——此时绝不 kill，但也不能
+/// 断言「非本产品」（文案要区分，macOS 曾因 /proc 恒 false 而误报）。
+///
+/// 孤儿清理会 taskkill /F /T 整棵进程树，绝不能只凭「谁占着端口就杀谁」：
+/// state.pid 在复用分支来自 pid_listening_on_port——用户自己的 dev server、
+/// 其他工具、正在重启窗口期的外部引擎都可能占 5801，误杀等于数据丢失。
+/// 只认引擎二进制名（与 engine_exe 的 ENGINE_NAMES / PyInstaller spec 一致）。
+fn engine_process_identity(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    fn image_name(pid: u32) -> Option<String> {
+        let out = no_window(&mut Command::new("tasklist"))
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        // 命令跑起来了就能判定（无匹配时输出 "INFO: ..." 行，同样不等于引擎名）
+        let txt = String::from_utf8_lossy(&out.stdout);
+        txt.lines()
+            .next()
+            .and_then(|line| line.split(',').next())
+            .map(|img| img.trim_matches('"').to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn image_name(pid: u32) -> Option<String> {
+        // Linux：/proc 直接读；macOS 无 /proc，回退 ps -o comm=
+        if let Ok(p) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+            return p.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+        let out = no_window(&mut Command::new("ps"))
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let txt = String::from_utf8_lossy(&out.stdout);
+        let name = txt.trim();
+        if name.is_empty() {
+            // ps 正常返回但无输出：进程已不存在 → 确认非本产品
+            return Some(String::new());
+        }
+        // macOS 的 comm= 返回可执行文件全路径（Linux 是 basename），
+        // 统一取 basename，消除平台差异
+        Some(
+            std::path::Path::new(name)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.to_string()),
+        )
+    }
+    let name = image_name(pid)?.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name).to_string();
+    Some(name == "maskitengine" || name == "llmshieldengine")
+}
+
 /// 终止由壳层自己拉起的引擎及其代理子进程。
 ///
 /// Windows 用 taskkill 递归终止进程树；Unix 没有等价的跨发行版 Rust 标准库 API，
@@ -430,6 +489,9 @@ impl EngineManager {
         // 已被清空，下一轮 exited=false 且 hung=false，会永远卡在下面的 `!exited && !hung`
         // 上——「1 分钟后重试」变成永不重试，引擎崩溃后自愈能力永久静默失效（审计 P0）。
         let mut pending_restart: Option<u64> = None;
+        // 假死孤儿（复用分支记录 pid 但无 child 句柄）的连续失联计数，与 has_child
+        // 路径的 strikes 分开，避免两条判定互相清零。
+        let mut orphan_strikes: u32 = 0;
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let exited = {
@@ -472,7 +534,68 @@ impl EngineManager {
                 // 无 child：只有「限频排队已到点」才继续往下重试，其余保持原行为
                 // （外部引擎模式，壳不主动拉进程）。
                 if !pending_restart.map_or(false, |t| now_epoch() >= t) {
-                    continue;
+                    // 复用分支曾记录 pid 的「假死孤儿引擎」（kill 失败残留 / 外部
+                    // 引擎接管后假死）：端口在监听、/healthz 不通 → 按孤儿清理后走
+                    // 正常重启。此前这里直接 continue，watchdog 无 child、无
+                    // pending_restart，永久静默空转，只能重启 App（审计 P2）。
+                    // 连续多次不响应才认账：外部引擎重启窗口期（healthz 短暂不通）
+                    // 不能误杀用户手动启动的实例。
+                    let orphan_pid = self.state.lock().ok().and_then(|s| s.pid);
+                    if let Some(pid) = orphan_pid {
+                        if pid != 0 && !Self::panel_alive() {
+                            orphan_strikes += 1;
+                            if orphan_strikes >= HANG_STRIKES {
+                                orphan_strikes = 0;
+                                // 杀之前必须校验进程身份：pid 来自「谁占着 5801」，
+                                // 无关进程（dev server / 外部引擎重启窗口期）不能杀。
+                                // 三态：确认引擎才 kill；确认非本产品/无法确认都只清记录，
+                                // 但文案必须区分——「无法确认」可能是权限问题，不是占用者的错。
+                                match engine_process_identity(pid) {
+                                    Some(true) => {
+                                        self.set_last_error(
+                                            "检测到假死引擎残留（端口占用但面板无响应），正在清理并重启",
+                                        );
+                                        terminate_process_tree(pid);
+                                        if let Ok(mut s) = self.state.lock() {
+                                            s.pid = None;
+                                            s.ready = false;
+                                        }
+                                        std::thread::sleep(Duration::from_millis(800));
+                                        // 落到下面的重启逻辑（限频/退避照常约束）
+                                    }
+                                    Some(false) => {
+                                        self.set_last_error(&format!(
+                                            "端口 {} 被非本产品进程（pid {pid}）占用且无响应，已停止接管；请手动排查该进程",
+                                            engine_port()
+                                        ));
+                                        if let Ok(mut s) = self.state.lock() {
+                                            s.pid = None;
+                                            s.ready = false;
+                                        }
+                                        continue;
+                                    }
+                                    None => {
+                                        self.set_last_error(&format!(
+                                            "无法确认占用端口 {} 的进程（pid {pid}）身份，为防误杀已跳过清理；请手动排查",
+                                            engine_port()
+                                        ));
+                                        if let Ok(mut s) = self.state.lock() {
+                                            s.pid = None;
+                                            s.ready = false;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            orphan_strikes = 0;
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
             }
             if hung {
@@ -509,8 +632,20 @@ impl EngineManager {
                 continue;
             }
             pending_restart = None;
+            // CAS 抢占而不是 load 后 store：load 检查与 store 之间线程可能被调度
+            // 暂停，手动 restart_engine 同样置位并 spawn → 两条路径并发拉起双引擎、
+            // 抢 5801 后再触发一轮 watchdog 重启（churn 窗口）。抢不到就排 2s 重试。
+            if self
+                .restart_in_flight
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                pending_restart = Some(now.saturating_add(2));
+                continue;
+            }
+            // 限频计数必须在 CAS 成功之后才消耗：抢不到锁也 push 的话，极端下
+            // 手动重启与 watchdog 交错会白白烧掉「1 分钟 3 次」配额，推迟自愈。
             restarts.push(now);
-            self.restart_in_flight.store(true, Ordering::SeqCst);
             // Drop 兜底：下面任一步 panic 都不会让标志位留在 true（那会让 watchdog
             // 从此每轮 continue，自愈能力永久静默失效）
             let _in_flight = ResetInFlightOnDrop(&self.restart_in_flight);
@@ -539,7 +674,9 @@ impl EngineManager {
         }
     }
 
-    /// 三段式退出：HTTP /api/proxy/stop 优雅停 → 3s 超时 → 终止自己持有的进程树。
+    /// 三段式退出：HTTP /api/proxy/stop（skip_fallback=1，退出不挂兜底直连）→ 3s 超时 → 终止自己持有的进程树。
+    /// 退出不挂兜底：兜底监听活不过随后的强杀，只会把未脱敏明文放出去 3 秒；
+    /// 用户语义是「退出脱敏网关」，端口释放、客户端断连才是诚实行为。
     fn shutdown(&self) {
         let owned = self
             .child
@@ -581,7 +718,10 @@ impl EngineManager {
             .build()
             .map_err(|e| e.to_string())?;
         client
-            .post(format!("http://127.0.0.1:{}/api/proxy/stop", engine_port()))
+            .post(format!(
+                "http://127.0.0.1:{}/api/proxy/stop?skip_fallback=1",
+                engine_port()
+            ))
             .header("X-Shield-Token", token)
             .send()
             .map_err(|e| e.to_string())?;
@@ -1456,8 +1596,16 @@ fn restart_engine(
 ) -> Result<(), String> {
     let mgr = Arc::clone(&manager);
     std::thread::spawn(move || {
-        // 置位后 watchdog 跳过自身重启逻辑，避免两条路径同时拉起引擎抢 5801
-        mgr.restart_in_flight.store(true, Ordering::SeqCst);
+        // CAS 抢占（与 watchdog 同款）：抢不到说明另一条重启路径正在跑，
+        // 直接失败返回而不是排队叠加——两条路径并发 spawn 会拉起双引擎抢 5801。
+        if mgr
+            .restart_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            mgr.set_last_error("已有重启流程在进行中，请稍候");
+            return;
+        }
         let _in_flight = ResetInFlightOnDrop(&mgr.restart_in_flight);
         mgr.shutdown();
         std::thread::sleep(Duration::from_millis(500));
@@ -1821,6 +1969,26 @@ mod watchdog_backoff_tests {
         assert_eq!(restart_backoff_until(&restarts, T + 30), None);
         // 全部滑出后依然允许
         assert_eq!(restart_backoff_until(&restarts, T + 61), None);
+    }
+}
+
+#[cfg(test)]
+mod engine_identity_tests {
+    use super::engine_process_identity;
+
+    /// 测试进程自身（cargo test 的二进制）绝不该被认成引擎——孤儿清理只允许
+    /// 杀引擎镜像，认错等于误杀用户进程。身份查询必须能给出确定结论。
+    #[test]
+    fn own_test_process_is_definitely_not_engine() {
+        assert_eq!(engine_process_identity(std::process::id()), Some(false));
+    }
+
+    /// 不存在的 pid：进程已不存在 → 确认非本产品（Some(false)），
+    /// 绝不能是 None（无法确认）——那会让清理逻辑永远悬而未决。
+    #[test]
+    fn missing_pid_is_definitely_not_engine() {
+        // 4194303 是 Windows 允许的 PID 上限附近，几乎不可能存在
+        assert_eq!(engine_process_identity(4194303), Some(false));
     }
 }
 

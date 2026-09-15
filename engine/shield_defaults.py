@@ -99,7 +99,7 @@ DEFAULT_SECRET_PREFIXES = ["sk-", "ah-"]
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 DEFAULT_LISTEN_PORT = 5802
 
-# 内置正则规则默认状态：推荐 7 项核心隐私/凭据默认开启，其余 12 项默认关闭
+# 内置正则规则默认状态：推荐 7 项核心隐私/凭据默认开启，其余 13 项默认关闭
 # 避免过多的冷门/高误报规则（如内网IP、MAC、车牌等）干扰模型正常代码/配置推理。
 DEFAULT_BUILTIN_RULES = {
     "API_KEY": True,
@@ -114,6 +114,7 @@ DEFAULT_BUILTIN_RULES = {
     "IBAN": False,
     "IP_INTERNAL": False,
     "IP_PRIVATE": False,
+    "IP_PUBLIC": False,
     "JWT": False,
     "MAC": False,
     "PLATE": False,
@@ -135,6 +136,7 @@ BUILTIN_RULE_META = {
     "IDCARD": "身份证（15 位旧证 + 18 位二代证，省份+日期+校验位多重校验）",
     "IP_PRIVATE": "内网 IP：192.168.x / 链路本地",
     "IP_INTERNAL": "内网 IP：10.x / 172.16-31.x（默认关——易误伤版本号）",
+    "IP_PUBLIC": "公网 IPv4（默认关——与四段版本号形态互斥，既可能误伤版本号也可能漏检 IP）",
     "CARD": "银行卡（Luhn）",
     "IBAN": "IBAN（mod-97）",
     "USCC": "统一社会信用代码（18 位，默认关防误伤）",
@@ -145,6 +147,22 @@ BUILTIN_RULE_META = {
     "TOKEN": "Bearer Token",
     "SECRET": "password=/token=/api_key= 等赋值凭据",
 }
+
+# IP_PUBLIC 规则的知名公共 DNS 白名单（网络配置与脚本中高频出现，打码会破坏
+# 模型对 DNS 配置的理解）。真实公网主机里「四段全个位数」的只有这些 anycast
+# 地址，全部枚举进来——配合 transparent._ip_public_ok 的全个位数启发式，
+# 四段全个位数的非白名单地址按版本号/教学示例放行，不再误伤。
+KNOWN_PUBLIC_DNS = frozenset({
+    "8.8.8.8", "8.8.4.4",          # Google DNS
+    "1.1.1.1", "1.0.0.1",          # Cloudflare DNS
+    "4.2.2.1", "4.2.2.2", "4.2.2.3",  # Level3 DNS
+    "114.114.114.114", "114.114.115.115",  # 114 DNS
+    "223.5.5.5", "223.6.6.6",      # 阿里 DNS
+    "119.29.29.29",                # 腾讯 DNSPod
+    "180.76.76.76",                # 百度 DNS
+    "9.9.9.9",                     # Quad9
+    "208.67.222.222", "208.67.220.220",  # OpenDNS
+})
 
 
 # ========== 模型价格表（费用估算用） ==========
@@ -442,9 +460,16 @@ def load_price_cache(path):
 
 
 def save_price_cache(path, prices, source):
-    """写价格缓存文件（含同步时间）。失败静默——缓存不是关键路径。"""
+    """写价格缓存文件（含同步时间）。失败静默——缓存不是关键路径。
+
+    原子写（tmp + os.replace）：Tauri 壳对引擎的超时退出是 taskkill 强杀，
+    可能恰好落在写入中途；写坏半截 JSON 后 load 兜底虽然能回退内置价，
+    但 synced_at 归零、估算长期失真。os.replace 同盘原子替换无此窗口。
+    """
+    tmp = None
     try:
         import json
+        import os
         import time
         payload = {
             "synced_at": time.time(),
@@ -452,9 +477,15 @@ def save_price_cache(path, prices, source):
             "prices": prices,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
     except Exception:
-        pass
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def extract_usage(body_text, previous=None):

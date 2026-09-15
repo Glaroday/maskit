@@ -1420,6 +1420,133 @@ class ConfigAndApiTests(unittest.TestCase):
         self.assertIn("event_writer_alive", data["writer_stats"])
 
 
+class PassthroughRestoreTests(unittest.TestCase):
+    """透传模式占位符还原：PT 层尽力还原非凭据占位符，凭据类绝不还原。
+
+    数据源与引擎侧 _warmup_recent_from_db 同款（事件库 MASK 事件 items、
+    48h 窗口、凭据剔除）。还原信息并入 PASS 事件的 restored/unresolved 字段
+    （不另发 RESTORE，避免 usage 双计——见 event_store daily_tokens 口径）。
+    """
+
+    def setUp(self):
+        # 每个用例独立数据目录 + 独立事件库，绝不碰生产库（与 warmup 隔离红线一致）
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self._env = mock.patch.dict(os.environ, {"LLM_SHIELD_DATA_DIR": self._dir.name})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self._old_db = event_store.DB_PATH
+        event_store.DB_PATH = os.path.join(self._dir.name, "shield-events.sqlite3")
+        event_store._reset_writer()
+        self.addCleanup(lambda: setattr(event_store, "DB_PATH", self._old_db))
+        # 复位 PT 映射缓存，保证各用例从自己的库重新加载
+        panel._PT_RESTORE["map"] = {}
+        panel._PT_RESTORE["loaded_at"] = 0.0
+
+    def _write_mask_items(self, items):
+        event_store.append_event({
+            "ts": time.time(), "type": "MASK", "host": "api.example.com",
+            "method": "POST", "path": "/v1/chat/completions", "items": items,
+        })
+
+    def test_map_loads_from_db_and_filters_credentials(self):
+        """映射从事件库加载；凭据类与占位符原文被剔除；最新事件优先。"""
+        self._write_mask_items([
+            {"tok": "{{PHONE_qzwcmr}}", "original": "13800138000", "label": "PHONE"},
+            {"tok": "{{API_KEY_mnbvcx}}", "original": "sk-test-0000000000", "label": "API_KEY"},
+            {"tok": "{{TERM_zxckfg}}", "original": "{{PHONE_qzwcmr}}", "label": "TERM"},
+        ])
+        m = panel._pt_restore_map()
+        self.assertEqual(m.get("{{PHONE_qzwcmr}}"), "13800138000")
+        self.assertNotIn("{{API_KEY_mnbvcx}}", m, "凭据类不得进入还原映射")
+        self.assertNotIn("{{TERM_zxckfg}}", m, "原文是占位符的（防套娃）不得进入映射")
+
+    def test_restore_text_json_escapes_and_counts_unresolved(self):
+        """JSON 字符串上下文转义正确；查不到的计入 unresolved 原样放行。"""
+        rmap = {"{{PHONE_qzwcmr}}": "13800138000",
+                "{{TERM_hjklsd}}": '含"引号"的词'}
+        stats = {}
+        out = panel._pt_restore_text(
+            'data: {"text": "号码 {{PHONE_qzwcmr}} 词条 {{TERM_hjklsd}} 未知 {{EMAIL_poiuyt}}"}',
+            rmap, stats)
+        self.assertIn("13800138000", out)
+        self.assertIn('{{EMAIL_poiuyt}}', out)
+        self.assertEqual(stats["restored"], 2)
+        self.assertEqual(stats["unresolved"], {"{{EMAIL_poiuyt}}"})
+        # 引号必须被 JSON 转义，否则客户端解析 SSE data JSON 直接报错
+        self.assertNotIn('"含"引号"的词"', out)
+        self.assertIn('\\"引号\\"', out)
+
+    def test_sse_frame_split_restores_across_chunk_boundary(self):
+        """占位符被 TCP 边界切在两个 chunk 中间时靠扣留缓冲完整还原。"""
+        rmap = {"{{PHONE_qzwcmr}}": "13800138000"}
+        stats = {}
+        state = {"decoder": __import__("codecs").getincrementaldecoder("utf-8")(errors="replace"),
+                 "buf": "", "delim": "\n\n"}
+        # 半截占位符尾巴必须被扣住，前缀照常下发
+        out1 = panel._pt_restore_chunk(state, b'data: {"t": "a {{PHONE_qz', rmap, stats, False)
+        self.assertEqual(out1, 'data: {"t": "a ')
+        # 下一块补全占位符 + 事件结束边界（分隔符必须随帧回填，否则事件粘连）
+        out2 = panel._pt_restore_chunk(state, 'wcmr}} b"}\n\n'.encode(), rmap, stats, False)
+        self.assertEqual(out2, '13800138000 b"}\n\n')
+        # 流末无残留
+        out3 = panel._pt_restore_chunk(state, b"", rmap, stats, True)
+        self.assertEqual(out3, "")
+
+    def test_final_flush_releases_incomplete_frame(self):
+        """流末扣住的尾部必须吐出；永不闭合的半截占位符原样放行。"""
+        rmap = {}
+        stats = {}
+        state = {"decoder": __import__("codecs").getincrementaldecoder("utf-8")(errors="replace"),
+                 "buf": "", "delim": "\n\n"}
+        out1 = panel._pt_restore_chunk(state, b'data: {"t": "{{PHONE_qz', rmap, stats, False)
+        out2 = panel._pt_restore_chunk(state, b"", rmap, stats, True)
+        # 半截占位符被扣住到流末再吐出：拼接后与原文一致，不丢字
+        self.assertEqual(out1 + out2, 'data: {"t": "{{PHONE_qz')
+        # 半截形态匹配不到完整 token：不算 unresolved（regex 只认闭合占位符）
+        self.assertNotIn("unresolved", stats)
+
+    def test_whole_json_holds_partial_token_across_read_boundary(self):
+        """整包 JSON（delim=None）：占位符被 64KB read1 边界切开时扣留到下一块。
+
+        曾整段直接吐出：跨边界占位符既不还原也不计 unresolved，客户端拿到
+        裸占位符（外部复审实测）。
+        """
+        rmap = {"{{PHONE_qzwcmr}}": "13800138000"}
+        stats = {}
+        state = {"decoder": __import__("codecs").getincrementaldecoder("utf-8")(errors="replace"),
+                 "buf": "", "delim": None}
+        out1 = panel._pt_restore_chunk(state, b'{"text": "call {{PHONE_qz', rmap, stats, False)
+        self.assertEqual(out1, '{"text": "call ')
+        out2 = panel._pt_restore_chunk(state, b'wcmr}} done"}', rmap, stats, False)
+        out3 = panel._pt_restore_chunk(state, b"", rmap, stats, True)
+        self.assertEqual(out1 + out2 + out3, '{"text": "call 13800138000 done"}')
+        self.assertEqual(stats.get("restored"), 1)
+
+    def test_pt_restore_skips_compressed_responses(self):
+        """压缩响应绝不能进还原链路：字节流不是 UTF-8，解码回写会损坏整条响应。"""
+        self.assertTrue(panel._pt_should_restore("application/json", ""))
+        self.assertTrue(panel._pt_should_restore("text/event-stream", "identity"))
+        self.assertTrue(panel._pt_should_restore("application/x-ndjson", ""))
+        self.assertFalse(panel._pt_should_restore("application/json", "gzip"))
+        self.assertFalse(panel._pt_should_restore("text/event-stream", "br"))
+        self.assertFalse(panel._pt_should_restore("text/plain", ""))
+
+    def test_clear_cutoff_persists_for_cross_process_writer(self):
+        """清空 cutoff 落 meta 表：引擎进程（另一进程）写线程据此丢弃积压旧事件。"""
+        self._write_mask_items([{"tok": "{{PHONE_qzwcmr}}", "original": "13800138000", "label": "PHONE"}])
+        old_cutoff = event_store._clear_cutoff
+        event_store.clear_events()
+        try:
+            self.assertGreater(event_store._clear_cutoff, 0)
+            # 模拟引擎进程：内存 cutoff 归零（新进程初始值），从 meta 表对齐
+            event_store._clear_cutoff = 0.0
+            event_store._sync_clear_cutoff_from_db()
+            self.assertGreater(event_store._clear_cutoff, 0, "写线程必须能从 meta 表对齐 cutoff")
+        finally:
+            event_store._clear_cutoff = old_cutoff
+
+
 class GeminiToolEnumTests(unittest.TestCase):
     """tools schema enum 清洗（Gemini function_declarations 兼容）。
 
@@ -1838,6 +1965,313 @@ class StabilityFixTests(unittest.TestCase):
             panel.load_config = lambda m=mode: {**panel.default_config(), "stop_mode": m}
             panel._start_fallback("test")
             self.assertEqual(hits, expect, f"stop_mode={mode} 分派错误")
+
+    def test_recall_token_cleans_orphan_rev_entries(self):
+        """旧映射过期后重签：REV / 后缀索引的旧条目必须注销，不留孤儿。
+
+        _prune_recent 只扫 _RECENT_FWD 的值发现待删 token，孤儿 REV 条目两个
+        清理路径都碰不到，长驻进程无界缓慢泄漏（审计 P2）。
+        """
+        sid = "orphan-rc"
+        tr._new_session(sid)
+        tr.CUSTOM_WORDS.clear()
+        old_tables = (dict(tr._RECENT_FWD), dict(tr._RECENT_REV))
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+        try:
+            tok1 = tr._recall_token("13800138000", "PHONE")
+            self.assertIn(tok1, tr._RECENT_REV)
+            # 模拟 TTL 过期：直接把时间戳拨回过去，再签发同原文的新 token
+            tr._RECENT_FWD["13800138000"][2] = time.time() - 100 * 3600
+            tok2 = tr._recall_token("13800138000", "PHONE")
+            self.assertNotEqual(tok1, tok2)
+            self.assertNotIn(tok1, tr._RECENT_REV, "旧 token 的 REV 条目必须注销")
+            self.assertNotIn(tr._token_suffix(tok1), tr._RECENT_SUFFIX, "旧后缀索引必须注销")
+            self.assertIn(tok2, tr._RECENT_REV)
+            # 新 token 查表正常，孤儿不影响正确性（回归保护）
+            self.assertEqual(tr._lookup(tok2, sid), "13800138000")
+        finally:
+            tr._RECENT_FWD.clear(); tr._RECENT_REV.clear(); tr._RECENT_SUFFIX.clear()
+            tr._RECENT_FWD.update(old_tables[0]); tr._RECENT_REV.update(old_tables[1])
+            for t in list(tr._RECENT_REV):
+                tr._suffix_index_add(t)
+
+    def test_warmup_evicts_oldest_when_over_capacity(self):
+        """预热超容量时按时间正序淘汰（删最旧），而非按倒序插入删最新。
+
+        预热条目时间戳全是同一个 now，_prune_recent 稳定排序退化为按插入序删；
+        曾倒序（最新先插）写入 → 最新的映射先被删，重启后活跃会话还原命中率
+        倒挂（审计 P2）。
+        """
+        import sqlite3 as _sq
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "shield-events.sqlite3")
+            conn = _sq.connect(db)
+            conn.execute("""CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL, type TEXT NOT NULL, sid TEXT, host TEXT, method TEXT,
+                path TEXT, count INTEGER, restored INTEGER, status TEXT,
+                http_status INTEGER, payload TEXT NOT NULL)""")
+            # 三条 MASK 事件（id 递增 = 越新），各自映射**不同原文**（同一原文会被
+            # 「最新 token 优先」去重，测不出容量淘汰）。后缀必须全在
+            # _TOKEN_ALPHABET 辅音表内（l/y 不在表内，_PLACEHOLDER_RX 不认）。
+            samples = [("13800138000", "{{PHONE_qzwcmr}}"),
+                       ("13900139000", "{{PHONE_hjkmsd}}"),
+                       ("13700137000", "{{PHONE_mnbvcx}}")]
+            rows = [(time.time() - 100 + i, json.dumps({"items": [
+                {"tok": tok, "original": orig, "label": "PHONE"}]}))
+                    for i, (orig, tok) in enumerate(samples)]
+            conn.executemany("INSERT INTO events (ts, type, payload) VALUES (?, 'MASK', ?)", rows)
+            conn.commit()
+            conn.close()
+            old_tables = (dict(tr._RECENT_FWD), dict(tr._RECENT_REV))
+            tr._RECENT_FWD.clear(); tr._RECENT_REV.clear(); tr._RECENT_SUFFIX.clear()
+            old_max = tr._RECENT_MAX
+            tr._RECENT_MAX = 2  # 容量 2，3 条映射必须淘汰最旧那条
+            try:
+                with mock.patch.dict(os.environ, {"LLM_SHIELD_DATA_DIR": d}):
+                    tr._warmup_recent_from_db()
+                self.assertEqual(len(tr._RECENT_REV), 2)
+                # 最新两条存活、最旧（qzwcmr，id 最小）被淘汰
+                self.assertNotIn("{{PHONE_qzwcmr}}", tr._RECENT_REV, "被淘汰的必须是最旧映射")
+                self.assertIn("{{PHONE_mnbvcx}}", tr._RECENT_REV, "最新映射必须存活")
+                self.assertIn("{{PHONE_hjkmsd}}", tr._RECENT_REV)
+            finally:
+                tr._RECENT_MAX = old_max
+                tr._RECENT_FWD.clear(); tr._RECENT_REV.clear(); tr._RECENT_SUFFIX.clear()
+                tr._RECENT_FWD.update(old_tables[0]); tr._RECENT_REV.update(old_tables[1])
+                for t in list(tr._RECENT_REV):
+                    tr._suffix_index_add(t)
+
+    def test_stop_endpoint_skip_fallback_for_exit(self):
+        """App 退出专用 stop?skip_fallback=1：不挂兜底监听，消除退出后的明文直连窗口。
+
+        普通手动停止（无参数）仍走完整 stop_mode 语义；只有带 skip_fallback=1
+        的退出调用跳过兜底。stop_proxy 本体在此 mock 掉，只验参数传递与解析。
+        """
+        calls = []
+        old_stop = panel.stop_proxy
+        self.addCleanup(lambda: setattr(panel, "stop_proxy", old_stop))
+        panel.stop_proxy = lambda skip_fallback=False: calls.append(skip_fallback) or (True, None)
+        headers = {"X-Shield-Token": panel.API_TOKEN}
+        with panel.app.test_client() as client:
+            r = client.post("/api/proxy/stop?skip_fallback=1", headers=headers)
+            self.assertEqual(r.status_code, 200)
+            r = client.post("/api/proxy/stop", json={"skip_fallback": True}, headers=headers)
+            self.assertEqual(r.status_code, 200)
+            r = client.post("/api/proxy/stop", headers=headers)
+            self.assertEqual(r.status_code, 200)
+        self.assertEqual(calls, [True, True, False],
+                         "仅显式 skip_fallback 请求跳过兜底，手动停止必须保持 stop_mode 语义")
+
+    def test_allow_hosts_change_triggers_restart_only_in_explicit_mode(self):
+        """explicit 模式域名白名单变化必须重启（--allow-hosts 是启动期参数）；
+        reverse/local 模式与未变化的白名单都不重启。"""
+        restarts = []
+        old_restart = panel._restart_proxy_locked
+        old_emit = panel._emit_log
+        old_proc = panel.proc.copy()
+        self.addCleanup(lambda: setattr(panel, "_restart_proxy_locked", old_restart))
+        self.addCleanup(lambda: setattr(panel, "_emit_log", old_emit))
+        self.addCleanup(lambda: panel.proc.update(old_proc))
+        panel._emit_log = lambda line: None
+        panel._restart_proxy_locked = lambda reason: restarts.append(reason) or True
+        # 伪造「代理运行中」：poll() 返回 None
+        panel.proc["p"] = SimpleNamespace(poll=lambda: None)
+        base = {"capture_mode": "explicit", "target_domains": ["a.com", "b.com"],
+                "domains_disabled": []}
+        try:
+            # 域名新增 → 重启
+            self.assertTrue(panel._maybe_restart_for_allow_hosts(
+                {**base, "target_domains": ["a.com", "b.com", "c.com"]},
+                panel._allow_hosts_of(base)))
+            # 禁用域名变化 → 重启
+            self.assertTrue(panel._maybe_restart_for_allow_hosts(
+                {**base, "domains_disabled": ["a.com"]}, panel._allow_hosts_of(base)))
+            # 白名单未变 → 不重启
+            self.assertFalse(panel._maybe_restart_for_allow_hosts(base, panel._allow_hosts_of(base)))
+            # reverse 模式（由 addon 路由）→ 域名变化也不重启
+            self.assertFalse(panel._maybe_restart_for_allow_hosts(
+                {"capture_mode": "reverse", "target_domains": ["c.com"]},
+                panel._allow_hosts_of(base)))
+        finally:
+            panel.proc["p"] = None
+        self.assertEqual(len(restarts), 2)
+
+    def test_stop_mode_migration_never_overrides_explicit_choice(self):
+        """v2 迁移只补缺省键：用户显式配置的 stop_mode=error/block 必须原样保留。
+
+        曾被静默改回 passthrough——明确选择 fail-closed 的用户被换成
+        「停止即明文直连」（隐私语义被无声改写）。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            old_cfg_path = panel.CONFIG_PATH
+            patcher = mock.patch.object(panel, "CONFIG_PATH", Path(d) / "config.json")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            self.addCleanup(lambda: setattr(panel, "CONFIG_PATH", old_cfg_path))
+            try:
+                # 显式 error：迁移后必须保持 error
+                panel.CONFIG_PATH.write_text(json.dumps({
+                    "stop_mode": "error",
+                    "meta": {"stop_mode_passthrough_default_v2": False},
+                }), encoding="utf-8")
+                cfg = panel.load_config()
+                self.assertEqual(cfg["stop_mode"], "error", "显式配置不得被迁移覆盖")
+                self.assertTrue(cfg["meta"]["stop_mode_passthrough_default_v2"])
+                # 缺省：迁移补 passthrough
+                panel.CONFIG_PATH.write_text(json.dumps({
+                    "meta": {"stop_mode_passthrough_default_v2": False},
+                }), encoding="utf-8")
+                cfg = panel.load_config()
+                self.assertEqual(cfg["stop_mode"], "passthrough", "缺省键由迁移补默认值")
+            finally:
+                panel.CONFIG_PATH.unlink(missing_ok=True)
+
+    def test_filter_off_stream_passthrough_is_identity(self):
+        """过滤关闭的流式接管回调：chunk 原样返回（无会话可查、无还原）。"""
+        self.assertEqual(tr._raw_stream_passthrough(b"data: x\n\n"), b"data: x\n\n")
+        self.assertEqual(tr._raw_stream_passthrough(b""), b"")
+
+    def test_filter_off_responseheaders_installs_passthrough_stream(self):
+        """过滤关闭时 responseheaders 必须真的挂上纯透传流回调。
+
+        曾只验证 `_raw_stream_passthrough` 是恒等函数，没验挂载点——回调
+        存在但没人安装等于没有流式（复审指出的测试锚点缺口）。
+        """
+        old_stream = tr.STREAM_RESPONSE
+        tr.STREAM_RESPONSE = True
+        self.addCleanup(lambda: setattr(tr, "STREAM_RESPONSE", old_stream))
+
+        def mk_flow(ct, enc=""):
+            headers = {"content-type": ct, "content-length": "123"}
+            if enc:
+                headers["content-encoding"] = enc
+            return SimpleNamespace(
+                request=SimpleNamespace(pretty_host="h", path="/x", method="POST", host="h"),
+                response=SimpleNamespace(headers=headers, stream=None),
+                metadata={"shield_filter_off": True},
+            )
+
+        # SSE：挂纯透传接管 + 剥 Content-Length（EOF 定界）
+        f1 = mk_flow("text/event-stream")
+        tr.responseheaders(f1)
+        self.assertIs(f1.response.stream, tr._raw_stream_passthrough)
+        self.assertNotIn("content-length", f1.response.headers)
+        # 压缩 SSE：不挂接管、退回整包路径并留痕
+        f2 = mk_flow("text/event-stream", "gzip")
+        tr.responseheaders(f2)
+        self.assertIsNone(f2.response.stream)
+        self.assertEqual(f2.metadata.get("shield_stream_degraded"), "gzip")
+        # 整包 JSON：无帧边界需求，不接管
+        f3 = mk_flow("application/json")
+        tr.responseheaders(f3)
+        self.assertIsNone(f3.response.stream)
+
+    def test_autostart_exception_branch_starts_fallback(self):
+        """_autostart 任意异常（配置读不了/启动炸了）必须挂兜底监听。
+
+        对比正常失败分支有兜底，异常分支漏挂的话所有 upstream 端口无人监听、
+        客户端连接被拒且引擎不退出不自愈（审计 P2）。
+        """
+        import engine_entry
+        hits = []
+        with mock.patch.object(panel, "load_config", side_effect=RuntimeError("boom")), \
+             mock.patch.object(panel, "start_proxy", lambda: (True, None)), \
+             mock.patch.object(panel, "_emit_log", lambda line: None), \
+             mock.patch.object(panel, "_start_fallback",
+                               lambda reason: hits.append(reason) or 1):
+            engine_entry._autostart()  # 异常必须被吞掉（引擎进程不许退出）
+        self.assertEqual(hits, ["代理自启异常"])
+
+    def test_price_sync_loop_reschedules_periodically(self):
+        """价格定期复查：每次调用检查一次并排下一个 6h Timer（自续期）。
+
+        「每 7 天自动刷新」曾只在启动时判断一次，桌面壳常驻数周价格失真；
+        本用例锁住「会自续期」这个机制本身（Timer 被 mock，不真等 6 小时）。
+        """
+        called = []
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, fn):
+                self.interval, self.fn = interval, fn
+                self.daemon = False
+                timers.append(self)
+            def start(self):
+                pass
+
+        with mock.patch.object(panel, "_maybe_auto_sync_prices",
+                               lambda: called.append(1)), \
+             mock.patch.object(panel.threading, "Timer", FakeTimer):
+            panel._price_sync_loop()
+        self.assertEqual(called, [1], "每轮必须真调一次同步检查")
+        self.assertEqual(len(timers), 1, "必须排下一个周期 Timer")
+        self.assertEqual(timers[0].interval, 6 * 3600)
+        self.assertTrue(timers[0].daemon, "周期线程必须 daemon，不阻塞进程退出")
+
+    def test_read_chunked_body_rejects_malformed_and_truncated(self):
+        """畸形 chunk 头 / 中途截断必须 raise（400），不得静默返回半截 body。
+
+        曾静默 break 把截断 JSON 转发上游，错误被移花接接木、排障困难。
+        """
+        import io
+        # 正常 chunked：解码完整
+        r = io.BytesIO(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")
+        self.assertEqual(panel._read_chunked_body(r), b"Wikipedia")
+        # 畸形 chunk 头（非十六进制）→ ValueError
+        r = io.BytesIO(b"ZZ\r\nxxxx")
+        with self.assertRaises(ValueError):
+            panel._read_chunked_body(r)
+        # 中途 EOF（声明 8 字节只给 3 字节）→ ValueError
+        r = io.BytesIO(b"8\r\nabc")
+        with self.assertRaises(ValueError):
+            panel._read_chunked_body(r)
+
+    def test_passthrough_handler_class_hardening(self):
+        """PT handler 硬化锚点：读超时、Nagle 关闭、HEAD/OPTIONS 不再落 501。"""
+        PT = panel._make_passthrough_handler("https://api.example.com")
+        self.assertEqual(PT.timeout, 300, "半开连接不得永久占用 handler 线程")
+        self.assertTrue(PT.disable_nagle_algorithm, "SSE 小块必须立刻下发")
+        # CORS 预检 / 健康检查：与转发同一路径，不再落 BaseHTTPRequestHandler 默认 501
+        self.assertIs(PT.do_OPTIONS, PT.do_GET)
+        self.assertTrue(callable(PT.do_HEAD))
+
+    def test_stop_proxy_locked_skip_fallback_branch(self):
+        """退出流程（skip_fallback=True）必须真的不挂兜底监听，手动停止必须挂。
+
+        曾只验 API 参数传递，_stop_proxy_locked 分支本身无锚点（复审指出）。
+        """
+        hits = []
+        saved = {}
+        for name, fake in (
+            ("_start_fallback", lambda reason: hits.append(("fallback", reason))),
+            ("_kill_proxy_tree", lambda pid: None),
+            ("_read_pid_file", lambda: None),
+            ("_listening_port_pids", lambda ports, fresh=False: {}),
+            ("load_config", lambda: panel.default_config()),
+        ):
+            saved[name] = getattr(panel, name)
+            setattr(panel, name, fake)
+            self.addCleanup(lambda n=name, orig=saved[name]: setattr(panel, n, orig))
+        old_pid_file = panel.PID_FILE
+        old_state = dict(panel.state)
+        with tempfile.TemporaryDirectory() as d:
+            mock.patch.object(panel, "PID_FILE", Path(d) / "pid").start()
+            self.addCleanup(mock.patch.stopall)
+            panel.proc["p"] = None
+            try:
+                ok, _ = panel._stop_proxy_locked(skip_fallback=True)
+                self.assertTrue(ok)
+                self.assertEqual(hits, [], "退出流程不得挂兜底监听（明文直连窗口）")
+                ok, _ = panel._stop_proxy_locked(skip_fallback=False)
+                self.assertTrue(ok)
+                self.assertEqual(hits, [("fallback", "已停止代理")],
+                                 "手动停止必须走 stop_mode 兜底语义")
+            finally:
+                panel.state.clear()
+                panel.state.update(old_state)
+                panel.PID_FILE = old_pid_file
 
     def test_error_listener_returns_503_json(self):
         """stop_mode=error：端口继续监听，请求收到 503 + 可解析的错误结构。
@@ -2331,6 +2765,7 @@ class _RuleTestBase(unittest.TestCase):
         tr.SENSITIVE_WORD_DISABLED = {}
         tr.BUILTIN_RULES = {l: True for l in tr.DEFAULT_BUILTIN_RULES}
         tr.BUILTIN_RULES["IP_INTERNAL"] = False
+        tr.BUILTIN_RULES["IP_PUBLIC"] = False
         tr.BUILTIN_RULES["USCC"] = False
         tr._CUSTOM_WORD_RX_CACHE.clear()
         self._sid = [0]
@@ -2426,6 +2861,122 @@ class BuiltinRuleVariantTests(_RuleTestBase):
     def test_idcard18_requires_checksum(self):
         self.assertMasked("证件 110101199003078515")
         self.assertUntouched("订单 202601151234567")
+
+    def test_ip_public_variants_and_false_positive_boundaries(self):
+        """IP_PUBLIC 开启时的覆盖面与严格防误伤边界。"""
+        tr.BUILTIN_RULES["IP_PUBLIC"] = True
+        old_private = tr.BUILTIN_RULES.get("IP_PRIVATE", False)
+        tr.BUILTIN_RULES["IP_PRIVATE"] = False
+        try:
+            # 真实公网 IP 应脱敏
+            for t in [
+                "服务器公网IP 123.57.89.10 请排查",
+                "curl http://47.98.12.34:8080/api",
+                "连接 104.21.55.2",
+                "IP是 123.57.89.10。",
+                "host=52.12.34.56",
+                # URL 路径里的真实公网 IP（含多位段）照常脱敏
+                "https://example.com/47.98.12.34/health",
+                # 构建号形态收紧后：第三段非 0 的真实公网主机（AWS/Level3 常见段）
+                # 必须照常脱敏（复审实测曾漏检）
+                "主机 5.189.128.100 与 3.11.14.2",
+            ]:
+                with self.subTest(t=t):
+                    masked, _ = self.assertMasked(t)
+                    self.assertIn("IPPUBLIC_", masked)
+
+            # 误伤形态必须全部跳过
+            for t in [
+                "版本号 1.2.3.4.5",
+                "升级到 v1.2.3.4 版本",
+                "升级到 V2.1.0.5 版本",
+                "下载 package-1.2.3.4.jar",
+                "解压 app-1.2.3.4.tar.gz",
+                "这是 bundle.1.2.3.4.js 文件",
+                "运行 1.2.3.4-beta 测试",
+                "构建 1.2.3.4-SNAPSHOT",
+                "版本 1.2.3.4_rc1",
+                "构建 1.2.3.4-5 构建号",
+                "模块 lib-1.2.3.4 报错",
+                "服务 app_1.2.3.4 崩溃",
+                "前缀 build.1.2.3.4",
+                # 全个位数启发式：四段均个位数且非 DNS 白名单 → 视为版本号/示例放行
+                "示例地址 1.2.3.4 请忽略",
+                "版本 2.0.1.0 发布",
+                # 构建号形态启发式：首段个位 + 第三段为 0 + 末段三位数
+                # （Java/构建号版本标准形状；第三段非 0 不放行，防误放 5.189.128.100）
+                "Java 1.8.0.202 运行时",
+                "升级 1.8.0.151 补丁",
+                "构建 2.4.0.101",
+                # URL 路径版本号（全个位数）曾是实测误伤，启发式后清零
+                "maven 下载 https://repo.example.com/app/1.2.3.4/release.zip",
+                # 已知取舍（钉住防回归误判为 bug）：连字符 IP 区间不脱——
+                # "-" 同时是版本号防御特征（-beta/-5），上下文不可区分，接受漏检
+                "区间 47.98.12.34-47.98.12.35",
+                "内网IP 192.168.1.1",
+                "内网 10.20.30.40",
+                "内网 172.16.0.1",
+                "链路本地 169.254.1.1",
+                "环回 127.0.0.1",
+                "全通配 0.0.0.0",
+                "组播 224.0.0.1",
+                "保留段 240.0.0.1",
+                "广播 255.255.255.255",
+                "DNS 8.8.8.8",
+                "DNS 1.1.1.1",
+                "DNS 114.114.114.114",
+                "阿里DNS 223.5.5.5",
+                # Level3 全个位数 anycast DNS，白名单豁免
+                "DNS 4.2.2.2",
+                "Tailscale 100.118.224.56",
+            ]:
+                with self.subTest(t=t):
+                    self.assertUntouched(t)
+        finally:
+            tr.BUILTIN_RULES["IP_PUBLIC"] = False
+            tr.BUILTIN_RULES["IP_PRIVATE"] = old_private
+
+    def test_token_rule_covers_uppercase_bearer(self):
+        """TOKEN 预检 marker 缺 BEARER 时全大写头漏检的回归（实测存量缺陷）。
+
+        _RULE_MARKERS 是大小写敏感子串预检，正则本身是 (?i)：marker 只列
+        Bearer/bearer 时，"BEARER xxx" 连正则都跑不到。
+        """
+        for t in [
+            "Authorization: BEARER abcdef1234567890abcdef",
+            "Authorization: bearer abcdef1234567890abcdef",
+        ]:
+            with self.subTest(t=t):
+                masked, _ = self.assertMasked(t)
+                self.assertIn("TOKEN_", masked)
+                self.assertNotIn("abcdef1234567890abcdef", masked)
+
+    def test_ip_public_restoration_and_variants(self):
+        """IP_PUBLIC 占位符在模型输出时完整还原，包括模型改写标签时。"""
+        tr.BUILTIN_RULES["IP_PUBLIC"] = True
+        try:
+            sid = "ip-pub-restore"
+            tr._new_session(sid)
+            raw = "服务器 123.57.89.10 部署成功"
+            masked = tr.mask(raw, sid)
+            self.assertNotIn("123.57.89.10", masked)
+
+            # 标准还原
+            restored = tr.restore_final(f"回复：已连接 {masked}", sid)
+            self.assertIn("123.57.89.10", restored)
+
+            # 模型改写成 IP_PUBLIC 或全小写兜底还原
+            m = re.search(r"\{\{IPPUBLIC_([a-z0-9]+)\}\}", masked)
+            self.assertIsNotNone(m)
+            suffix = m.group(1)
+            # 变体 1: {{IP_PUBLIC_xxxxxx}}
+            r1 = tr.restore_final(f"已连接 {{{{IP_PUBLIC_{suffix}}}}}", sid)
+            self.assertIn("123.57.89.10", r1)
+            # 变体 2: {{ippublic_xxxxxx}}
+            r2 = tr.restore_final(f"已连接 {{{{ippublic_{suffix}}}}}", sid)
+            self.assertIn("123.57.89.10", r2)
+        finally:
+            tr.BUILTIN_RULES["IP_PUBLIC"] = False
 
 
 class CloudCredentialCoverageTests(_RuleTestBase):
@@ -2680,6 +3231,23 @@ class PriceCatalogMatchingTests(unittest.TestCase):
     389 条目录一条都命中不了，全部退回 36 条内置表，用户体感就是
     「你不发版我就用不上新模型」。这组用例锁死匹配顺序和归一规则。
     """
+
+    def test_save_price_cache_is_atomic_and_loadable(self):
+        """价格缓存原子写（tmp + replace）：写完不留 tmp 残片、内容可回读。
+
+        Tauri 壳对引擎的超时退出是 taskkill 强杀，写一半的 JSON 会让
+        load_price_cache 回退内置价且 synced_at 归零（审计 P2）。
+        """
+        from shield_defaults import save_price_cache, load_price_cache
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "prices.json"
+            save_price_cache(p, {"gpt-4o": {"input": 2.5, "output": 10.0}}, "test")
+            self.assertTrue(p.exists())
+            self.assertFalse(p.with_suffix(".json.tmp").exists(), "原子写不得残留 tmp 文件")
+            loaded = load_price_cache(p)
+            self.assertIsNotNone(loaded)
+            self.assertIn("gpt-4o", loaded["prices"])
+            self.assertEqual(loaded["prices"]["gpt-4o"]["input"], 2.5)
 
     CATALOG = {
         "openai/gpt-4o": {"input": 2.5, "output": 10.0},

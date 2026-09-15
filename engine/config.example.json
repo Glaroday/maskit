@@ -33,6 +33,7 @@
     "IDCARD": true,
     "IP_PRIVATE": true,
     "IP_INTERNAL": false,
+    "IP_PUBLIC": false,
     "CARD": true,
     "IBAN": true,
     "USCC": false,

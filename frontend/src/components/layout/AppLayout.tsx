@@ -80,7 +80,16 @@ function useTheme() {
 }
 
 export function AppLayout({ children }: { children: ReactNode }) {
-  const [collapsed, setCollapsed] = useState(false)
+  const [collapsed, setCollapsed] = useState(() => {
+    if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+      return true
+    }
+    try {
+      return localStorage.getItem('maskit_sidebar_collapsed') === '1'
+    } catch {
+      return false
+    }
+  })
   const { dark, toggle } = useTheme()
   const queryClient = useQueryClient()
   const { engineReady, engineError } = useAuthStore()
@@ -243,6 +252,10 @@ export function AppLayout({ children }: { children: ReactNode }) {
   })()
 
 
+  const isLogsPage = routeLocation.pathname === '/logs'
+  // 数据密集型页面：在大屏下放宽版心到 1536px，让表格和趋势图自然舒展；表单类页面保持 1200px
+  const isWidePage = ['/', '/logs', '/stats', '/audit'].includes(routeLocation.pathname)
+
   const toggleProxy = async () => {
     if (proxyBusy) return
     setProxyBusy(true)
@@ -344,11 +357,17 @@ export function AppLayout({ children }: { children: ReactNode }) {
 
         {/* 收起按钮 */}
         <button
-          onClick={() => setCollapsed((c) => !c)}
+          onClick={() => {
+            setCollapsed((c) => {
+              const next = !c
+              try { localStorage.setItem('maskit_sidebar_collapsed', next ? '1' : '0') } catch {}
+              return next
+            })
+          }}
           className={cn(
             'flex h-9 shrink-0 items-center justify-center border-t text-muted-foreground transition-colors hover:bg-muted hover:text-foreground',
           )}
-          title={collapsed ? t('layout.collapseSidebar') : t('layout.expandSidebar')}
+          title={collapsed ? t('layout.expandSidebar') : t('layout.collapseSidebar')}
         >
           <PanelLeft className={cn('h-4 w-4 transition-transform duration-300', collapsed && 'rotate-180')} />
         </button>
@@ -464,7 +483,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
                 }
               }}
               title="GitHub"
-              className="h-8 w-8 px-0 text-muted-foreground hover:text-foreground"
+              className="hidden h-8 w-8 px-0 text-muted-foreground hover:text-foreground sm:inline-flex"
             >
               <GithubIcon className="h-4 w-4" />
             </Button>
@@ -515,9 +534,21 @@ export function AppLayout({ children }: { children: ReactNode }) {
           </div>
         )}
 
-        {/* 内容区：不自己滚（子页按需管理；Logs 页要固定高度让虚拟滚动生效） */}
-        <main className="min-h-0 flex-1 overflow-hidden">
-          <div className="mx-auto h-full w-full max-w-[1200px] overflow-y-auto p-6 lg:p-8">
+        {/* 内容区：Logs 页由自身定高容器进行虚拟滚动，其余页面由全宽 main 提供贴边自然滚动 */}
+        <main
+          className={cn(
+            'min-h-0 flex-1',
+            isLogsPage ? 'overflow-hidden' : 'overflow-y-auto'
+          )}
+        >
+          <div
+            key={routeLocation.pathname}
+            className={cn(
+              'animate-page-enter mx-auto w-full p-5 lg:p-8',
+              isWidePage ? 'max-w-[1536px]' : 'max-w-6xl',
+              isLogsPage ? 'h-full overflow-hidden flex flex-col' : 'min-h-full'
+            )}
+          >
             {statusError && (
               <div className="mb-4 flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
                 <AlertCircle className="h-3.5 w-3.5 shrink-0" />

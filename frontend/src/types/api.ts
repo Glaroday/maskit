@@ -157,6 +157,8 @@ export interface LogsResponse {
   /** Older engines may not include pagination metadata. */
   has_more?: boolean
   next_since?: number
+  /** 游标重置（清空日志/库隔离重建后 id 从 1 重新开始）：丢弃旧游标从 0 重拉 */
+  reset?: boolean
 }
 
 export interface LogDetailResponse {

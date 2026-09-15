@@ -107,3 +107,33 @@ export function formatBytes(bytes: number | null | undefined): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
+
+/**
+ * 百分比格式化（防伪 100% 满格展示）：
+ * - 接收 0 ~ 1 之间的比率（如 0.9995）
+ * - rate == null 或 isNaN(rate) 时返回 '—'
+ * - 真实达到 100%（rate >= 1 且未被 isNotFull 显式标记）时才显示 '100.0%'
+ * - 未完全达到 100%（rate < 1 或 isNotFull 为 true）时，若四舍五入进位为 100.0%，
+ *   封顶显示为 '99.9%'（对应 digits 位数），杜绝「分子 < 分母却显示 100.0%」的视觉误解
+ */
+export function formatPercent(
+  rate: number | null | undefined,
+  digits = 1,
+  options?: { isNotFull?: boolean },
+): string {
+  if (rate == null || isNaN(rate)) return '—'
+  if (rate <= 0) return `${(0).toFixed(digits)}%`
+
+  const isNotFull = options?.isNotFull ?? (rate < 1)
+  if (!isNotFull && rate >= 1) return `${(100).toFixed(digits)}%`
+
+  const p = rate * 100
+  const s = p.toFixed(digits)
+  if (isNotFull && Number(s) >= 100) {
+    // 实际未满（如 2056/2057），但四舍五入进位到了 100.0%，封顶显示为 99.9%
+    const cap = 100 - Math.pow(10, -digits)
+    return `${cap.toFixed(digits)}%`
+  }
+  return `${s}%`
+}
+

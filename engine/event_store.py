@@ -1017,6 +1017,35 @@ def _append_many_with_degrade(records):
         return ok_count, fail_count
 
 
+def db_max_event_id():
+    """当前库最大事件 id（清空/隔离重建后归 0）。供 /api/logs 的游标重置检测。"""
+    _ensure_db()
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()
+    try:
+        return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+def _sync_clear_cutoff_from_db():
+    """从 meta 表对齐清空 cutoff（跨进程：面板进程清空时写入，引擎写线程消费）。
+
+    只升不降：本进程内存值更新（如自己也刚清空过）不受影响。读失败静默——
+    对齐不到最多退化回单进程防护，不能让清空竞态修复反过来打断写线程。
+    """
+    global _clear_cutoff
+    try:
+        with closing(_connect()) as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key='clear_cutoff'").fetchone()
+        if row:
+            stored = float(row[0] or 0)
+            if stored > _clear_cutoff:
+                _clear_cutoff = stored
+    except Exception:
+        pass
+
+
 def _writer_loop():
     while True:
         record = _event_queue.get()
@@ -1035,6 +1064,10 @@ def _writer_loop():
         # except 里引用它会再抛 UnboundLocalError 把写线程打死。
         lost = 0
         try:
+            # 清空 cutoff：面板进程与本进程（mitmdump 引擎）各自有内存值，面板
+            # 清空时把 cutoff 落进 meta，这里每批对齐一次——否则引擎队列里积压
+            # 的旧事件会在清空完成后"复活"（跨进程竞态，审计 P2）。
+            _sync_clear_cutoff_from_db()
             # 清空 cutoff 前的旧事件：丢弃，防"清空又冒出来"
             fresh = [r for r in batch if not _clear_cutoff or float(r.get("ts") or 0) >= _clear_cutoff]
             if fresh:
@@ -1394,6 +1427,9 @@ def clear_events():
     打码 preview 属于日志明细，daily_stats/daily_status/daily_tokens/daily_prefix
     是纯数字计数，清掉等于把用户几个月的趋势图归零，而他只是想清日志；
     4) 按 cutoff 补删一次兜住写线程正在写旧事件的窗口。清空之后的新事件正常写入。
+    5) cutoff 落 meta 表：事件写方是另一个进程（mitmdump 引擎，有自己的内存
+    cutoff=0），不落库的话引擎队列里积压的旧事件会在清空完成后"复活"
+    （跨进程竞态，审计 P2）；写线程每批从 meta 对齐一次（_sync_clear_cutoff_from_db）。
 
     这段 docstring 曾写「删除 events + 三个日统计摘要表」，与下面的实现相反——
     实现只删 daily_words。注释和代码不一致时，改注释别改代码（2026-08-17 修正）。
@@ -1426,6 +1462,11 @@ def clear_events():
         conn.execute("DELETE FROM sqlite_sequence WHERE name='events'")
         # 摘要表清空后迁移标记失效：后续事件重新增量累积
         conn.execute("DELETE FROM meta WHERE key='daily_stats_migrated'")
+        # cutoff 落库：引擎进程（另一进程）的写线程据此丢弃清空前的积压事件
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('clear_cutoff', ?)",
+            (_clear_cutoff,),
+        )
         conn.commit()
     # 兜底：写线程已取走但未提交的旧事件（窗口竞态）按 cutoff 补删
     with closing(_connect()) as conn:

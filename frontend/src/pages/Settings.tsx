@@ -90,7 +90,7 @@ const BUILTIN_RULE_GROUPS: { key: string; labelKey: string; rules: string[] }[] 
   {
     key: 'network',
     labelKey: 'settings.words.groupNetwork',
-    rules: ['IP_PRIVATE', 'IP_INTERNAL', 'MAC'],
+    rules: ['IP_PRIVATE', 'IP_INTERNAL', 'IP_PUBLIC', 'MAC'],
   },
   {
     key: 'entities',
@@ -100,29 +100,38 @@ const BUILTIN_RULE_GROUPS: { key: string; labelKey: string; rules: string[] }[] 
 ]
 
 // ========== 上游表单 ==========
-// 客户端类型 → 路径预设（多选 chip 展示，用户可增删；自定义类型全部手输）
-// headers 只放「与凭据无关」的协议头。凭据头（Authorization / x-api-key）**绝不预填**：
-// 预设一旦填上 <YOUR_API_KEY> 这类占位符，用户不替换就保存，转发时会无条件覆盖客户端
-// 自带的真 key，上游只回 401「无效的令牌」，用户完全看不出是自己的配置把 key 顶掉了
-// （实测 anyrouter 中转站必现）。客户端本来就带凭据，真需要注入的场景手填真实值即可。
-const CLIENT_TYPE_PRESETS: Record<string, { labelKey: string; paths: string[]; headers: [string, string][] }> = {
+// 客户端类型 / 协议模板预设
+// 默认通用聚合（/v1），一键通配全部协议；同时保留按需微调与单协议模板
+const CLIENT_TYPE_PRESETS: Record<string, { labelKey: string; paths: string[] }> = {
+  general: {
+    labelKey: 'settings.clientType.general',
+    paths: ['/v1'],
+  },
   openai: {
     labelKey: 'settings.clientType.openai',
     paths: ['/v1/chat/completions', '/v1/completions', '/v1/responses', '/v1/embeddings', '/v1/rerank', '/rerank', '/v1/models'],
-    headers: [],
   },
   anthropic: {
     labelKey: 'settings.clientType.anthropic',
     paths: ['/v1/messages', '/v1/complete'],
-    headers: [['anthropic-version', '2023-06-01']],
   },
   gemini: {
     labelKey: 'settings.clientType.gemini',
     paths: ['/v1/models', '/v1beta/models'],
-    headers: [],
   },
-  custom: { labelKey: 'settings.clientType.custom', paths: [], headers: [] },
+  custom: { labelKey: 'settings.clientType.custom', paths: [] },
 }
+
+// 跨协议常用端点推荐池：确保用户无论选什么模板，都能随手一点自由组合，轻松支持多协议聚合网关
+const QUICK_SUGGESTED_PATHS = [
+  '/v1',
+  '/v1/chat/completions',
+  '/v1/messages',
+  '/v1/responses',
+  '/v1/models',
+  '/v1/embeddings',
+  '/v1beta/models',
+]
 
 // 凭据类请求头：语义就是「承载身份凭据」，禁止通过「注入请求头」配置。
 // Maskit 只配 URL、只做透明转发，凭据归客户端（Claude Code / Cursor 等自带）。
@@ -153,11 +162,16 @@ const CREDENTIAL_HEADER_NAMES = new Set([
 const isCredentialHeader = (k: string) => CREDENTIAL_HEADER_NAMES.has(k.trim().toLowerCase())
 
 function detectClientType(u: UpstreamConfig): string {
-  // 按现有 paths 猜测类型（编辑已有客户端时回显）
+  // 按现有 paths 智能回显（/v1 或同时包含两家协议回显为通用聚合；老配置原样尊重）
   const paths = (u.paths ?? []).map((p) => p.toLowerCase())
-  if (paths.some((p) => p.includes('/v1/messages')) && !paths.some((p) => p.includes('/v1/chat/completions'))) return 'anthropic'
+  if (paths.includes('/v1')) return 'general'
+  const hasAnthropic = paths.some((p) => p.includes('/v1/messages') || p.includes('/v1/complete'))
+  const hasOpenAI = paths.some((p) => p.includes('/v1/chat/completions') || p.includes('/v1/completions'))
+  if (hasAnthropic && hasOpenAI) return 'general'
+  if (hasAnthropic) return 'anthropic'
   if (paths.some((p) => p.includes('/v1beta'))) return 'gemini'
-  return 'openai'
+  if (hasOpenAI) return 'openai'
+  return paths.length > 0 ? 'custom' : 'general'
 }
 
 function UpstreamForm({
@@ -190,21 +204,18 @@ function UpstreamForm({
   // 于是重渲染永远写回正确值，不会把用户展开的状态弹回去。
   const [advOpen, setAdvOpen] = useState(() => Object.keys(initial.extra_headers ?? {}).length > 0)
 
-  const presets = CLIENT_TYPE_PRESETS[clientType] ?? CLIENT_TYPE_PRESETS.openai
-  const presetPaths = presets.paths.filter((p) => !(form.paths ?? []).includes(p))
-  const presetHeaders = presets.headers.filter(([k]) => !(k in extraHeaders))
+  const presets = CLIENT_TYPE_PRESETS[clientType] ?? CLIENT_TYPE_PRESETS.general
+  const allCandidatePaths = Array.from(new Set([...presets.paths, ...QUICK_SUGGESTED_PATHS]))
+  const presetPaths = allCandidatePaths.filter((p) => !(form.paths ?? []).includes(p))
 
   const applyType = (t: string) => {
     setClientType(t)
     if (t === 'custom') return
-    // 选类型 → 切换为该类型的预设路径 + 预设 header（不保留其他协议的旧路径）
+    // 切换模板只更新推荐路径，绝不篡改用户的注入请求头
     const p = CLIENT_TYPE_PRESETS[t]
-    set('paths', [...p.paths])
-    const h = { ...extraHeaders }
-    for (const [k, v] of p.headers) {
-      if (!(k in h)) h[k] = v
+    if (p && p.paths.length > 0) {
+      set('paths', [...p.paths])
     }
-    set('extra_headers', h)
   }
 
   const togglePath = (p: string) => {
@@ -305,6 +316,11 @@ function UpstreamForm({
                 </button>
               ))}
             </div>
+            {form.paths?.includes('/v1') && (
+              <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                {t('settings.upstream.wildcardHint')}
+              </p>
+            )}
             <div className="mt-1.5 flex items-center gap-1.5">
               <Input className="h-7 w-52 font-mono text-xs" value={newPath} onChange={(e) => setNewPath(e.target.value)} placeholder={t('settings.upstream.pathPh')} onKeyDown={(e) => {
                 if (e.key === 'Enter' && newPath.trim().startsWith('/')) {
@@ -351,16 +367,6 @@ function UpstreamForm({
                     </div>
                   )
                 })}
-                {presetHeaders.map(([k, v]) => (
-                  <button
-                    key={k}
-                    type="button"
-                    onClick={() => setHeader(k, v)}
-                    className="flex items-center gap-1.5 rounded-lg border border-dashed border-border bg-muted/40 px-2 py-1 text-[11px] text-muted-foreground hover:border-primary/50 hover:text-foreground"
-                  >
-                    <Plus className="h-3 w-3" /> {k}: {v}
-                  </button>
-                ))}
                 <div className="flex items-center gap-1.5">
                   <Input className="h-7 w-36 font-mono text-[11px]" value={newHeaderKey} onChange={(e) => setNewHeaderKey(e.target.value)} placeholder={t('settings.upstream.headerNamePh')} />
                   <Input className="h-7 flex-1 font-mono text-[11px]" value={newHeaderVal} onChange={(e) => setNewHeaderVal(e.target.value)} placeholder={t('settings.upstream.headerValPh')} />
@@ -1108,7 +1114,11 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               // 1. OpenAI 兼容体系：官方 SDK 要求带 /v1（例如 http://127.0.0.1:18701/v1）
               // 2. Anthropic、Gemini 体系：官方 SDK 明确要求根地址（例如 http://127.0.0.1:18703），SDK 内部会自动请求 /v1/messages 等，追加 /v1 会导致 /v1/v1/messages 404
               const cType = detectClientType(u)
-              const isStandardOpenAI = cType === 'openai' && (u.paths ?? []).some((p) => p.startsWith('/v1'))
+              // OpenAI 规范 Base URL 带 /v1。除明确识别为 openai 外，「/v1 通配」
+              // 模板（通用聚合，paths 恰为 ['/v1']）也是 OpenAI 兼容入口，同样要带；
+              // anthropic/gemini/mixed 聚合保持根地址（SDK 自己拼 /v1/xxx）。
+              const isStandardOpenAI = (cType === 'openai' || (u.paths ?? []).some((p) => p === '/v1'))
+                && (u.paths ?? []).some((p) => p.startsWith('/v1'))
               const standardBaseUrl = isStandardOpenAI ? `${baseUrl}/v1` : baseUrl
               const paths: string[] = (u.paths ?? []).length > 0 ? (u.paths as string[]) : ['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses']
               return (
@@ -2470,7 +2480,7 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
 
       {(editing || adding) && (
         <UpstreamForm
-          initial={editing ?? { name: '', port: nextPort, target: '', use_proxy: false, paths: ['/v1/chat/completions', '/v1/completions'], base_path: '' }}
+          initial={editing ?? { name: '', port: nextPort, target: '', use_proxy: false, paths: ['/v1'], base_path: '' }}
           onSave={onSaveUpstream}
           onClose={() => { setEditing(null); setAdding(false) }}
           captureMode={cfg?.capture_mode ?? 'reverse'}

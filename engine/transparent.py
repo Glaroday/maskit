@@ -16,6 +16,7 @@ mitmproxy 本地显式代理 - 只拦目标站点聊天接口，脱敏请求 + �
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
 import codecs
 import datetime
+import ipaddress
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from shield_defaults import (
     DEFAULT_TTL,
     DEFAULT_UPSTREAMS,
     DEFAULT_BUILTIN_RULES,
+    KNOWN_PUBLIC_DNS,
     parse_egress_proxy,
     extract_usage as _extract_usage,
 )
@@ -50,6 +52,12 @@ ID_BOUND_R = r"(?![A-Za-z0-9])"
 # 原来只用 ID_BOUND_R，`编号 192.168.1.1.1` 会把前 4 段当 IP 打码、剩个孤零零的
 # `.1` 在后面，用户看到的是被截半的编号。5 段以上不是 IPv4，直接放过。
 IP_BOUND_R = r"(?![A-Za-z0-9]|\.\d)"
+
+# 公网 IPv4 专用边界：强防误伤定宽断言
+# 左边界：挡住字母数字、字母数字连字符/下划线（lib-1.2.3.4/app_1.2.3.4）、包名域名点号前缀与多段版本截断
+IP_PUBLIC_BOUND_L = r"(?<![A-Za-z0-9][-_])(?<![A-Za-z0-9]\.)(?<![A-Za-z0-9])"
+# 右边界：挡住字母数字、点号文件后缀（.jar/.tar.gz/.js）与连字符标签/构建号后缀（-beta/-SNAPSHOT/-5）
+IP_PUBLIC_BOUND_R = r"(?![A-Za-z0-9]|\.[A-Za-z0-9]|[-_][A-Za-z0-9])"
 RULES = [
     # PEM 私钥整块替换（最高危凭据，形态固定零误报）——审计规则专项 P0。
     # 多行匹配：-----BEGIN ... PRIVATE KEY----- 到 -----END ... PRIVATE KEY-----
@@ -181,6 +189,9 @@ RULES = [
     # 第二段限定 64-127，避免把 100.0.x / 100.200.x 这类普通数字串卷进来。
     (re.compile(ID_BOUND_L + r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}" + IP_BOUND_R), "IP_PRIVATE", 0),
     (re.compile(ID_BOUND_L + r"(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})" + IP_BOUND_R), "IP_INTERNAL", 0),
+    # 公网 IPv4：放 network 规则末尾（IP_INTERNAL 之后），作为泛化规则兜底。
+    # 严格限定各段 0-255，语义校验由 _ip_public_ok 剔除私网保留段、组播与知名公共 DNS。
+    (re.compile(IP_PUBLIC_BOUND_L + r"(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?|[1-9])(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})" + IP_PUBLIC_BOUND_R), "IP_PUBLIC", 0),
     # 银行卡：13-19 位数字，必须以 3-6 开头（真卡 BIN：3=Amex/JCB，4=Visa，
     # 5=MasterCard，6=银联/Discover），且过 Luhn。位数范围按 ISO/IEC 7812——
     # 旧版只匹配 16 位，把国内主流的 19 位银联借记卡（62 开头）整类漏掉。
@@ -226,7 +237,9 @@ _RULE_MARKERS = {
     # 它整条是小写键名，不含 AK/LTAI/AKID 任何一个，不加就会被预检直接跳过。
     "ACCESS_KEY": ("AK", "LTAI", "AKID", "aws", "AWS"),
     "JWT": ("eyJ",),             # JWT 头固定
-    "TOKEN": ("Bearer", "bearer"),  # (?i)\bBearer\s+ 值
+    # (?i)\bBearer\s+ 值。marker 是大小写敏感子串，三种常见大小写都要列：
+    # 只列 Bearer/bearer 时全大写 "BEARER abc..." 连正则都跑不到（实测漏检）。
+    "TOKEN": ("Bearer", "bearer", "BEARER"),
     # 规则要求 \s*[:=：＝]\s*。全角冒号/等号必须一并列出：预检命不中就整条规则跳过，
     # 中文用户写的「令牌：xxx」会连正则都跑不到（与 CGNAT 那次同一个坑）。
     "SECRET": ("=", ":", "：", "＝"),
@@ -807,6 +820,35 @@ _prefix_rx_cache = None
 _prefix_rx_key = None
 
 
+def _ip_public_ok(orig: str) -> bool:
+    """公网 IPv4 校验：排除已知公共 DNS、版本号形态、私网、环回、组播及保留段。
+
+    两层版本号启发式（规则默认关，宁漏勿误伤）：
+    1. 四段全个位数（1.2.3.4 / 2.0.1.0）：开发文本里压倒性偏向版本号与教学
+       示例；真实公网主机的全个位数地址只有知名 anycast DNS，已全部枚举进白名单。
+    2. 构建号形态（首段个位 + 第三段为 0 + 末段三位数，如 Java 1.8.0.202 /
+       2.4.0.101）：Java/构建号版本的标准形状。第三段必须为 0——不加这条的
+       话 5.189.128.100 这类真实公网主机（AWS/Level3 的 3.x/5.x/8.x 段常见）
+       会被放行（复审实测）。
+    漏检面（fail-open，已知取舍）：全个位数非白名单段（8.8.8.1）、构建号形态
+    真实主机（5.189.0.100）不脱；由默认关闭 + 元数据标注兜底。
+    """
+    if not isinstance(orig, str) or orig in KNOWN_PUBLIC_DNS:
+        return False
+    try:
+        parts = orig.split(".")
+        # 四段全个位数：视为版本号/教学示例放行（白名单已在上面先判）
+        if all(len(part) == 1 for part in parts):
+            return False
+        # 构建号形态：首段个位 + 第三段为 0 + 末段三位数（100-255）
+        if len(parts[0]) == 1 and parts[2] == "0" and len(parts[-1]) == 3:
+            return False
+        addr = ipaddress.IPv4Address(orig)
+        return addr.is_global and not addr.is_multicast
+    except ValueError:
+        return False
+
+
 def _prefix_secret_regex():
     global _prefix_rx_cache, _prefix_rx_key
     key = tuple(SECRET_PREFIXES)
@@ -1006,13 +1048,21 @@ def _warmup_recent_from_db():
         # LIMIT 兜底：重度使用下 48h 可能有几万条事件，逐条 json.loads 会把
         # 引擎启动拖慢。倒序取最近的 _WARMUP_MAX_EVENTS 条足够覆盖活跃会话，
         # 而复用表本来就有 _RECENT_MAX 上限，多读也留不住。
-        with sqlite3.connect(db_path, timeout=5) as conn:
+        # 注意：sqlite3 的 with 只管事务不关连接，句柄不释放会锁住数据目录
+        # （Windows 下隔离测试实例 cleanup 直接 PermissionError）。
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
             rows = conn.execute(
                 "SELECT payload FROM events WHERE ts >= ? ORDER BY id DESC LIMIT ?",
                 (cutoff, _WARMUP_MAX_EVENTS),
             ).fetchall()
+        finally:
+            conn.close()
 
-        count = 0
+        # 先按「最新事件优先」收集（rows 为 id 倒序），同一原文只留最新 token：
+        # 旧 token 直接不登记，天然不产生 REV/后缀索引孤儿。
+        seen_orig = set()
+        collected = []
         for (payload_str,) in rows:
             try:
                 p = json.loads(payload_str)
@@ -1025,12 +1075,21 @@ def _warmup_recent_from_db():
                     # 过滤凭据类与占位符自身
                     if label in CREDENTIAL_LABELS or _PLACEHOLDER_RX.match(orig):
                         continue
-                    _RECENT_FWD[orig] = [tok, label, now]
-                    _RECENT_REV[tok] = [orig, label, now]
-                    _suffix_index_add(tok)
-                    count += 1
+                    if orig in seen_orig:
+                        continue
+                    seen_orig.add(orig)
+                    collected.append((tok, orig, label))
             except Exception:
                 pass
+        # 再按时间正序（旧→新）写入：所有条目的 ts 都是同一个 now，_prune_recent
+        # 超容量时的稳定排序按插入序删——正序插入保证先删**最旧**映射。
+        # 曾按倒序直接写入：恢复 >2000 条时反而把最新的映射先删掉，重启后
+        # 活跃会话最需要的占位符还原命中率倒挂（审计 P2）。
+        for tok, orig, label in reversed(collected):
+            _RECENT_FWD[orig] = [tok, label, now]
+            _RECENT_REV[tok] = [orig, label, now]
+            _suffix_index_add(tok)
+        count = len(collected)
         if count > 0:
             _prune_recent(now)
             _log(f"[shield-warmup] 从本地事件库预热 {count} 条占位符映射"
@@ -1063,6 +1122,13 @@ def _recall_token(orig, label):
         _suffix_index_add(hit[0])
         return hit[0]
     token = _new_token(label)
+    # 旧映射已过期：注销旧 token 的 REV / 后缀索引再覆盖 FWD。
+    # 不注销的话旧条目成孤儿——_prune_recent 只扫 FWD 的值发现待删 token，
+    # REV / _RECENT_SUFFIX 里的旧条目两个清理路径都碰不到，长驻进程缓慢泄漏。
+    prev = _RECENT_FWD.get(orig)
+    if prev and prev[0] != token:
+        _RECENT_REV.pop(prev[0], None)
+        _suffix_index_del(prev[0])
     _RECENT_FWD[orig] = [token, label, now]
     _RECENT_REV[token] = [orig, label, now]
     _suffix_index_add(token)
@@ -2369,6 +2435,8 @@ def mask(text, sid):
                 continue
             if label == "JWT" and not _jwt_ok(orig):
                 continue
+            if label == "IP_PUBLIC" and not _ip_public_ok(orig):
+                continue
             if label == "CONNSTR" and not _connstr_ok(orig, m, text):
                 # 记下被豁免的区间：CONNSTR 排在 EMAIL 之前，下面必须让 EMAIL 避开
                 # 与它重叠的命中，否则「口令尾@host」会被当邮箱吃掉留下半明文。
@@ -2480,7 +2548,9 @@ def _lookup(token, sid):
             inner = s["rev"].get(hit)
         if inner is None:
             rec = _RECENT_REV.get(hit)
-            if rec:
+            # 内层同样校验 TTL：套娃解包走的是「外层校验过、内层没校验」的缝隙，
+            # 会用一条早已过期的映射完成还原，突破 24h 原文保留窗口契约
+            if rec and time.time() - rec[2] <= _recent_ttl():
                 inner = rec[0]
         if inner is not None and inner != hit:
             hit = inner
@@ -3394,7 +3464,9 @@ def request(flow: http.HTTPFlow):
             # 若是 JSON，FAIL_CLOSED 下**同样不能按 passthrough 放行** —— 见下面 fail_closed 分支的说明。
             if not _looks_like_llm_request(flow):
                 ct_unlisted = (flow.request.headers.get("content-type", "") or "").lower()
-                if "json" not in ct_unlisted and FAIL_CLOSED:
+                # FILTER_ENABLED=False（用户承诺「透明转发」）时不阻断：开关语义
+                # 必须完整——关了脱敏还 503 拦 multipart/二进制，等于没关（审计 P2）。
+                if "json" not in ct_unlisted and FAIL_CLOSED and FILTER_ENABLED:
                     _emit("BLOCK", host=host, method=method, path=path.split("?")[0],
                           reason="unlisted_non_json_blocked", upstream=up_name, **source)
                     flow.response = http.Response.make(
@@ -3441,6 +3513,11 @@ def request(flow: http.HTTPFlow):
     # 过滤开关关闭：路由已生效（reverse 模式已改写 host），但不脱敏，透明转发到上游
     if not FILTER_ENABLED:
         flow.metadata["shield_filter_off"] = True
+        # 声明 identity：否则上游对 SSE 压缩后，responseheaders 的流式接管只能
+        # 退回整包路径，客户端失去打字机效果（与脱敏路径 3592 的处理一致；
+        # 代价是过滤关闭期间非流式 JSON 响应也不压缩，PT 兜底层同样如此）。
+        if STREAM_RESPONSE and "json" in (flow.request.headers.get("content-type", "") or "").lower():
+            flow.request.headers["accept-encoding"] = "identity"
         _emit(
             "BYPASS",
             host=host, method=method,
@@ -3913,6 +3990,8 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
                 if label == "EMAIL" and not _email_ok(orig):
                     continue
                 if label == "IBAN" and not _iban_ok(orig):
+                    continue
+                if label == "IP_PUBLIC" and not _ip_public_ok(orig):
                     continue
                 if label == "CONNSTR" and not _connstr_ok(orig, m, body):
                     if len(exempt_conn) < _CONNSTR_EXEMPT_MAX:
@@ -4672,6 +4751,17 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     )
 
 
+def _raw_stream_passthrough(data: bytes):
+    """过滤关闭（FILTER_ENABLED=False）时的流式接管：chunk 原样透传。
+
+    无会话可查、无占位符可还原（请求本来就没脱敏），接管只为把「整包缓冲」
+    变成「逐块下发」，保住客户端的打字机效果（此前过滤关闭时 SSE 首字节
+    延迟 = 整段生成时长，与脱敏路径/PT 兜底行为不一致，审计 P2）。
+    末块 b"" 走 mitmproxy 的 ResponseEndOfMessage 分支（那里会过滤成 []）。
+    """
+    return data
+
+
 def responseheaders(flow: http.HTTPFlow):
     """对 SSE 启用逐块还原转发；非 SSE 保持原有整包路径。
 
@@ -4682,7 +4772,25 @@ def responseheaders(flow: http.HTTPFlow):
     if not STREAM_RESPONSE:
         return
     sid = flow.metadata.get("session_id")
-    if not sid or flow.metadata.get("shield_streamed") or not flow.response:
+    if not sid:
+        # 过滤关闭的流量没有 session_id，但流式接管同样应该生效（纯透传）。
+        # 前提是请求侧已声明 identity（见 request() 的 filter_off 分支），
+        # 压缩响应在这里退回整包路径并留痕，与脱敏路径同款降级。
+        if flow.metadata.get("shield_filter_off") and flow.response:
+            headers0 = flow.response.headers
+            ct0 = (headers0.get("content-type", "") or "").lower()
+            framing0 = ("ndjson" if _is_ndjson_ct(ct0)
+                        else ("sse" if "text/event-stream" in ct0 else None))
+            if framing0:
+                enc0 = (headers0.get("content-encoding", "") or "").lower().strip()
+                if enc0 and enc0 != "identity":
+                    _log(f"[stream] 过滤关闭但上游返回 content-encoding={enc0}，退回整包路径（失去流式）")
+                    flow.metadata["shield_stream_degraded"] = enc0
+                    return
+                headers0.pop("content-length", None)
+                flow.response.stream = _raw_stream_passthrough
+        return
+    if flow.metadata.get("shield_streamed") or not flow.response:
         return
     headers = flow.response.headers
     content_type = (headers.get("content-type", "") or "").lower()

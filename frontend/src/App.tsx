@@ -28,19 +28,35 @@ function App() {
       setEngineReady(true)
       const url = new URL(window.location.href)
       const fromUrl = (url.searchParams.get('token') || '').trim()
-      const fragmentParams = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : '')
-      const fromFragment = (fragmentParams.get('token') || '').trim()
+      let fromFragment = ''
+      const hashRaw = url.hash.startsWith('#') ? url.hash.slice(1) : ''
+      if (hashRaw) {
+        const qIdx = hashRaw.indexOf('?')
+        if (qIdx >= 0) {
+          const qParams = new URLSearchParams(hashRaw.slice(qIdx + 1))
+          fromFragment = (qParams.get('token') || '').trim()
+          if (fromFragment) {
+            qParams.delete('token')
+            const restQ = qParams.toString()
+            const routePath = hashRaw.slice(0, qIdx)
+            url.hash = restQ ? `#${routePath}?${restQ}` : `#${routePath}`
+          }
+        } else {
+          const fragmentParams = new URLSearchParams(hashRaw)
+          fromFragment = (fragmentParams.get('token') || '').trim()
+          if (fromFragment) {
+            fragmentParams.delete('token')
+            const rest = fragmentParams.toString()
+            url.hash = rest ? `#${rest}` : ''
+          }
+        }
+      }
       const fromLink = fromUrl || fromFragment
       if (fromLink) {
         saveBrowserToken(fromLink)
         // 立刻从地址栏抹掉，避免 token 留在历史记录 / 被截图；fragment 方式
         // 本来不会发给服务器，但仍不应长期留在浏览器历史中。
         url.searchParams.delete('token')
-        if (fromFragment) {
-          fragmentParams.delete('token')
-          const rest = fragmentParams.toString()
-          url.hash = rest ? `#${rest}` : ''
-        }
         window.history.replaceState(null, '', url.pathname + url.search + url.hash)
       }
       // 仅开发构建允许用 VITE_SHIELD_TOKEN 便于本地联调；生产 bundle 不应

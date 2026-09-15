@@ -43,7 +43,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { cn, formatCompactNumber, formatTokensShort, formatBytes } from '@/lib/utils'
+import { cn, formatCompactNumber, formatTokensShort, formatBytes, formatPercent } from '@/lib/utils'
 import { CRED_LABELS, maskWord } from '@/lib/sensitive-word'
 import { toast } from '@/lib/toast'
 import { useI18n } from '@/lib/i18n'
@@ -68,6 +68,18 @@ const fmtMs = (ms?: number | null) => {
   if (s < 60) return `${s.toFixed(1)}s`
   const m = Math.floor(s / 60)
   return `${m}m${Math.round(s % 60)}s`
+}
+
+function renderStatValue(v?: string | null) {
+  if (typeof v === 'string' && v.startsWith('$')) {
+    return (
+      <>
+        <span className="mr-0.5 text-[20px] font-normal text-muted-foreground/80">$</span>
+        <span>{v.slice(1)}</span>
+      </>
+    )
+  }
+  return v ?? '—'
 }
 
 export default function Dashboard() {
@@ -474,7 +486,7 @@ export default function Dashboard() {
                     <TooltipProvider delayDuration={150}>
                       <Tooltip>
                         <TooltipTrigger asChild className="cursor-default">
-                          <span>{c.value}</span>
+                          <span>{renderStatValue(c.value)}</span>
                         </TooltipTrigger>
                         <TooltipContent>
                           <p className="font-mono text-xs">{c.fullValue}</p>
@@ -482,7 +494,7 @@ export default function Dashboard() {
                       </Tooltip>
                     </TooltipProvider>
                   ) : (
-                    c.value
+                    renderStatValue(c.value)
                   )}
                 </div>
                 {c.sub ? (
@@ -561,7 +573,7 @@ export default function Dashboard() {
                 </TooltipProvider>
               </div>
               <div className="text-[20px] font-bold leading-tight tabular-nums text-sky-600 dark:text-sky-400">
-                {prefix ? `${(prefix.clean_rate * 100).toFixed(1)}%` : '—'}
+                {prefix ? formatPercent(prefix.clean_rate, 1, { isNotFull: prefix.clean < prefix.masks }) : '—'}
               </div>
               <div className="truncate text-[11px] text-muted-foreground/80">
                 {prefix
@@ -586,7 +598,11 @@ export default function Dashboard() {
                 </TooltipProvider>
               </div>
               <div className="text-[20px] font-bold leading-tight tabular-nums text-emerald-600 dark:text-emerald-400">
-                {prefix?.reuse_rate != null ? `${(prefix.reuse_rate * 100).toFixed(1)}%` : '—'}
+                {prefix?.reuse_rate != null
+                  ? formatPercent(prefix.reuse_rate, 1, {
+                      isNotFull: prefix.rewritten > 0 && prefix.suffix_reused < prefix.rewritten,
+                    })
+                  : '—'}
               </div>
               <div className="truncate text-[11px] text-muted-foreground/80">
                 {prefix

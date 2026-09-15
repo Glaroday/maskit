@@ -188,6 +188,17 @@ export default function LogsPage() {
           slim: true,
         }, signal)
         tail = resp.tail ?? tail
+        // 游标重置：清空日志/库隔离重建后自增 id 从 1 重新开始，旧 cursor（高值）
+        // 永远拉不到新记录——丢弃累积列表与游标，从 0 重新拉取。
+        // 页码必须一并归位：用户停在第 2 页时列表骤减会渲染出空页 + 错误的分页条。
+        if (resp.reset && since > 0) {
+          since = 0
+          cursor = 0
+          list = []
+          seen.clear()
+          setPage(1)
+          continue
+        }
         const added = resp.events.filter((e) => {
           if (seen.has(e.seq)) return false
           seen.add(e.seq)
@@ -331,6 +342,7 @@ export default function LogsPage() {
       await clearLogs()
       toast(t('logs.cleared'))
       setConfirmClear(false)
+      setPage(1)  // 清空后列表骤减，停留高页码会渲染空页 + 错误的分页条
       refresh()
     } catch (e) {
       toast(tf('logs.clearFail', { e: String(e) }), 'error')
@@ -578,6 +590,7 @@ export default function LogsPage() {
         ref={scrollRef}
         className="min-h-0 flex-1 overflow-auto rounded-xl border bg-card shadow-[var(--shadow-card)]"
       >
+        <div className="min-w-[820px]">
         {/* 表头（固定）：时间(两行 日期+时间) / 结果 / 上游 / 模型(宽列) / 处理摘要(脱敏/还原) / 状态 / 耗时 / 费用 */}
         <div className="sticky top-0 z-10 grid grid-cols-[68px_92px_88px_minmax(180px,2fr)_minmax(130px,1fr)_54px_58px_64px] gap-2 border-b bg-card px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
           <span>{t('logs.colTime')}</span>
@@ -673,7 +686,13 @@ export default function LogsPage() {
         </div>
 
         {paged.length === 0 && !logsQuery.isLoading && (
-          <div className="py-16 text-center text-sm text-muted-foreground">{t('logs.noEvents')}</div>
+          <div className="flex flex-col items-center justify-center py-20 text-center">
+            <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-2xl bg-muted/60 text-muted-foreground/70">
+              <Search className="h-5 w-5 stroke-[1.5]" />
+            </div>
+            <p className="text-sm font-semibold text-foreground/80">{t('logs.noEvents')}</p>
+            <p className="mt-1 max-w-sm text-xs text-muted-foreground/70">{t('logs.noEventsHint')}</p>
+          </div>
         )}
         {paged.length === 0 && logsQuery.isLoading && (
           <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
@@ -681,6 +700,7 @@ export default function LogsPage() {
             {t('logs.loading')}
           </div>
         )}
+        </div>
       </div>
 
       {/* 原始日志尾巴（引擎 stdout 白名单行） */}

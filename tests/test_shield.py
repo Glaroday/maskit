@@ -243,6 +243,46 @@ class ShieldEngineTests(unittest.TestCase):
         self.assertNotIn("192.168.1.1", masked)
         self.assertNotIn("169.254.1.2", masked)
 
+    def test_ip_public_matches_global_unicast_networks(self):
+        """IP_PUBLIC 默认关闭；开启时命中公网 IP，白名单豁免公共 DNS。"""
+        # 1. 默认关闭时不脱敏
+        tr.BUILTIN_RULES["IP_PUBLIC"] = False
+        sid1 = "ip-pub-off"
+        tr._new_session(sid1)
+        masked1 = tr.mask("访问公网 123.57.89.10 和 47.98.12.34", sid1)
+        self.assertIn("123.57.89.10", masked1)
+        self.assertIn("47.98.12.34", masked1)
+
+        # 2. 开启后脱敏公网 IP
+        tr.BUILTIN_RULES["IP_PUBLIC"] = True
+        try:
+            sid2 = "ip-pub-on"
+            tr._new_session(sid2)
+            masked2 = tr.mask("访问公网 123.57.89.10:8080 和 http://47.98.12.34/api", sid2)
+            self.assertNotIn("123.57.89.10", masked2)
+            self.assertNotIn("47.98.12.34", masked2)
+            self.assertIn("IPPUBLIC_", masked2)
+
+            # 3. 知名公共 DNS 白名单不脱敏
+            sid3 = "ip-pub-dns"
+            tr._new_session(sid3)
+            masked3 = tr.mask("DNS 8.8.8.8 和 1.1.1.1 与 114.114.114.114", sid3)
+            self.assertIn("8.8.8.8", masked3)
+            self.assertIn("1.1.1.1", masked3)
+            self.assertIn("114.114.114.114", masked3)
+
+            # 4. 专测：同时开启 IP_PRIVATE + IP_PUBLIC 时，192.168.x 必须签 IPPRIVATE 而非漏掉或错签
+            tr.BUILTIN_RULES["IP_PRIVATE"] = True
+            sid4 = "ip-both-on"
+            tr._new_session(sid4)
+            masked4 = tr.mask("内网 192.168.1.1 和公网 123.57.89.10", sid4)
+            self.assertNotIn("192.168.1.1", masked4)
+            self.assertNotIn("123.57.89.10", masked4)
+            self.assertIn("IPPRIVATE_", masked4)
+            self.assertIn("IPPUBLIC_", masked4)
+        finally:
+            tr.BUILTIN_RULES["IP_PUBLIC"] = False
+
     def test_secret_rule_does_not_match_code_snippets(self):
         """SECRET 误报回归：代码片段/说明文案不再当凭据。
         曾把 pattern\nimport、m.group(0)、/token=/api_key= 误脱敏（system prompt
