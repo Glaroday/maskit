@@ -453,6 +453,7 @@ def _new_session(sid, source=None):
         "mask_ms": 0.0,
         "resp_ts": None,
         "first_byte_ms": None,
+        "ext_frames": {},
         "ts": time.time(),
         "source": source or {},
     }
@@ -4415,6 +4416,21 @@ def _build_flush_event(tmpl_json, channel, leftover):
             hit = True
         else:
             setter("")  # 其余槽位清空，避免重复下发同一段文本
+    if not hit and channel.endswith(":db") and isinstance(data, dict):
+        # 支持扩展豆包等私有信封模板回填，避免异常截断时收尾退化为裸文本
+        cnt = data.get("content")
+        if isinstance(cnt, str) and cnt.startswith("{") and "text" in cnt:
+            try:
+                inner = json.loads(cnt)
+                if isinstance(inner, dict) and "text" in inner:
+                    inner["text"] = leftover
+                    data["content"] = json.dumps(inner, ensure_ascii=False)
+                    hit = True
+            except Exception:
+                pass
+        elif isinstance(cnt, dict) and "text" in cnt:
+            cnt["text"] = leftover
+            hit = True
     if not hit:
         return ""
     for c in data.get("choices", []) or []:
@@ -4593,6 +4609,144 @@ def _restore_sse_event(block, sid, final=False):
         out_lines.append(line)
     return "\n".join(out_lines)
 
+
+def _restore_ext_sse_event(block, sid, stream_id, final=False):
+    """扩展链路专属 SSE 事件还原。优先解耦处理豆包等私有信封，其余走标准 SSE 管线。"""
+    # 尝试解析豆包式私有信封（不污染代理链路公共核心）
+    out_lines = []
+    handled_doubao = False
+    for line in block.split("\n"):
+        stripped = line.rstrip("\r")
+        if stripped.startswith("data:"):
+            payload = stripped[5:].lstrip(" ")
+            if payload.strip() and payload.strip() != "[DONE]":
+                try:
+                    data = json.loads(payload)
+                    if isinstance(data, dict) and "choices" not in data and "response" not in data:
+                        cnt = data.get("content")
+                        channel = f"ext:{stream_id}:db"
+                        if isinstance(cnt, str) and cnt.startswith("{") and "text" in cnt:
+                            inner = json.loads(cnt)
+                            if isinstance(inner, dict) and isinstance(inner.get("text"), str):
+                                inner["text"] = restore(inner["text"], sid, channel=channel, escape=False, final=final)
+                                data["content"] = json.dumps(inner, ensure_ascii=False)
+                                out_lines.append("data: " + json.dumps(data, ensure_ascii=False))
+                                handled_doubao = True
+                                s = sessions.get(sid) or {}
+                                pend = s.get("pending") or {}
+                                if pend.get(channel):
+                                    s.setdefault("flush_tmpl", {})[channel] = json.dumps(data, ensure_ascii=False)
+                                continue
+                        elif isinstance(cnt, dict) and isinstance(cnt.get("text"), str):
+                            cnt["text"] = restore(cnt["text"], sid, channel=channel, escape=False, final=final)
+                            out_lines.append("data: " + json.dumps(data, ensure_ascii=False))
+                            handled_doubao = True
+                            s = sessions.get(sid) or {}
+                            pend = s.get("pending") or {}
+                            if pend.get(channel):
+                                s.setdefault("flush_tmpl", {})[channel] = json.dumps(data, ensure_ascii=False)
+                            continue
+                except Exception:
+                    pass
+        out_lines.append(line)
+    if handled_doubao:
+        return "\n".join(out_lines)
+    return _restore_sse_event(block, sid, final=final)
+
+
+def restore_stream_chunk(text, sid, stream_id, content_type="", escape=False, final=False):
+    """扩展链路的**分帧**还原入口：按帧边界切开流文本，逐帧走与代理链路相同的管线。
+
+    ── 为什么必须有这一层（2026-09-16 真机往返实测定位）──
+
+    代理链路是**引擎自己解析 SSE**：`_sse_stream_factory` 按空行切事件 →
+    `json.loads` 取出负载 → `_sse_text_slots` 抽出**增量文本槽位** → 把**槽位文本**
+    交给 `restore()`。于是半截占位符天然落在缓冲区结尾，`_PARTIAL_RX` 的
+    「半截正好在结尾」判据成立，跨事件拼接正常。
+
+    扩展链路此前把**整段 SSE 原文**（含 `data: {...}` 外壳）直接喂给 `restore()`。
+    模型逐 token 输出时占位符会被切成两个事件：
+
+        event A  content = "{{EMAIL"
+        event B  content = "_dsszcd}}"
+
+    `restore()` 看到的缓冲区结尾是 `"}}]}\\n\\n` 而不是半截占位符，判据永不成立 →
+    两半各自原样下发，页面上留下裸 `{{EMAIL_dsszcd}}`。实测 Qwen 真实往返即此现象，
+    且引擎侧 RESTORE 事件是 `restored=0 unresolved=0`——因为 `{{{` 从没进过替换阶段。
+
+    修法**不是**放宽 `restore()` 的半截判据：那是代理链路共用的核心，改它等于让
+    两条链路的缓冲行为互相牵扯。正确做法是把扩展链路提升到与代理链路**同一粒度**，
+    由引擎做分帧 + 槽位抽取。副作用是扩展链路顺带继承了代理链路的全部能力：
+
+    - 每个槽位独立通道，正文 / reasoning / tool_calls.arguments 互不串字；
+    - 按槽位判定 escape（工具参数需 JSON 转义、正文不需要），不再靠"整条流猜一个值"；
+    - 终止事件与 `[DONE]` 前后的缓冲补发（`_flush_pending`），不吞最后几个字。
+
+    `stream_id` 用于在当前会话中隔离半帧切片缓冲 `ext_frames[stream_id]`。
+    当前扩展链路每次 mask 均签发唯一的独立 sid，单 sid 对应单条流；通道状态由 sid 隔离。
+    """
+    s = sessions.get(sid)
+    if not s or not isinstance(text, str):
+        return text
+    frames = s.get("ext_frames")
+    if not isinstance(frames, dict):
+        frames = s["ext_frames"] = {}
+
+    ct = (content_type or "").lower()
+    if _is_ndjson_ct(ct):
+        kind, sep = "ndjson", "\n"
+    elif "text/event-stream" in ct:
+        kind, sep = "sse", "\n\n"
+    else:
+        # 非流式整体：JSON 响应体里的占位符都落在字符串内部，必须按 JSON 转义。
+        # 其它类型（text/plain 等）沿用调用方判定。
+        # 透传 final 参数：扩展对大响应的每个 TCP chunk 都会调用本函数（final=False），
+        # 只有在 flush 阶段才会发 final=True。若写死 final=True，跨分片的占位符
+        # 会在第一片就被提前清空缓冲，导致第二片拼不回。
+        if final:
+            frames.pop(stream_id, None)
+        return restore(text, sid, channel=f"ext:{stream_id}",
+                       escape=("json" in ct) or escape, final=final)
+
+    # SSE 允许 CRLF；统一成 LF 后再按空行切事件（与 _sse_stream_factory 同源）
+    buf = (frames.get(stream_id, "") + text).replace("\r\n", "\n")
+    out = []
+    # 只处理**已完整到达**的帧，半帧留在缓冲里等下一次调用——
+    # 这正是「占位符被切在两个事件之间」能拼回来的原因。
+    while True:
+        idx = buf.find(sep)
+        if idx < 0:
+            break
+        block, buf = buf[:idx], buf[idx + len(sep):]
+        if kind == "sse":
+            out.append(_restore_ext_sse_event(block, sid, stream_id, final=False) + sep)
+        else:
+            out.append(_restore_ndjson_line(block, sid, final=False) + sep)
+    # 异常上游防御：持续推送不含帧边界的数据会让缓冲无限增长（内存 + 首字延迟失控）。
+    # 与代理链路同样优先在最后一个换行处切分，避免把合法 JSON 拦腰截断。
+    if len(buf) > _SSE_BUF_MAX:
+        if kind == "sse":
+            idx = buf.rfind("\n")
+            if idx >= 0:
+                out.append(_restore_ext_sse_event(buf[:idx], sid, stream_id, final=True) + sep)
+                buf = buf[idx + 1:]
+            else:
+                out.append(_restore_ext_sse_event(buf, sid, stream_id, final=True) + sep)
+                buf = ""
+        else:
+            out.append(_restore_ndjson_line(buf, sid, final=True) + sep)
+            buf = ""
+    if final:
+        if buf:
+            out.append(_restore_ext_sse_event(buf, sid, stream_id, final=True) if kind == "sse"
+                       else _restore_ndjson_line(buf, sid, final=True))
+        tail = _flush_pending(sid, framing="ndjson") if kind == "ndjson" else _flush_pending(sid)
+        if tail:
+            out.append(tail)
+        frames.pop(stream_id, None)
+    else:
+        frames[stream_id] = buf
+    return "".join(out)
 
 
 def _sse_stream_factory(flow, sid, host, method, emit_path, source, framing="sse"):

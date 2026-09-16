@@ -34,6 +34,32 @@
    *   - `false` = **没实测过**，不代表不能用。未命中路径白名单的请求一律原样直通：
    *               不断网，但也不脱敏。所以这里标 false 是「我不知道」，不是「不行」。
    *
+   * ── 2026-09-16 逐站实测（真 Chromium + 真扩展 + 真面板，18/18 路径命中并完整
+   *    走通「打码 → 流式还原」）。命中时用的路径形态如下，供后续核对：
+   *      chatgpt   /backend-api/conversation
+   *      claude    /api/organizations/<org>/chat_conversations/<id>/completion
+   *      gemini    /_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate
+   *      grok      /rest/app-chat/conversations/new
+   *      perplexity /rest/sse/perplexity_ask
+   *      copilot   /c/api/chat
+   *      mistral   /api/chat
+   *      poe       /api/gql_POST
+   *      deepseek  /api/v0/chat/completion
+   *      doubao    /samantha/chat/completion
+   *      tongyi    /api/chat
+   *      qwen      /api/chat/completions
+   *      kimi      /api/chat/current/completion
+   *      yuanbao   /api/chat
+   *      chatglm   /chatglm/chatglm/assistant-api/stream
+   *      wenxin    /api/chat
+   *      xinghuo   /iflygpt/u/chat_message/v1/chat
+   *      mimo      /api/chat
+   *
+   *    ⚠️ 这次实测**没有登录任何站点**（没有账号），所以结论的准确表述是：
+   *      「若该站对话接口是上述形态，则一定会被打码」。它证明了**白名单不再漏**，
+   *      但不等于「已确认该站当前线上接口就是这个路径」——所以 verified 维持 false，
+   *      不因为一次未登录的探测就把它升格为"已实测"。
+   *
    * 域名一律写**顶域**：`*://*.example.com/*` 同时匹配顶域与所有子域（MDN match pattern
    * 规则已核对），所以写 `doubao.com` 就能覆盖 `www.doubao.com`，不必重复列。
    */

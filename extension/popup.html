@@ -68,6 +68,12 @@
     button:hover { border-color: #c8ccd2; }
     button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
     button.primary:hover { background: #1d4ed8; }
+    .box.guide { border-color: #f3d9a4; background: #fdf6e7; }
+    .guide-title { font-weight: 600; font-size: 12px; color: var(--warn); }
+    .guide-body { font-size: 11px; color: var(--fg2); margin: 4px 0 6px; }
+    .guide-link { font-size: 12px; color: #1d4ed8; }
+    .box.attach { border-color: #f3d9a4; background: #fdf6e7; }
+    .attach-text { font-size: 11px; color: var(--warn); }
   </style>
 </head>
 <body>
@@ -75,6 +81,13 @@
     <span id="dot" class="dot"></span>
     <span id="statusText" class="status-text">…</span>
     <span id="statusDetail" class="status-detail"></span>
+  </div>
+
+  <!-- 引擎不在时的引导：扩展不能独立工作，必须明说去哪装，不能默默什么都不做 -->
+  <div class="box guide" id="guideBox" hidden>
+    <div id="guideTitle" class="guide-title"></div>
+    <div id="guideBody" class="guide-body"></div>
+    <a id="guideLink" class="guide-link" href="#" target="_blank" rel="noreferrer"></a>
   </div>
 
   <div class="box">
@@ -96,6 +109,11 @@
   <div class="box" id="unmatchedBox" hidden>
     <h3><span data-i18n="unmatchedTitle"></span></h3>
     <ul class="paths" id="unmatchedList"></ul>
+  </div>
+
+  <!-- 本页出现过带文件的请求：明说「附件/图片内容不脱敏」，不静默放行 -->
+  <div class="box attach" id="attachBox" hidden>
+    <div id="attachText" class="attach-text"></div>
   </div>
 
   <footer>

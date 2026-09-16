@@ -358,6 +358,32 @@ if (/onMessage/.test(bg) && !/sender\.url[\s\S]{0,120}chrome-extension:/.test(bg
     '以标签页打开的选项页其 sender.tab 有值，用 !sender.tab 判会让 admin 消息全部超时')
 }
 
+// ── restore 请求必须带 content_type ─────────────────────────────────────────
+// 这是**静默失败**类字段：漏了不报错，引擎只是退回旧的「整段文本还原」，
+// 而被 SSE 事件边界切开的占位符（模型逐 token 输出时 `content:"{{EMAIL"` +
+// `content:"_dsszcd}}"`）就永远拼不回来，页面露出裸 `{{...}}`。
+// 真机往返才暴露过一次（2026-09-16），所以钉死在门禁里。
+// 两处都要检查：MAIN world 的调用点，以及 SW 构造 body 时的白名单。
+const mainSrc = sources['bridge-main.js'] || ''
+const restoreSites = [...mainSrc.matchAll(/bridge\.call\(\s*'restore'/g)]
+if (!restoreSites.length) {
+  fail("bridge-main.js 里找不到 bridge.call('restore') 调用点 —— 还原链路缺失")
+} else {
+  for (const site of restoreSites) {
+    if (!/content_type\s*:/.test(mainSrc.slice(site.index, site.index + 400))) {
+      fail('bridge-main.js 的 restore 调用没带 content_type —— 引擎会退回整段文本还原，' +
+        '被 SSE 事件边界切开的占位符将无法还原（页面露出裸 {{...}}）')
+    }
+  }
+}
+if (/async function handleRestore/.test(bg)) {
+  const at = bg.indexOf('async function handleRestore')
+  if (!/content_type\s*:/.test(bg.slice(at, at + 800))) {
+    fail('background.js 的 handleRestore 白名单漏了 content_type —— ' +
+      '字段在建 body 时被丢掉，还原退化成整段文本（静默失败）')
+  }
+}
+
 // ── 结论 ────────────────────────────────────────────────────────────────────
 for (const n of notes) console.log(`check-extension:      ${n}`)
 if (errors.length) {

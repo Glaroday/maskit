@@ -3,6 +3,7 @@
   "name": "Data Maskit Browser Bridge",
   "version": "1.0.0",
   "description": "把网页版 AI（ChatGPT / Claude）发出的请求送进本地 Maskit 引擎打码，回包流式无感还原。100% 本地运算，零外传。",
+  "homepage_url": "https://github.com/xiaYuTian11/maskit",
   "minimum_chrome_version": "111",
   "permissions": ["storage", "scripting", "tabs"],
   "optional_host_permissions": ["*://*/*"],

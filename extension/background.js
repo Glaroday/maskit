@@ -21,14 +21,33 @@
 // 扩展内共享常量与纯函数（STATIC_SITES / UNSUPPORTED_REASON / siteMatchPattern…
 // 的唯一来源，见 shared.js 头部说明为何必须收敛成一份）。
 importScripts('shared.js');
-const { STATIC_SITES, siteMatchPattern } = self.MASKIT_SHARED;
+const { STATIC_SITES, siteMatchPattern, siteCovers } = self.MASKIT_SHARED;
 
 const DEFAULTS = {
   token: '',
   panelUrl: 'http://127.0.0.1:5801',
   enabledSites: STATIC_SITES.slice(),
   enabled: true,
+  /**
+   * 拦截范围：`true` = 同站 POST 一律送引擎（广泛模式，实验性）；
+   *           `false` = 只处理已知对话接口路径（精准模式，默认，无数据污染风险）。
+   * 由 bridge-main.js 通过 `config` 消息在首次请求时取一次并缓存（刷新页面生效）。
+   */
+  wideMode: false,
 };
+
+/**
+ * 引擎未安装 / 未启动时的引导入口。
+ *
+ * 为什么必须有：扩展**不能独立工作**——规则引擎、占位符复用表、还原都在本地程序里，
+ * 扩展只是把页面请求转发过去。引擎不在时扩展「默默什么都不做」，页面完全正常但内容
+ * 裸着发出去，用户根本不知道自己没被保护。这比报错糟糕得多，所以必须**明说**去哪装。
+ */
+// 从 manifest 的 `homepage_url` 推出来，**不在 JS 里写外域字面 URL** —— 扩展代码里出现
+// 非本机主机一律被 `check-extension.mjs` 判失败（那条规则防的正是"扩展偷偷外发"）。
+// 这个地址只会被渲染成给用户点开的 `<a href>`，扩展自己永不 fetch 它。
+const MANIFEST_HOME = String((chrome.runtime.getManifest && chrome.runtime.getManifest() || {}).homepage_url || '').replace(/\/+$/, '');
+const DOWNLOAD_URL = MANIFEST_HOME ? MANIFEST_HOME + '/releases/latest' : '';
 
 /** sid 签发表条目存活上限：对齐引擎复用表 RECENT_TTL(24h)，留 1h 余量。 */
 const SID_TTL_MS = 25 * 3600 * 1000;
@@ -42,6 +61,8 @@ const RECENT_FIELDS = ['ts', 'host', 'path', 'action', 'count', 'status'];
 const STATUS_KEY = 'maskit:status';
 const UNMATCHED_KEY = 'maskit:unmatched';
 const UNMATCHED_MAX = 40;
+/** 本页「带文件上传的请求」标记：{tabId: {image, count, at}}。只存有没有、是什么类型。 */
+const ATTACH_KEY = 'maskit:attach';
 
 /**
  * 今日计数（**只有计数，绝无正文**）。popup 的「今日计数」需要按日归零，而
@@ -194,6 +215,30 @@ async function pushUnmatched(tabId, path) {
   }
 }
 
+/**
+ * 记录「本页有请求带文件上传」。
+ *
+ * 只记**有没有 + 是不是图片**，绝不记文件名 / 内容 / 数量以外的任何东西。
+ * 用途是让 popup 能明说「文件内容不会被脱敏」——静默放行是最坏的一种失败：
+ * 用户以为上传的合同/截图也被打过码了，实际上原样进了对方服务器。
+ */
+async function pushAttachment(tabId, payload) {
+  if (!tabId) return;
+  try {
+    const got = await chrome.storage.session.get(ATTACH_KEY);
+    const all = got[ATTACH_KEY] && typeof got[ATTACH_KEY] === 'object' ? got[ATTACH_KEY] : {};
+    const prev = all[tabId] || { image: false, count: 0, at: 0 };
+    all[tabId] = {
+      image: !!prev.image || !!payload.image,
+      count: Number(payload.count) || prev.count || 0,
+      at: Date.now(),
+    };
+    await chrome.storage.session.set({ [ATTACH_KEY]: all });
+  } catch (e) {
+    /* 同上 */
+  }
+}
+
 // ── sid 签发表（chrome.storage.session：跨 SW 重启存活、不落盘） ───────────────
 
 async function rememberSid(sid, tabId, host) {
@@ -301,7 +346,19 @@ async function isBlockOnDown() {
 }
 
 async function refreshPing() {
-  const r = await callPanel('/api/ext/ping', null, 'GET', 5000);
+  let r;
+  try {
+    r = await callPanel('/api/ext/ping', null, 'GET', 5000);
+  } catch (e) {
+    // 连接拒绝 / 超时 / DNS：引擎**真的连不上**。
+    //
+    // 这条分支以前是空的（异常抛给 handlePing 兜底），后果是：状态停在**上一次的
+    // 值**不动。上一秒还好好的 → 引擎关掉 → status 仍是 `ok`、popup 仍绿标，
+    // 而实际上所有流量都在裸奔。绿标 + 不脱敏是最糟的组合，必须在这里显式标红。
+    await setStatus('down', 'engine_unreachable');
+    cache = { ...cache, alive: false, at: Date.now() };
+    return cache;
+  }
   const data = r.data;
   if (r.http === 200 && data && data.ok) {
     cache = {
@@ -318,6 +375,26 @@ async function refreshPing() {
     authHoldUntil = 0;
     authHoldErr = '';
     authProbeAt = 0;
+    // 状态也要跟着清：之前可能是 invalid_token（token 填错时打的标），
+    // 用户改对后如果只有退避窗口被清、状态没清，popup 会一直红着说 token 失效。
+    // 实测：SW 冷启动时空 token 打默认端口必吃 403，状态会被钉在 invalid_token，
+    // 不在这里清就再也绿不回来（除非真的发一次对话）。
+    await setStatus('ok', '');
+    return cache;
+  }
+  // 401 / 403：**引擎在跑**，只是不认我们（token 错 / 面板把扩展桥关了）。
+  //
+  // 必须跟「连不上」区分开。不区分的后果：popup 看到 `alive: false` 就显示
+  // 「检测到本地引擎没运行，点这里去下载」——用户真的重装一遍，装完还是同一个 403，
+  // 排查方向被彻底带偏。这里显式把状态打成 invalid_token / disabled，
+  // renderGuide 据此判定「引擎在跑」从而**不**显示下载引导。
+  const err = String((data && (data.error || data.reason)) || '');
+  if (r.http === 401 || r.http === 403) {
+    await setStatus(err === 'ext_bridge_disabled' ? 'disabled' : 'invalid_token',
+                    err || ('http_' + r.http));
+    // 引擎活着就不该进直通退避窗口，否则会把「token 错」伪装成「引擎挂了」
+    downUntil = 0;
+    cache = { ...cache, alive: false, at: Date.now() };
     return cache;
   }
   // ping 失败也走默认桶，不改缓存里的开关值（避免"拿不到就改行为"）
@@ -397,6 +474,18 @@ async function handleMask(payload, tabId, host) {
   // payload 里的 host / sid 一律忽略（页面提供不可信）
   const text = payload && typeof payload.text === 'string' ? payload.text : '';
   if (!text) return { ok: false, passthrough: true };
+
+  // 站点开关在这里兜底——**配置是唯一真相来源**。
+  //
+  // 为什么必须在这一层：chatgpt.com / claude.ai 是 manifest 里静态声明的 content script，
+  // 而静态脚本**没法**用 `unregisterContentScripts` 注销（它不是动态注册的）。
+  // 于是用户在设置里删掉 ChatGPT 后，脚本照样注入、照样把 body 送过来——
+  // 界面显示「已删除」，实际还在打码，这是比"删不掉"更糟的一种撒谎。
+  // 不在这里认账，就没有别的地方能拦住了。
+  const cfg = await getConfig();
+  if (!siteCovers(host, cfg.enabledSites)) {
+    return { ok: false, passthrough: true, error: 'site_disabled' };
+  }
   const r = await safeCall('/api/ext/mask', { text, host });
   if (r.ok) {
     await rememberSid(r.body.sid, tabId, host);
@@ -415,7 +504,10 @@ async function handleRestore(payload, host) {
     sid: String((payload && payload.sid) || ''),
     stream_id: String((payload && payload.stream_id) || ''),
     final: !!(payload && payload.final),
-    escape: !!(payload && payload.escape),
+    // content-type 是**分帧方式的唯一依据**（引擎据它决定按 SSE 空行 / NDJSON 换行 /
+    // 整体处理）。漏传它 → 引擎退回旧的整段文本还原 → 被事件边界切开的占位符永远
+    // 拼不回来，页面露出裸 `{{...}}`。这个字段漏了不会报错，只会安静地不还原。
+    content_type: String((payload && payload.content_type) || ''),
     host,                       // host 用 SW 推导值，不用 payload 里的
   };
   const r = await safeCall('/api/ext/restore', body);
@@ -457,10 +549,18 @@ async function handleAdmin(op) {
     }
     return {
       ok: true,
-      config: { enabled: cfg.enabled, panelUrl: cfg.panelUrl, enabledSites: cfg.enabledSites, hasToken: !!cfg.token },
+      config: {
+        enabled: cfg.enabled, panelUrl: cfg.panelUrl,
+        enabledSites: cfg.enabledSites, hasToken: !!cfg.token,
+        wideMode: cfg.wideMode === true,
+      },
       status: await readStatus(),
       recent: (await chrome.storage.session.get(RECENT_KEY))[RECENT_KEY] || [],
       unmatched: (await chrome.storage.session.get(UNMATCHED_KEY))[UNMATCHED_KEY] || {},
+      // 本页是否出现过带文件的请求（用于提示「附件/图片内容不脱敏」）
+      attachments: (await chrome.storage.session.get(ATTACH_KEY))[ATTACH_KEY] || {},
+      // 引擎不在时 popup 要给的去向——扩展不能独立工作，必须明说去哪装
+      downloadUrl: DOWNLOAD_URL,
       daily: (await chrome.storage.session.get(DAILY_KEY))[DAILY_KEY] || null,
       sidCount: sids.length,
       sessionBytes: bytes,
@@ -518,9 +618,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
-  // 打码链路：只认真实网页里的 content script
+  // 打码链路：只认真实网页里的 content script。
+  // 优先取 sender.url（当前 frame 自身的真实 URL），避免 iframe 嵌 AI 页面因顶层域不同被误拦
   if (!sender.tab) return;
-  const host = safeHostname(sender.tab.url);
+  const host = safeHostname(sender.url || sender.tab.url);
   const tabId = sender.tab.id;
   if (msg.action === 'mask') {
     handleMask(msg.payload, tabId, host).then(sendResponse).catch((e) => sendResponse({ ok: false, passthrough: true, error: String(e) }));
@@ -548,7 +649,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.payload && msg.payload.kind === 'unmatched_post') {
       pushUnmatched(tabId, String(msg.payload.path || '').slice(0, 200));
     }
+    // 「本页有请求带文件上传」：只记类型，不记内容
+    if (msg.payload && msg.payload.kind === 'attachment') {
+      pushAttachment(tabId, msg.payload);
+    }
     sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.action === 'config') {
+    // 拦截范围下发（MAIN world 读不到 chrome.storage，只能问 SW）。
+    // 只回非敏感的行为开关；token / panelUrl 一律不给页面上下文。
+    getConfig()
+      .then((c) => sendResponse({ wideMode: c.wideMode === true }))
+      .catch(() => sendResponse({ wideMode: false }));
     return true;
   }
 });

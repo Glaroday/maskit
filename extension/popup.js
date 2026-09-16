@@ -39,6 +39,13 @@ const I18N = {
     scopeAll: '全部标签页',
     recentEmpty: '暂无记录。请求发出后这里会逐条出现 —— 没有记录本身就是证据。',
     unmatchedTitle: '本页未命中白名单的 POST',
+    // 引擎不在时的引导（扩展不能独立工作，必须明说去哪装）
+    guideTitle: '未检测到本地程序',
+    guideBody: '本扩展只负责转发，规则引擎在本机程序里。未安装/未启动时网页照常使用，但内容不会被脱敏。',
+    guideLink: '下载安装桌面端 →',
+    // 附件提示（不静默放行图片/文件）
+    attachText: '本页上传了 {n} 个文件。文件内容不会脱敏，只有文字字段会被打码。',
+    attachTextImg: '本页上传了 {n} 个文件（含图片）。图片与附件里的内容不会脱敏，只有文字字段会被打码。',
     refreshBtn: '刷新',
     optionsBtn: '设置',
     colTime: '时间',
@@ -74,6 +81,13 @@ const I18N = {
     scopeAll: 'All tabs',
     recentEmpty: 'No records yet. Entries appear as requests go out — an empty list is itself evidence.',
     unmatchedTitle: 'POST paths missing the whitelist on this page',
+    // Engine-missing guidance (the extension cannot work standalone)
+    guideTitle: 'Local app not detected',
+    guideBody: 'This extension only forwards requests — the masking engine lives in the local app. Without it pages work normally, but nothing gets masked.',
+    guideLink: 'Download the desktop app →',
+    // Attachment notice (never silently pass images/files)
+    attachText: 'This page uploaded {n} file(s). File contents are NOT masked — only text fields are.',
+    attachTextImg: 'This page uploaded {n} file(s), including images. Image and attachment contents are NOT masked — only text fields are.',
     refreshBtn: 'Refresh',
     optionsBtn: 'Settings',
     colTime: 'Time',
@@ -187,7 +201,10 @@ function activeState(cfg) {
   const coveredSite = siteCovers(currentHost, sites);
   if (!coveredSite) return { yes: false, text: t('activeNoSite'), kind: 'warn' };
   if (unsupportedReason(currentHost, coveredSite)) {
-    return { yes: false, text: t('activeNoPath'), kind: 'warn' };
+    // 开启广泛模式时未实测路径也会自动脱敏；精准模式下才提示未实测
+    if (!cfg.wideMode) {
+      return { yes: false, text: t('activeNoPath'), kind: 'warn' };
+    }
   }
   return { yes: true, text: t('activeYes'), kind: 'ok' };
 }
@@ -260,6 +277,40 @@ function renderUnmatched(snap) {
   }
 }
 
+/**
+ * 引擎不在时给出去向。
+ *
+ * 必须区分两种「引擎没回应」：**连不上**（没装 / 没启动）与 **403**（装了，但 token 错
+ * 或面板把桥关了）。只有前者该引导去下载——对后者说「去装程序」会把排查方向彻底带偏，
+ * 用户会重装一遍然后发现还是同一个 403。
+ */
+function renderGuide(snap) {
+  const st = (snap && snap.status) || {};
+  const alive = !!(snap && snap.cache && snap.cache.alive);
+  // invalid_token / disabled 恰恰**证明引擎在跑**（是它在回 403），不引导下载
+  const engineUp = alive || st.engine === 'invalid_token' || st.engine === 'disabled' || st.engine === 'ok';
+  const box = $('guideBox');
+  box.hidden = engineUp;
+  if (engineUp) return;
+  $('guideTitle').textContent = t('guideTitle');
+  $('guideBody').textContent = t('guideBody');
+  const a = $('guideLink');
+  const url = (snap && snap.downloadUrl) || '';
+  a.textContent = t('guideLink');
+  a.href = url || '#';
+  a.hidden = !url;
+}
+
+/** 本页出现过带文件的请求 —— 明说「附件/图片不脱敏」，绝不静默放行。 */
+function renderAttach(snap) {
+  const map = (snap && snap.attachments) || {};
+  const rec = currentTabId != null ? map[String(currentTabId)] : null;
+  const box = $('attachBox');
+  box.hidden = !rec;
+  if (!rec) return;
+  $('attachText').textContent = t(rec.image ? 'attachTextImg' : 'attachText', { n: rec.count || 1 });
+}
+
 function render(snap) {
   lastSnapshot = snap;
   const cfg = (snap && snap.config) || {};
@@ -280,6 +331,8 @@ function render(snap) {
     : t('dash');
 
   renderStatus(snap);
+  renderGuide(snap);
+  renderAttach(snap);
   renderRecent(snap);
   renderUnmatched(snap);
 }

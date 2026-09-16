@@ -43,9 +43,20 @@
     }
   });
 
-  // ─── AI 请求路径白名单 ───
-  // EMAIL / PHONE 内置规则默认开启，登录表单默认会被误伤（实测：{"email":"a@b.com"}
-  // → {{EMAIL_xxxxxx}}），所以**路径白名单是默认行为下的必需品**，不是优化。
+  // ─── 拦截策略：广泛模式（默认，零适配）/ 窄模式（只认对话接口） ───
+  //
+  // 【为什么从白名单改成黑名单】原方案要求路径命中 LLM_PATH_HINTS 才打码，于是每加一个
+  // 新站点都要先猜接口路径——猜错就**整站静默未脱敏**（页面毫无异常，内容裸着发出去）。
+  // 2026-09-16 实测 18 站，有 4 个海外站就是这样漏掉的（Gemini/Grok/Perplexity/Poe 的
+  // 路径一个关键词都不带）。逐个补路径是打地鼠：站点改版一次就失效一次。
+  //
+  // 广泛模式的判定是三层：
+  //   ① 认证/埋点/噪声路径 → 永不打码（黑名单）
+  //   ② 命中对话接口形态   → 一定打码（**跨域也算**，兜住 API 在独立域的站点）
+  //   ③ 其余同站 POST      → 也送引擎（广泛模式独有；引擎没匹配到敏感信息就原样返回）
+  //
+  // 同站限定是关键：埋点几乎全是跨域（clarity.ms / sentry.io / volces.com / 百度统计…），
+  // 一条「不同站就不碰」就能滤掉绝大部分噪声，而 AI 站点的对话请求基本都在本站或子域。
   const LLM_PATH_HINTS = [
     /\/api\/.*conversation/i, /\/backend-api\//i, /\/(v1\/)?(chat|completions|messages|responses)/i,
     // ── 下面四条是 2026-09-16 真机逐站验证补的 ──
@@ -57,66 +68,149 @@
     /\/rest\/sse\//i,       // Perplexity：/rest/sse/perplexity_ask
     /\/api\/gql/i,          // Poe：GraphQL 端点 /api/gql_POST
   ];
-  const AUTH_PATH_BLOCKLIST = [
-    /login|signin|sign-in|signup|register|auth|session|token|password|credential|oauth|sso/i,
+
+  /**
+   * 永不打码的路径黑名单。
+   *
+   * ① 认证类：EMAIL/PHONE 是**默认开启**的内置规则，登录表单里 `{"email":"a@b.com"}`
+   *    会被打成 `{{EMAIL_xxxxxx}}`（实测），一旦打码就登录不上——这是硬失败，必须排除。
+   * ② 埋点/遥测类：不是内容，送引擎纯属浪费，且占位符混进埋点会造成数据污染。
+   * ③ 只读类（history/list/detail）：不带用户新输入，没有打码价值。
+   *
+   * 黑名单命中就**直接放行**，不再走引擎——宁可少打一次码，也不能让登录表单坏掉。
+   */
+  const NEVER_MASK_PATH = [
+    // 认证 / 凭据
+    /(login|signin|sign-?in|signup|sign-?up|register|logout|auth|oauth|sso|session|token|password|credential|passwd|captcha|verify|verification|sms|otp|2fa|mfa)/i,
+    // 埋点 / 遥测 / 监控
+    /(\/|_|-|\.)(log|logs|logging|logger|beacon|telemetry|track|tracking|tracker|analytics|metric|metrics|monitor|monitoring|report|reports|collect|collector|event|events|stats|stat|perf|performance|apm|rum|sentry|clarity|error|errors|exception|crash|heartbeat|health|healthcheck|alive|ping|feedback|survey|abtest|ab-?test|experiment)($|\/|_|-|\.|\?|\d)/i,
+    // 配置 / 静态字典（不含用户输入）
+    /(\/|_|-|\.)(config|configs|settings|preference|preferences|i18n|locale|lang|dict|theme|version|update|upgrade|announce|notice|notification|invite|referral|share|balance|quota|billing|payment|order)($|\/|_|-|\.|\?|\d)/i,
   ];
-  const isLLMRequest = (url) => {
-    let path;
+
+  /** 同站判定：完全同 host，或互为子域（api.doubao.com ↔ www.doubao.com）。 */
+  const isSameSite = (host) => {
+    const h = String(host || '').toLowerCase();
+    const p = location.hostname.toLowerCase();
+    if (!h || !p) return false;
+    if (h === p) return true;
+    return h.endsWith('.' + p) || p.endsWith('.' + h);
+  };
+
+  /**
+   * 是否该对这次请求打码。
+   * 先判白名单（命中直接打码，防止 events/settings 误杀真实对话接口）；
+   * 再判黑名单（排除认证/埋点/配置等非对话管理接口）；
+   * 兜底：广泛模式下同站其余 POST 送引擎，默认精准模式下直接放行。
+   */
+  const shouldMaskUrl = (url, wide) => {
+    let u, path;
     try {
-      path = new URL(url, location.href).pathname;
+      u = new URL(url, location.href);
+      path = u.pathname;
     } catch (e) {
       return false;
     }
-    if (AUTH_PATH_BLOCKLIST.some((rx) => rx.test(path))) return false;
-    return LLM_PATH_HINTS.some((rx) => rx.test(path));
+    if (LLM_PATH_HINTS.some((rx) => rx.test(path))) return true;   // 对话接口优先打码（跨域也算）
+    if (NEVER_MASK_PATH.some((rx) => rx.test(path))) return false; // 认证/埋点/管理排除
+    return !!wide && isSameSite(u.hostname);
+  };
+
+  // 广泛模式开关由 SW 下发（chrome.storage 在 MAIN world 不可用）。默认 false（精准对话模式）。
+  // 且**只问一次**并缓存——每个请求都问一次 storage 不划算，而这个值改了刷新页面就生效。
+  let wideModePromise = null;
+  const getWideMode = () => {
+    if (!wideModePromise) {
+      wideModePromise = bridge.call('config', {}).then((r) => {
+        const w = r && typeof r.wideMode === 'boolean' ? r.wideMode : false;
+        return { wideMode: w };
+      }).catch(() => ({ wideMode: false }));
+    }
+    return wideModePromise;
   };
 
   // ─── 可打码 body 判定（成对原则的落地点） ───
   // Request 的 body 可能是 FormData / Blob / URLSearchParams / ReadableStream —— 把它
   // clone().text() 读成字符串再 new Request(old, {body: 字符串}) 回写，会保留原来的
   // `Content-Type: multipart/form-data; boundary=…` 却把实体换成纯文本，上游直接 400。
-  // LLM 路径上的附件上传正是 multipart（走 /backend-api/），所以这条守卫是**必需**的。
-  // 只按 content-type 前缀判定，不解析内容。
-  const MASKABLE_CT = /^(application\/json|application\/(x-)?ndjson|application\/json-seq|text\/)/i;
+  // 所以文本分支只吃文本类 content-type；multipart 走**独立的 FormData 分支**（见
+  // maskMultipart），不再像 v1 那样整体跳过——跳过的代价是「带附件的请求完全不脱敏」。
+  const MASKABLE_CT = /^(application\/json|application\/(x-)?ndjson|application\/json-seq|application\/x-www-form-urlencoded|text\/)/i;
+  const MULTIPART_CT = /^multipart\/form-data/i;
   const isMaskableBody = (req) => MASKABLE_CT.test((req.headers.get('content-type') || '').trim());
+  const isMultipart = (req) => MULTIPART_CT.test((req.headers.get('content-type') || '').trim());
   const initBodyIsText = (init) => !!init && typeof init.body === 'string';
-  // 注：`init` 分支**故意不套用** isMaskableBody —— `init.body` 是字符串本身就证明是文本
-  // （无需看 content-type），套上去反而会让「忘了带 content-type 的 JSON 字符串体」漏打码。
-  // 两个分支守卫不同不是笔误。
+  const initBodyIsURLSearchParams = (init) =>
+    !!init && typeof URLSearchParams !== 'undefined' && init.body instanceof URLSearchParams;
+  const initBodyIsFormData = (init) =>
+    !!init && typeof FormData !== 'undefined' && init.body instanceof FormData;
 
-  // ─── escape 上下文判定：SSE 默认 true，明确纯文本才 false ───
-  // 依据：续帧（上一 chunk 的 JSON 未完）不以 `data: {` 开头，「遇 { 才翻 true」会漏掉
-  // 续帧里替换的占位符。默认站的 SSE 都是 JSON，JSON-first 更稳。
-  // 载荷首字符**只有明确是普通文本（以字母开头）才翻 false**：空帧 `data:`（很多站先发
-  // 一个空 data 行）与一切非字母开头（含 `{` `[` `"` 数字 `-`）维持默认 true。
-  // 裸字面量帧（null/true/false）会被判成纯文本，但那类帧里不含占位符，无影响。
-  const firstDataLine = (chunk) =>
-    chunk.split(/\r?\n/).find((l) => l.trim().startsWith('data:')) || '';
-  const escapeForDataLine = (line) => {
-    const payload = line.replace(/^\s*data:\s?/, '').trim();
-    if (!payload) return true;                        // 空帧 → 维持默认（安全方向）
-    return !/^[A-Za-z]/.test(payload);                // 字母开头=普通文本；否则当 JSON
-  };
   /**
-   * 只在 `content-type` 含 `text/event-stream` 时调用（见 wrapResponse 的
-   * `!escapeDecided && ct.includes('text/event-stream')` 守卫）。
+   * multipart 打码：文本字段打码，**文件字段原样透传**。
    *
-   * 因此**不存在**"content-type 既不是 JSON 也不是 SSE"的分支——原先那个
-   * `return false` 兜底永远不可达。留着一个不可达分支比删掉它更糟：后来人会把
-   * 它当"未知类型的安全默认"，可 `escape` 的语义取决于**目标槽位是不是 JSON 字符串
-   * 内部**（transparent.restore 的 escape 参数），根本不取决于 content-type。
-   * 若将来真出现新的调用点（比如支持 `application/json-seq`），必须**重新推导**
-   * escape 语义，而不是顺手复用这里的返回值。
+   * 为什么可以这么做：`Request.formData()` 会把 multipart 解析成 [name, string|File] 条目，
+   * 我们用打码后的字符串 + 原 File 重新拼一个 FormData，再交给 fetch 自动生成**新的**
+   * boundary —— 不存在手写 boundary 写坏的问题。
+   *
+   * 为什么必须显式删掉 `content-type`：见 `new Request(resource, {body})` 那处注释。
+   * 旧头里是**旧 boundary**，留着等于告诉上游按一条已经不存在的分隔线去切分实体 → 400。
+   *
+   * 文件（含图片）里的内容**不脱敏**：要处理图片里的文字得引入 OCR，单张几百毫秒到几秒，
+   * 会把它从轻量工具变成重工具。不静默放行——检测到文件就发一条 note，由 popup 明说。
+   *
+   * 所有字符串字段**一次拼好统一打码**，再按同一分隔符拆回：分字段各打一次会让同一
+   * 个手机号在不同字段里拿到不同占位符，且请求数翻倍。
    */
-  const detectEscape = (ct, chunk) => {
-    if (ct.includes('application/json')) return true;   // 防未来误用：JSON 恒需转义
-    const line = firstDataLine(chunk);
-    if (!line) return true;                            // 未出现 data 行 → 维持默认 true
-    return escapeForDataLine(line);
-  };
+  const FIELD_SEP = '\u0001';
+  async function maskMultipart(fd) {
+    const entries = [...fd.entries()];
+    const texts = [];
+    let hasFile = false, hasImage = false;
+    let fileCount = 0;
+    for (const [, v] of entries) {
+      if (typeof v === 'string') texts.push(v);
+      else {
+        hasFile = true;
+        fileCount++;
+        if (v && typeof v.type === 'string' && v.type.startsWith('image/')) hasImage = true;
+      }
+    }
+    if (!texts.length) {
+      if (hasFile) bridge.notify('note', { kind: 'attachment', image: hasImage, count: fileCount });
+      return null;                                  // 纯文件：没有文本可打码
+    }
+    const joined = texts.join(FIELD_SEP);
+    if (!joined) return null;
+    const r = await bridge.call('mask', { text: joined });
+    if (r && r.blocking) return { blocking: true };  // (A) 无条件阻断，交给调用方抛
+    if (!r || !r.ok) return null;
+    const parts = String(r.masked_text || '').split(FIELD_SEP);
+    if (parts.length !== texts.length) return null;  // 条目数对不上说明有意外，宁可放行
+    const out = new FormData();
+    let i = 0;
+    for (const [k, v] of entries) {
+      if (typeof v === 'string') out.append(k, parts[i++]);
+      else out.append(k, v, v && v.name);
+    }
+    if (hasFile) bridge.notify('note', { kind: 'attachment', image: hasImage, count: fileCount });
+    return { body: out, sid: r.sid };
+  }
+
+  // ─── escape 由引擎按槽位判定 ───
+  // 这里原先有一段「读首个 data: 行的首字符，猜整条流要不要 JSON 转义」的启发式。
+  // 它已删除，原因有两条：
+  //   1. **粒度错了**。escape 的语义是「这个值是不是要放进 JSON 字符串里」，
+  //      而同一条流里 `choices[].delta.content`（正文，不转义）与
+  //      `tool_calls[].function.arguments`（JSON 文本，必须转义）是**并存**的，
+  //      整条流只能猜出一个值，必然有一个是错的。
+  //   2. **它永远猜不准 SSE**。首帧往往只是 `data: {"choices":[...`，末尾的续帧
+  //      不以 `data:` 开头，靠首帧推出来的值要一路用到流结束。
+  // 现在由引擎 `_sse_text_slots()` 逐槽位给出 escape（与代理链路同一份实现）。
+  // 扩展只需要告诉引擎 content-type —— 分帧方式（SSE 空行 / NDJSON 换行 / 整体）
+  // 也由引擎判定，避免同一套规则在两边各写一遍然后悄悄漂移。
 
   const streamLike = (ct) =>
-    ct.includes('text/event-stream') || ct.includes('application/json');
+    ct.includes('text/event-stream') || ct.includes('application/json') || ct.includes('ndjson') || ct.includes('json-seq');
 
   // ─── fetch hook ───
   const origFetch = window.fetch;
@@ -132,25 +226,52 @@
     } catch (e) {
       return origFetch.apply(this, args);             // 任何解析意外：原样放行
     }
-    if (method !== 'POST' || !isLLMRequest(url)) {
-      // 白名单外：不打码不包装（成对原则）。同时记一条「未命中白名单的 POST」供反馈。
-      if (method === 'POST') {
+    // 只有带 body 的写方法值得过桥；GET 语义的查询串不处理（历史上 MIN_MASKABLE_LEN
+    // 就是为滤掉这类短请求，现在进一步按方法先过滤，省掉绝大部分无谓判定）。
+    if (method !== 'POST' && method !== 'PUT' && method !== 'PATCH') {
+      return origFetch.apply(this, args);
+    }
+
+    const cfg = await getWideMode();
+    if (!shouldMaskUrl(url, cfg.wideMode)) {
+      // 不打码不包装（成对原则）。窄模式下记一条「未命中对话接口的 POST」供反馈——
+      // 广泛模式不记：它本就把同站 POST 全收了，记下来的全是跨域埋点，纯噪音。
+      if (!cfg.wideMode) {
         try {
           const p = new URL(url, location.href).pathname;
-          if (!AUTH_PATH_BLOCKLIST.some((rx) => rx.test(p))) {
+          if (!NEVER_MASK_PATH.some((rx) => rx.test(p))) {
             bridge.notify('note', { kind: 'unmatched_post', path: p });
           }
         } catch (e) { /* ignore */ }
       }
       return origFetch.apply(this, args);
     }
+    const minLen = MIN_MASKABLE_LEN;
 
     let sid = null;
     if (isReq) {
-      // 非文本 body 整体跳过（否则会把 multipart 写坏，见 isMaskableBody 说明）
+      // ── multipart：文本字段打码，文件原样 ──
+      if (isMultipart(resource)) {
+        const fd = await resource.clone().formData().catch(() => null);
+        if (fd) {
+          const m = await maskMultipart(fd);
+          if (m && m.blocking) throw new TypeError('Failed to fetch');   // (A)
+          if (m) {
+            // 必须删掉 content-type：旧值是**旧 boundary**，留着上游按不存在的分隔线
+            // 切分实体 → 400。新 FormData 由 fetch 自动补正确的 boundary。
+            const h = new Headers(resource.headers);
+            h.delete('content-type');
+            resource = new Request(resource, { body: m.body, headers: h, signal: resource.signal });
+            return wrapResponse(await origFetch.call(this, resource), m.sid);
+          }
+        }
+        return origFetch.apply(this, args);
+      }
+      // 其它非文本 body（Blob / ReadableStream / ArrayBuffer）：读成字符串再回写会破坏
+      // 原有语义，一律原样放行。
       if (!isMaskableBody(resource)) return origFetch.apply(this, args);
       const raw = await resource.clone().text();
-      if (raw.length > MIN_MASKABLE_LEN) {
+      if (raw.length > minLen) {
         const r = await bridge.call('mask', { text: raw });
         if (r && r.ok) {
           sid = r.sid;
@@ -169,11 +290,22 @@
     }
 
     let reqInit = init;
-    if (initBodyIsText(init) && init.body.length > MIN_MASKABLE_LEN) {
-      const r = await bridge.call('mask', { text: init.body });
+    const isUrlParams = initBodyIsURLSearchParams(init);
+    if (initBodyIsFormData(init)) {
+      const m = await maskMultipart(init.body);
+      if (m && m.blocking) throw new TypeError('Failed to fetch');       // (A)
+      if (m) {
+        const h = new Headers((init && init.headers) || {});
+        h.delete('content-type');
+        reqInit = { ...init, body: m.body, headers: h };
+        return wrapResponse(await origFetch.call(this, url, reqInit), m.sid);
+      }
+    } else if ((initBodyIsText(init) || isUrlParams) && (isUrlParams ? init.body.toString().length : init.body.length) > minLen) {
+      const textToMask = isUrlParams ? init.body.toString() : init.body;
+      const r = await bridge.call('mask', { text: textToMask });
       if (r && r.ok) {
         sid = r.sid;
-        reqInit = { ...init, body: r.masked_text };
+        reqInit = { ...init, body: isUrlParams ? new URLSearchParams(r.masked_text) : r.masked_text };
       } else if (r && r.blocking) {
         throw new TypeError('Failed to fetch');        // (A)
       }
@@ -194,28 +326,27 @@
     const streamId = (crypto.randomUUID && crypto.randomUUID()) || String(Math.random()).slice(2);
     const dec = new TextDecoder();
     const enc = new TextEncoder();
-    let escape = ct.includes('application/json');      // SSE 待首个 data 行判定（默认 true）
-    let escapeDecided = escape;
 
     const transformed = res.body.pipeThrough(new TransformStream({
       async transform(chunk, ctrl) {
+        // chunk 边界与 SSE 事件边界**无关**：一个 chunk 可能只有半个事件，也可能含
+        // 三个事件加半个。分帧必须是引擎的事（`restore_stream_chunk` 按 stream_id
+        // 持有半帧缓冲），这里只做字节→文本解码，**绝不自己切帧**。
+        //
+        // 这一层曾经把整段 SSE 原文直接送去还原，于是被事件边界切开的占位符
+        // （`content:"{{EMAIL"` + `content:"_dsszcd}}"`）永远拼不回来，页面上留下
+        // 裸 `{{EMAIL_dsszcd}}`。真机往返才暴露——mock 的 SSE 恰好把完整占位符
+        // 放在单个事件里，绕过了这个缺陷。
         const text = dec.decode(chunk, { stream: true });
-        if (!escapeDecided && ct.includes('text/event-stream')) {
-          if (firstDataLine(text)) {
-            escape = detectEscape(ct, text);
-            escapeDecided = true;
-          }
-          // 没出现 data: 行前保持 true（默认站全是 JSON；纯文本流会在首个 data 行翻 false）
-        }
         const r = await bridge.call('restore', {
-          sid, stream_id: streamId, text, final: false, escape,
+          sid, stream_id: streamId, text, final: false, content_type: ct,
         });
         ctrl.enqueue(enc.encode(r && r.ok ? r.text : text));   // 还原失败恒透传
       },
       async flush(ctrl) {
         const tail = dec.decode();
         const r = await bridge.call('restore', {
-          sid, stream_id: streamId, text: tail, final: true, escape,
+          sid, stream_id: streamId, text: tail, final: true, content_type: ct,
         });
         const out = r && r.ok ? r.text : tail;
         if (tail || out) ctrl.enqueue(enc.encode(out || ''));

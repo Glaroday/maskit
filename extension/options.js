@@ -33,6 +33,9 @@ const I18N = {
     openPanelFail: '打开面板失败：{err}',
     secEnabled: '总开关',
     enabledLabel: '启用浏览器扩展链路（关闭后网页请求原样直连，引擎侧也会同步拒绝）',
+    secScope: '拦截范围',
+    scopeHint: '打码判定发生在本地引擎里：送过去的文本没匹配到敏感信息就原样返回，不会改动内容。',
+    wideLabel: '广泛模式：把本站点发出的所有请求都送引擎（新站点不用适配，推荐）',
     secSites: '站点列表',
     sitesHint: '下面是已添加的站点。要加更多，点下面「推荐站点」里的任意一个；也可以自己在输入框里填域名。',
     presetHint: '点一下就加上（第一次加会弹一次授权，点「允许」）。带 ⚠ 的表示这个站的接口还没实测过，可能不生效——不影响上网，只是不脱敏。',
@@ -48,11 +51,9 @@ const I18N = {
       '扩展事件记在**事件页**（不是「运行日志」）。快速筛法：在事件页搜索框输入 /ext/。',
       '统计开关在面板「高级设置 → 日志与隐私 → 记录浏览器扩展流量」；落库发生在引擎侧，改完不用重装扩展。',
       '关闭统计 ≠ 不脱敏：开关只停落库，脱敏/还原与「未脱敏状态」提示照常。',
-      '未命中路径白名单的请求**原样直通**：不会断网，也不会脱敏。',
+      '广泛模式下，本站点发出的请求都会送进引擎；只有真正命中规则的才会被改写，其余原样返回。关掉广泛模式后，只送已知形态的对话接口。',
       '扩展只访问 127.0.0.1 / localhost，不使用 storage.sync，不上报，不记录请求正文。'
     ],
-    tagStatic: '内置',
-    tagDynamic: '已添加',
     tagUnsupported: '未实测',
     removeBtn: '删除',
     saved: '已保存。',
@@ -85,6 +86,9 @@ const I18N = {
     openPanelFail: 'Could not open the panel: {err}',
     secEnabled: 'Master switch',
     enabledLabel: 'Enable the browser-extension bridge (when off, page requests go straight through and the engine rejects too)',
+    secScope: 'Interception scope',
+    scopeHint: 'Masking happens in the local engine: text with no sensitive match is returned unchanged — content is never altered.',
+    wideLabel: 'Wide mode: send every request from the site to the engine (no per-site adaptation, recommended)',
     secSites: 'Sites',
     sitesHint: 'Below are the sites already added. To add more, click any recommended site below, or type a domain yourself.',
     presetHint: 'One click adds it (the first add asks for host access once — click Allow). ⚠ means the site’s request path is unverified and may not mask. Browsing still works; it just is not masked.',
@@ -100,11 +104,9 @@ const I18N = {
       'Extension events land in the **Events page** (not the runtime log). Quick filter: type /ext/ in the events search box.',
       'The stats toggle lives in the panel under Advanced settings → Logging & privacy → Record browser-extension traffic. Persistence happens engine-side, so no extension reload is needed.',
       'Turning stats off ≠ disabling masking: it only stops persistence; masking/restoring and the "not masked" indicators keep working.',
-      'Requests that miss the path whitelist pass through **untouched**: no network breakage, but also no masking.',
+      'In wide mode every request from the site is sent to the engine; only real matches are rewritten, everything else comes back as-is. With wide mode off, only known chat endpoints are sent.',
       'The extension only talks to 127.0.0.1 / localhost, never uses storage.sync, never reports anything, and never records request bodies.'
     ],
-    tagStatic: 'built-in',
-    tagDynamic: 'added',
     tagUnsupported: 'unverified',
     removeBtn: 'Remove',
     saved: 'Saved.',
@@ -169,7 +171,7 @@ function setMsg(el, text, kind) {
 
 // ── 配置读写 ────────────────────────────────────────────────────────────────
 
-const DEFAULTS = { token: '', panelUrl: 'http://127.0.0.1:5801', enabledSites: STATIC_SITES.slice(), enabled: true, uiLang: '' };
+const DEFAULTS = { token: '', panelUrl: 'http://127.0.0.1:5801', enabledSites: STATIC_SITES.slice(), enabled: true, wideMode: false, uiLang: '' };
 
 async function loadConfig() {
   const stored = await chrome.storage.local.get(Object.keys(DEFAULTS));
@@ -197,19 +199,18 @@ async function renderSites() {
     const spacer = document.createElement('span');
     spacer.className = 'spacer';
 
-    const tag = document.createElement('span');
-    tag.className = 'tag ' + (STATIC_SITES.includes(domain) ? 'static' : '');
-    tag.textContent = STATIC_SITES.includes(domain) ? t('tagStatic') : t('tagDynamic');
-
     li.append(chk, name, spacer);
 
+    // 站点一律一视同仁：都能删、都能再加。
+    // 原先给 chatgpt/claude 打「内置」、其余打「已添加」，用户会以为「内置」的两个特殊
+    // （删不掉、或删了也没用）——而这个"特殊"在删除生效后就是假的、还会误导。
+    // 现在只保留**有实际决策价值**的一个标记：该站路径未实测（= 可能不脱敏）。
     if (reasonFor(domain)) {
       const warn = document.createElement('span');
       warn.className = 'tag warn';
       warn.textContent = t('tagUnsupported');
       li.appendChild(warn);
     }
-    li.appendChild(tag);
 
     const del = document.createElement('button');
     del.type = 'button';
@@ -446,6 +447,7 @@ async function init() {
   $('panelUrl').value = cfg.panelUrl || DEFAULTS.panelUrl;
   $('token').value = cfg.token || '';
   $('enabled').checked = cfg.enabled !== false;
+  $('wideMode').checked = cfg.wideMode === true;
 
   applyI18n();
   await renderSites();
@@ -485,7 +487,13 @@ async function init() {
       panelUrl,
       token: String($('token').value || '').trim(),
       enabled: !!$('enabled').checked,
+      wideMode: !!$('wideMode').checked,
     });
+    // 拦截范围由页面侧在**首次请求时**取一次并缓存（MAIN world 读不到 storage），
+    // 所以改完要刷新已打开的网页才生效——和站点增删一样，明说出来免得用户以为没保存。
+    setMsg($('scopeMsg'), lang === 'zh'
+      ? '已保存。请刷新已打开的网页，新的拦截范围才会生效。'
+      : 'Saved. Reload any open page for the new scope to take effect.', 'ok');
     setMsg($('saveMsg'), t('saved'), 'ok');
     // 保存后立刻探一次：ping 成功会解开 SW 侧的两个退避窗口（见 background.js
     // 的 AUTH_HOLD_MS 注释）。不探的话，用户"刚把 token 改对"仍要盲等最多 60s，

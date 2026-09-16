@@ -5653,13 +5653,23 @@ def api_ext_mask():
 
 @app.post("/api/ext/restore")
 def api_ext_restore():
-    """扩展响应流还原。**还原方向恒透传**：失败也把原文交回客户端（红线 3）。"""
+    """扩展响应流还原。**还原方向恒透传**：失败也把原文交回客户端（红线 3）。
+
+    请求带 `content_type` 时走 `transparent.restore_stream_chunk`（分帧 + 槽位粒度），
+    不带则退回旧的整段文本还原。**这个分支必须留着**：扩展是用户手动加载的，
+    引擎与扩展的升级不同步是常态，旧扩展只会发 `text`——不能因为引擎更新了就把
+    还装着旧扩展的用户打成「还原全失败」（那会表现为满屏 `{{...}}`，比不还原更糟）。
+
+    为什么要区分两条路径见 `restore_stream_chunk` 的文档：整段文本还原无法拼接被
+    SSE 事件边界切开的占位符，页面上会留下裸 `{{EMAIL_xxxxxx}}`。
+    """
     data = request.get_json(force=True, silent=True) or {}
     text = data.get("text")
     sid = str(data.get("sid") or "").strip()        # 扩展回传 mask 签发的 sid
     stream_id = str(data.get("stream_id") or "").strip()
     final = bool(data.get("final"))
-    escape = bool(data.get("escape"))               # 扩展按上下文判定（SSE 默认 true）
+    escape = bool(data.get("escape"))               # 非流式文本类型才用得上
+    content_type = str(data.get("content_type") or "")
     # sid 必须带 ext: 前缀 —— 否则扩展可以拿它去还原代理链路/他人会话的占位符。
     if not isinstance(text, str) or not sid.startswith("ext:") or not stream_id:
         return jsonify({"ok": False, "error": "bad_request"}), 400
@@ -5669,8 +5679,13 @@ def api_ext_restore():
         with _EXT_LOCK:
             _sweep_throttled(tr)
             tr._touch(sid)
-            out = tr.restore(text, sid, channel=f"ext:{stream_id}",
-                             escape=escape, final=final)
+            if content_type:
+                out = tr.restore_stream_chunk(text, sid, stream_id,
+                                              content_type=content_type,
+                                              escape=escape, final=final)
+            else:
+                out = tr.restore(text, sid, channel=f"ext:{stream_id}",
+                                 escape=escape, final=final)
         if final:
             with _EXT_LOCK:
                 s = tr.sessions.get(sid) or {}
