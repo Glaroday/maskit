@@ -19,10 +19,10 @@ export function initEnginePort(port: number) {
 }
 
 function engineBase(): string {
-  // 浏览器生产态（Docker / 无头部署）：SPA 由 panel.py 同源托管，直接用当前 origin，
-  // 否则远程用户的浏览器会去请求他自己电脑上的 127.0.0.1。
-  // Tauri 与 vite dev（5173 端口）仍指向本机引擎端口。
-  if (!isTauri() && !import.meta.env.DEV && typeof window !== 'undefined') {
+  // 浏览器环境（本地 dev 走 Vite 代理同源转发，生产态同源托管）：直接用当前 origin，
+  // 避免 dev 跨端口请求触发 panel.py 的 Origin 拦截。
+  // Tauri 桌面端走 Rust 代发，指向本机引擎端口。
+  if (!isTauri() && typeof window !== 'undefined') {
     return window.location.origin
   }
   return `http://127.0.0.1:${enginePort}`

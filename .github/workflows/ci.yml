@@ -82,6 +82,12 @@ jobs:
       - name: .env import parser cases
         run: node --experimental-strip-types ../scripts/check-env-import.mjs
 
+      # 浏览器扩展（extension/）的静态门禁：i18n 键集一致性、shared.js 加载顺序、
+      # 驼峰 runAt、静态站点清单与 manifest 对齐、安全红线扫描。
+      # 放在本 job 只是因为这里已经装好了 node —— 扩展与前端是两套东西。
+      - name: Browser extension static checks
+        run: node ../scripts/check-extension.mjs
+
   rust:
     name: rust
     runs-on: windows-latest

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Data Maskit Browser Bridge",
+  "version": "1.0.0",
+  "description": "把网页版 AI（ChatGPT / Claude）发出的请求送进本地 Maskit 引擎打码，回包流式无感还原。100% 本地运算，零外传。",
+  "minimum_chrome_version": "111",
+  "permissions": ["storage", "scripting", "tabs"],
+  "optional_host_permissions": ["*://*/*"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
+  "action": { "default_popup": "popup.html", "default_title": "Data Maskit Browser Bridge" },
+  "content_scripts": [
+    {
+      "matches": ["*://*.chatgpt.com/*", "*://*.claude.ai/*"],
+      "js": ["bridge-isolated.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["*://*.chatgpt.com/*", "*://*.claude.ai/*"],
+      "js": ["bridge-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}

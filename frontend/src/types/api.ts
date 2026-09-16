@@ -143,6 +143,11 @@ export interface ShieldEvent {
   model?: string
   client_app?: string | number
   upstream?: string
+  /**
+   * 入口维度：`proxy`=CLI 代理链路，`ext`=浏览器扩展链路。
+   * **老数据/导入事件该列为空，读取时按 `proxy` 解读**（不要渲染成"—"）。
+   */
+  ingress?: 'proxy' | 'ext'
   reason?: string
   msg?: string
   seq: number
@@ -216,7 +221,22 @@ export interface TodayStats {
   prefix?: PrefixStats | null
   by_label: Record<string, number>
   top_words: { label: string; word: string; count: number }[]
+  /**
+   * 词表**按入口分组**的同一份数据（key: `proxy` / `ext`）。分组同屏而非过滤：
+   * 浏览器扩展链路的量级远大于 CLI，混算会把邮箱/电话这类高频词刷上榜，
+   * 压掉用户真正关心的业务密钥词；分组后各组各取 Top N，两组都可见。
+   */
+  words_by_ingress?: Record<string, IngressWordGroup>
   [key: string]: unknown
+}
+
+/** 单个入口（proxy=CLI 代理链路 / ext=浏览器扩展链路）的词表视图。 */
+export interface IngressWordGroup {
+  by_label: Record<string, number>
+  by_label_words: Record<string, { word: string; count: number }[]>
+  top_words: { label: string; word: string; count: number }[]
+  /** 该入口下的命中总数（组头计数；与 top_words 的 Top N 截断无关） */
+  label_total: number
 }
 
 // ========== 配置（/api/config） ==========
@@ -253,6 +273,17 @@ export interface ShieldConfig {
   session_ttl?: number
   diagnostic_unmatched?: boolean
   http2?: boolean
+  /** 浏览器扩展链路总开关（默认关）。关闭时三个 /api/ext/* 端点 403 `ext_bridge_disabled` */
+  ext_bridge_enabled?: boolean
+  /**
+   * 扩展访问令牌。**面板只回显，不进任何日志/导出/诊断包**。
+   * 轮换即扩展失效（403 invalid_token → 直通、未脱敏）直到用户在扩展设置里更新。
+   */
+  ext_token?: string
+  /** 引擎不可达时扩展侧是否阻断（默认关=直通）。**只管 (B) 类**，(A) 类无开关 */
+  ext_block_when_engine_down?: boolean
+  /** 扩展链路是否写入本地事件库与统计（默认 true）。只管落库，不管脱敏 */
+  ext_record_events?: boolean
   target_domains?: string[]
   api_paths?: string[]
   wizard_done?: boolean

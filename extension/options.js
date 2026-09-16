@@ -1,0 +1,498 @@
+/* Data Maskit Browser Bridge — 设置页逻辑
+ *
+ * 安全边界（违反即返工）：
+ *  - token 只写入 `chrome.storage.local`，**不注入页面、不进 postMessage**；
+ *  - 不用 `chrome.storage.sync`（那是把数据同步到账号 = 外传）；
+ *  - 任何地方都不 `console.log(body)`；本页也从不读请求正文。
+ *
+ * targetOrigin 一律用 location.origin 的显式值，不用 '*'。
+ */
+
+'use strict';
+
+// 共享常量与纯函数（唯一来源，见 shared.js 头部说明）。
+const { STATIC_SITES, PRESET_SITES, siteMatchPattern, normalizeDomain } = self.MASKIT_SHARED;
+// `reasonFor` 只是 `unsupportedReason(domain)` 的本页别名，保留名字让调用点读起来直白。
+const reasonFor = (domain) => self.MASKIT_SHARED.unsupportedReason(domain);
+
+const I18N = {
+  zh: {
+    title: 'Data Maskit Browser Bridge',
+    subtitle: '把网页版 AI（ChatGPT / Claude / DeepSeek / 豆包 / 元宝 …）的请求送进本地 Maskit 引擎打码，回包流式还原。100% 本地运算，零外传。',
+    secEngine: '引擎连接',
+    engineHint: '本机引擎地址。默认端口 5801，改了端口就在这里同步。',
+    panelUrlPh: 'http://127.0.0.1:5801',
+    testBtn: '测试连接',
+    secToken: '访问令牌（ext_token）',
+    tokenHint: '在面板「设置 → 浏览器扩展」里复制。令牌只在扩展本地存储，绝不注入页面。',
+    tokenPh: '粘贴 ext_token',
+    showBtn: '显示',
+    hideBtn: '隐藏',
+    openPanelBtn: '在面板中旋转令牌',
+    openPanelOk: '已在新标签页打开本机面板；请在「设置 → 浏览器扩展」里旋转，再把新令牌粘回这里。',
+    openPanelFail: '打开面板失败：{err}',
+    secEnabled: '总开关',
+    enabledLabel: '启用浏览器扩展链路（关闭后网页请求原样直连，引擎侧也会同步拒绝）',
+    secSites: '站点列表',
+    sitesHint: '下面是已添加的站点。要加更多，点下面「推荐站点」里的任意一个；也可以自己在输入框里填域名。',
+    presetHint: '点一下就加上（第一次加会弹一次授权，点「允许」）。带 ⚠ 的表示这个站的接口还没实测过，可能不生效——不影响上网，只是不脱敏。',
+    addAllPresets: '一键添加全部推荐站点',
+    presetNone: '推荐站点都已经在上面了。',
+    presetAdded: '已添加 {n} 个站点。请刷新已打开的网页，扩展才会对新页面生效。',
+    presetAllWarn: '将添加 {n} 个推荐站点。其中大部分的接口路径未经实测，可能不生效（不会断网，只是不脱敏）。是否继续？',
+    domainPh: '例如 chat.deepseek.com',
+    addBtn: '添加站点',
+    secNotes: '说明',
+    saveBtn: '保存',
+    notes: [
+      '扩展事件记在**事件页**（不是「运行日志」）。快速筛法：在事件页搜索框输入 /ext/。',
+      '统计开关在面板「高级设置 → 日志与隐私 → 记录浏览器扩展流量」；落库发生在引擎侧，改完不用重装扩展。',
+      '关闭统计 ≠ 不脱敏：开关只停落库，脱敏/还原与「未脱敏状态」提示照常。',
+      '未命中路径白名单的请求**原样直通**：不会断网，也不会脱敏。',
+      '扩展只访问 127.0.0.1 / localhost，不使用 storage.sync，不上报，不记录请求正文。'
+    ],
+    tagStatic: '内置',
+    tagDynamic: '已添加',
+    tagUnsupported: '未实测',
+    removeBtn: '删除',
+    saved: '已保存。',
+    saveFail: '保存失败。',
+    testOk: '连接成功：引擎 v{version}，统计 mask {mask} / restore {restore}。',
+    testFail: '连接失败：{err}。请确认引擎已启动、地址与令牌正确。',
+    testNoToken: '连接失败：未填写令牌（401/403）。',
+    domainInvalid: '域名格式不合法（只允许小写字母、数字、. * -）。',
+    domainDuplicate: '该站点已在列表中。',
+    siteWarn: '「{domain}」的路径规则未经实测，添加后可能不生效（不会断网：未命中即直通，但也不会脱敏）。是否继续？',
+    permDenied: '未授予该域名的访问权限，站点未添加。',
+    regFailed: '站点已保存，但动态注册失败：{detail}（该站点不会生效）',
+    resyncUnknown: '站点已保存，但没能确认是否注入成功（扩展后台没回应）。请到 chrome://extensions 点一次「重新加载」，再刷新目标网页。',
+    quota: '会话存储占用 {used}（预算 {budget}）· 签发表 {sids} 条 · Chrome ≤111 约 1MB，112+ 约 10MB',
+  },
+  en: {
+    title: 'Data Maskit Browser Bridge',
+    subtitle: 'Routes web-AI (ChatGPT / Claude / DeepSeek / Doubao / Yuanbao …) requests through the local Maskit engine for masking, and restores responses as they stream. 100% local, zero egress.',
+    secEngine: 'Engine',
+    engineHint: 'Local engine address. Default port 5801; keep this in sync if you changed it.',
+    panelUrlPh: 'http://127.0.0.1:5801',
+    testBtn: 'Test connection',
+    secToken: 'Access token (ext_token)',
+    tokenHint: 'Copy it from the panel: Settings → Browser extension. The token stays in extension storage and is never injected into pages.',
+    tokenPh: 'Paste ext_token',
+    showBtn: 'Show',
+    hideBtn: 'Hide',
+    openPanelBtn: 'Rotate it in the panel',
+    openPanelOk: 'Opened the local panel in a new tab; rotate under Settings → Browser extension, then paste the new token back here.',
+    openPanelFail: 'Could not open the panel: {err}',
+    secEnabled: 'Master switch',
+    enabledLabel: 'Enable the browser-extension bridge (when off, page requests go straight through and the engine rejects too)',
+    secSites: 'Sites',
+    sitesHint: 'Below are the sites already added. To add more, click any recommended site below, or type a domain yourself.',
+    presetHint: 'One click adds it (the first add asks for host access once — click Allow). ⚠ means the site’s request path is unverified and may not mask. Browsing still works; it just is not masked.',
+    addAllPresets: 'Add all recommended sites',
+    presetNone: 'All recommended sites are already added above.',
+    presetAdded: 'Added {n} sites. Reload any open AI page — the extension only injects into newly loaded pages.',
+    presetAllWarn: 'This adds {n} recommended sites. Most have unverified request paths and may not mask (browsing still works, it just is not masked). Continue?',
+    domainPh: 'e.g. chat.deepseek.com',
+    addBtn: 'Add site',
+    secNotes: 'Notes',
+    saveBtn: 'Save',
+    notes: [
+      'Extension events land in the **Events page** (not the runtime log). Quick filter: type /ext/ in the events search box.',
+      'The stats toggle lives in the panel under Advanced settings → Logging & privacy → Record browser-extension traffic. Persistence happens engine-side, so no extension reload is needed.',
+      'Turning stats off ≠ disabling masking: it only stops persistence; masking/restoring and the "not masked" indicators keep working.',
+      'Requests that miss the path whitelist pass through **untouched**: no network breakage, but also no masking.',
+      'The extension only talks to 127.0.0.1 / localhost, never uses storage.sync, never reports anything, and never records request bodies.'
+    ],
+    tagStatic: 'built-in',
+    tagDynamic: 'added',
+    tagUnsupported: 'unverified',
+    removeBtn: 'Remove',
+    saved: 'Saved.',
+    saveFail: 'Save failed.',
+    testOk: 'Connected: engine v{version}, stats mask {mask} / restore {restore}.',
+    testFail: 'Connection failed: {err}. Check that the engine is running and the URL/token are correct.',
+    testNoToken: 'Connection failed: token missing (401/403).',
+    domainInvalid: 'Invalid domain (only lowercase letters, digits, . * - are allowed).',
+    domainDuplicate: 'That site is already in the list.',
+    siteWarn: 'Path rules for "{domain}" are unverified; it may not take effect (it will not break the network — misses pass through — but it also will not mask). Continue?',
+    permDenied: 'Host access not granted; site not added.',
+    regFailed: 'Site saved, but dynamic registration failed: {detail} (it will not take effect)',
+    resyncUnknown: 'Site saved, but we could not confirm injection (the extension background did not respond). Reload it once at chrome://extensions, then reload the target page.',
+    quota: 'Session storage {used} of {budget} · {sids} sid entries · Chrome ≤111 ≈ 1MB, 112+ ≈ 10MB',
+  }
+};
+
+let lang = 'zh';
+const $ = (id) => document.getElementById(id);
+
+function t(key, vars) {
+  let s = (I18N[lang] && I18N[lang][key]) || (I18N.zh[key] || key);
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) s = s.replaceAll(`{${k}}`, String(v));
+  }
+  return s;
+}
+
+function applyI18n() {
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  for (const el of document.querySelectorAll('[data-i18n]')) {
+    el.textContent = t(el.dataset.i18n);
+  }
+  for (const el of document.querySelectorAll('[data-i18n-ph]')) {
+    el.placeholder = t(el.dataset.i18nPh);
+  }
+  $('langBtn').textContent = lang === 'zh' ? 'English' : '中文';
+  $('notes').innerHTML = '';
+  for (const line of I18N[lang].notes) {
+    const li = document.createElement('li');
+    // 只用 textContent + 手动粗体标记，绝不 innerHTML 拼外串（避免注入面）
+    const parts = String(line).split(/(\*\*[^*]+\*\*)/g);
+    for (const p of parts) {
+      if (p.startsWith('**') && p.endsWith('**')) {
+        const b = document.createElement('b');
+        b.textContent = p.slice(2, -2);
+        li.appendChild(b);
+      } else if (p) {
+        li.appendChild(document.createTextNode(p));
+      }
+    }
+    $('notes').appendChild(li);
+  }
+  // 表单态里的 button 标签会随语言变
+  $('tokenToggle').textContent = $('token').type === 'password' ? t('showBtn') : t('hideBtn');
+}
+
+function setMsg(el, text, kind) {
+  el.className = 'msg' + (kind ? ' ' + kind : '');
+  el.textContent = text || '';
+}
+
+// ── 配置读写 ────────────────────────────────────────────────────────────────
+
+const DEFAULTS = { token: '', panelUrl: 'http://127.0.0.1:5801', enabledSites: STATIC_SITES.slice(), enabled: true, uiLang: '' };
+
+async function loadConfig() {
+  const stored = await chrome.storage.local.get(Object.keys(DEFAULTS));
+  return { ...DEFAULTS, ...stored };
+}
+
+// ── 渲染 ────────────────────────────────────────────────────────────────────
+
+async function renderSites() {
+  const cfg = await loadConfig();
+  const ul = $('siteList');
+  ul.innerHTML = '';
+  for (const domain of cfg.enabledSites) {
+    const li = document.createElement('li');
+
+    const chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.checked = true;
+    chk.addEventListener('change', () => removeSite(domain));
+
+    const name = document.createElement('span');
+    name.className = 'domain';
+    name.textContent = domain;
+
+    const spacer = document.createElement('span');
+    spacer.className = 'spacer';
+
+    const tag = document.createElement('span');
+    tag.className = 'tag ' + (STATIC_SITES.includes(domain) ? 'static' : '');
+    tag.textContent = STATIC_SITES.includes(domain) ? t('tagStatic') : t('tagDynamic');
+
+    li.append(chk, name, spacer);
+
+    if (reasonFor(domain)) {
+      const warn = document.createElement('span');
+      warn.className = 'tag warn';
+      warn.textContent = t('tagUnsupported');
+      li.appendChild(warn);
+    }
+    li.appendChild(tag);
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'link danger';
+    del.textContent = t('removeBtn');
+    del.addEventListener('click', () => removeSite(domain));
+    li.appendChild(del);
+
+    ul.appendChild(li);
+  }
+  if (!cfg.enabledSites.length) {
+    const li = document.createElement('li');
+    li.style.color = '#6b7280';
+    li.textContent = lang === 'zh' ? '（暂无站点）' : 'No sites yet.';
+    ul.appendChild(li);
+  }
+  return cfg;
+}
+
+/**
+ * 推荐站点 chip。只列**还没添加**的 —— 已添加的在上面列表里，两处重复只会让人
+ * 以为加了没生效。chip 与手输走同一条 addDomain()，不另开一条路径。
+ * ⚠ 只标在 `verified:false` 的站点上：那是"没实测过"，不是"不能用"。
+ */
+async function renderPresets() {
+  const cfg = await loadConfig();
+  const box = $('presetList');
+  box.innerHTML = '';
+  const missing = PRESET_SITES.filter((p) => !cfg.enabledSites.includes(p.domain));
+  for (const p of missing) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chip';
+    btn.title = p.domain;
+    btn.textContent = lang === 'zh' ? p.zh : p.en;
+    if (!p.verified) {
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.textContent = '⚠';
+      btn.appendChild(dot);
+    }
+    btn.addEventListener('click', () => addDomain(p.domain));
+    box.appendChild(btn);
+  }
+  $('addAllPresetsBtn').style.display = missing.length ? '' : 'none';
+  if (!missing.length) {
+    const span = document.createElement('span');
+    span.className = 'tag';
+    span.textContent = t('presetNone');
+    box.appendChild(span);
+  }
+  return missing;
+}
+
+async function renderSnapshot() {
+  const snap = await sendToSW({ action: 'admin', op: 'snapshot' });
+  if (!snap || !snap.ok) return;
+  const used = snap.sessionBytes == null ? '—' : `${Math.round(snap.sessionBytes / 1024)} KB`;
+  const budget = `${Math.round((snap.sessionQuotaBytes || 1048576) / 1024)} KB`;
+  $('quota').textContent = t('quota', { used, budget, sids: snap.sidCount });
+}
+
+// ── 与 SW 通信 ──────────────────────────────────────────────────────────────
+
+function sendToSW(msg) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(msg, (resp) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        resolve(resp === undefined ? null : resp);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+// ── 事件 ────────────────────────────────────────────────────────────────────
+
+async function saveConfig(patch, msgEl) {
+  try {
+    await chrome.storage.local.set(patch);
+    setMsg(msgEl, t('saved'), 'ok');
+    return true;
+  } catch (e) {
+    setMsg(msgEl, t('saveFail'), 'bad');
+    return false;
+  }
+}
+
+async function removeSite(domain) {
+  const cfg = await loadConfig();
+  const next = cfg.enabledSites.filter((d) => d !== domain);
+  await chrome.storage.local.set({ enabledSites: next });
+  await sendToSW({ action: 'admin', op: 'resync' });
+  await renderSites();
+  await renderPresets();
+  setMsg($('siteMsg'), t('saved'), 'ok');
+}
+
+async function addSite() {
+  await addDomain(normalizeDomain($('newDomain').value), true);
+}
+
+/**
+ * 添加单个站点（手输与推荐站点 chip 共用）。
+ *
+ * `fromInput` 只影响"成功后要不要清空输入框"，其余五步——校验 → 手势内授权 →
+ * 落配置 → SW 重注册 → 如实报注册失败——**只有这一份实现**。两处各写一遍的下场
+ * 就是某天只改了一边，用户看到"添加成功"但实际没注入。
+ */
+async function addDomain(domain, fromInput) {
+  if (!domain) { setMsg($('siteMsg'), t('domainInvalid'), 'bad'); return; }
+
+  const cfg = await loadConfig();
+  if (cfg.enabledSites.includes(domain)) { setMsg($('siteMsg'), t('domainDuplicate'), 'warn'); return; }
+
+  if (!confirm(t('siteWarn', { domain }))) return;
+
+  // ① 用户手势内申请权限（先于任何网络/存储 await，避免丢失 transient activation）
+  let granted = true;
+  if (!STATIC_SITES.includes(domain)) {
+    try {
+      granted = await chrome.permissions.request({ origins: [siteMatchPattern(domain)] });
+    } catch (e) {
+      granted = false;
+    }
+  }
+  if (!granted) { setMsg($('siteMsg'), t('permDenied'), 'bad'); return; }
+
+  // ② 落配置 → 由 SW 统一重注册（单一写入者）
+  const next = cfg.enabledSites.concat([domain]);
+  await chrome.storage.local.set({ enabledSites: next });
+  const res = await sendToSW({ action: 'admin', op: 'resync' });
+
+  if (fromInput) $('newDomain').value = '';
+  await renderSites();
+  await renderPresets();
+  await renderSnapshot();
+
+  // 关键：**没拿到 SW 的确认就不能报成功**。
+  // `sendToSW` 在 lastError / SW 抛异常时会 resolve 成 null 或 `{ok:false}`，
+  // 而"站点已写进 storage"和"脚本真的注入了"是两件事——前者成功后者失败，用户看到的就是
+  // 「已保存」+ 实际不生效，也就是最难排查的那种"加了没反应"。宁可报黄也不能报绿。
+  if (!res || res.ok !== true) {
+    setMsg($('siteMsg'), t('resyncUnknown'), 'warn');
+    return;
+  }
+  const failed = Array.isArray(res.failed) ? res.failed.filter((f) => f.id.endsWith(domain)) : [];
+  if (failed.length) {
+    setMsg($('siteMsg'), t('regFailed', { detail: failed[0].error }), 'warn');
+  } else {
+    setMsg($('siteMsg'), t('saved'), 'ok');
+  }
+}
+
+/**
+ * 一键添加全部推荐站点。
+ *
+ * **故意只在一次 `permissions.request` 里申请全部 origins**：Chrome 会把同一次请求
+ * 合并成一个授权弹窗，用户点一次「允许」就完事。逐个申请会弹十几次，而弹窗一多
+ * 用户就会习惯性点掉，反而失去授权的意义。
+ */
+async function addAllPresets() {
+  const cfg = await loadConfig();
+  const missing = PRESET_SITES.map((p) => p.domain).filter((d) => !cfg.enabledSites.includes(d));
+  if (!missing.length) { setMsg($('siteMsg'), t('presetNone'), 'ok'); return; }
+
+  if (!confirm(t('presetAllWarn', { n: missing.length }))) return;
+
+  let granted = true;
+  try {
+    granted = await chrome.permissions.request({ origins: missing.map(siteMatchPattern) });
+  } catch (e) {
+    granted = false;
+  }
+  if (!granted) { setMsg($('siteMsg'), t('permDenied'), 'bad'); return; }
+
+  await chrome.storage.local.set({ enabledSites: cfg.enabledSites.concat(missing) });
+  const res = await sendToSW({ action: 'admin', op: 'resync' });
+
+  await renderSites();
+  await renderPresets();
+  await renderSnapshot();
+
+  // 同 addDomain：没有 SW 的确认就不报成功（原因见那里的注释）
+  if (!res || res.ok !== true) {
+    setMsg($('siteMsg'), t('resyncUnknown'), 'warn');
+    return;
+  }
+  const failed = Array.isArray(res.failed) ? res.failed : [];
+  if (failed.length) {
+    setMsg($('siteMsg'), t('regFailed', { detail: failed[0].error }), 'warn');
+  } else {
+    // 强调"刷新页面"：动态注册只对新加载的文档注入，不刷新就是"加了没反应"。
+    setMsg($('siteMsg'), t('presetAdded', { n: missing.length }), 'ok');
+  }
+}
+
+async function testConnection() {
+  const cfg = await loadConfig();
+  setMsg($('testMsg'), '…', '');
+  if (!cfg.token) { setMsg($('testMsg'), t('testNoToken'), 'bad'); return; }
+  const res = await sendToSW({ action: 'admin', op: 'ping' });
+  const ping = res && res.ping;
+  if (ping && ping.alive) {
+    const stats = ping.stats || { mask: 0, restore: 0 };
+    setMsg($('testMsg'), t('testOk', { version: ping.version || '?', mask: stats.mask || 0, restore: stats.restore || 0 }), 'ok');
+  } else {
+    setMsg($('testMsg'), t('testFail', { err: (ping && ping.error) || 'unreachable / invalid_token' }), 'bad');
+  }
+  await renderSnapshot();
+}
+
+async function openPanelSettings() {
+  // 旋转令牌**必须**在面板里做：`/api/ext/rotate-token` 是 API_TOKEN 鉴权，
+  // 而扩展手里只有 ext_token（SPEC §5.3 的 T9 断言「ext_token 打 rotate-token → 403」）。
+  // 原先这里是个"在本机面板旋转"按钮，用 ext_token 去调 —— 它**永远失败**，
+  // 用户每次点都只得到一句报错。改成打开面板设置页，是唯一诚实的做法。
+  const cfg = await loadConfig();
+  const url = `${String(cfg.panelUrl || DEFAULTS.panelUrl).replace(/\/+$/, '')}/settings`;
+  try {
+    await chrome.tabs.create({ url });
+    setMsg($('tokenMsg'), t('openPanelOk'), 'ok');
+  } catch (e) {
+    setMsg($('tokenMsg'), t('openPanelFail', { err: String((e && e.message) || e) }), 'bad');
+  }
+}
+
+async function init() {
+  const cfg = await loadConfig();
+  lang = cfg.uiLang === 'en' ? 'en' : cfg.uiLang === 'zh' ? 'zh' : (/^zh/i.test(chrome.i18n.getUILanguage() || '') ? 'zh' : 'en');
+
+  $('panelUrl').value = cfg.panelUrl || DEFAULTS.panelUrl;
+  $('token').value = cfg.token || '';
+  $('enabled').checked = cfg.enabled !== false;
+
+  applyI18n();
+  await renderSites();
+  await renderPresets();
+  await renderSnapshot();
+
+  $('langBtn').addEventListener('click', async () => {
+    lang = lang === 'zh' ? 'en' : 'zh';
+    await chrome.storage.local.set({ uiLang: lang });
+    applyI18n();
+    await renderSites();
+    await renderPresets();
+    await renderSnapshot();
+  });
+
+  $('testBtn').addEventListener('click', testConnection);
+
+  $('tokenToggle').addEventListener('click', () => {
+    const isPwd = $('token').type === 'password';
+    $('token').type = isPwd ? 'text' : 'password';
+    $('tokenToggle').textContent = isPwd ? t('hideBtn') : t('showBtn');
+  });
+
+  $('openPanelBtn').addEventListener('click', openPanelSettings);
+  $('addBtn').addEventListener('click', addSite);
+  $('addAllPresetsBtn').addEventListener('click', addAllPresets);
+
+  $('saveBtn').addEventListener('click', async () => {
+    const panelUrl = String($('panelUrl').value || '').trim().replace(/\/+$/, '') || DEFAULTS.panelUrl;
+    if (!/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(panelUrl)) {
+      setMsg($('saveMsg'), lang === 'zh'
+        ? '只允许 127.0.0.1 / localhost（扩展绝不向其它主机发请求）。'
+        : 'Only 127.0.0.1 / localhost are allowed (the extension never calls other hosts).', 'bad');
+      return;
+    }
+    await chrome.storage.local.set({
+      panelUrl,
+      token: String($('token').value || '').trim(),
+      enabled: !!$('enabled').checked,
+    });
+    setMsg($('saveMsg'), t('saved'), 'ok');
+    // 保存后立刻探一次：ping 成功会解开 SW 侧的两个退避窗口（见 background.js
+    // 的 AUTH_HOLD_MS 注释）。不探的话，用户"刚把 token 改对"仍要盲等最多 60s，
+    // 而这 60s 的流量是**静默未脱敏**的。
+    await sendToSW({ action: 'admin', op: 'ping' });
+    await renderSnapshot();
+  });
+}
+
+document.addEventListener('DOMContentLoaded', init);

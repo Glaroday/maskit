@@ -78,7 +78,7 @@ Data Maskit 是一款专为大模型打造的**100% 本地隐私脱敏与还原�
 
 ## 4. 验证与测试流程
 
-代码变更后必须通过全量门禁。**唯一清单是 `scripts/verify-all.py`**（本地与 CI 共用，13 项）：
+代码变更后必须通过全量门禁。**唯一清单是 `scripts/verify-all.py`**（本地与 CI 共用，14 项）：
 
 ```powershell
 python scripts/verify-all.py                 # 全跑

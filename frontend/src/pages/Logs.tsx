@@ -63,6 +63,12 @@ const EMPTY_LIST: readonly never[] = []
 /** 事件累积列表的内存封顶（与服务端导出上限 2000 对齐）；轮询游标另存，不受截断影响 */
 const MAX_LOG_LIST = 2000
 
+/**
+ * 入口筛选的「全部」哨兵。与 FILTER_ALL 同理：Radix Select 规定 SelectItem 的 value
+ * 不能是空串（空串=未选择、显示 placeholder），用它当真实选项会跟组件语义打架。
+ */
+const INGRESS_ALL = '__all__'
+
 interface AuditRow {
   id: number
   ts: number
@@ -121,6 +127,8 @@ export default function LogsPage() {
   const [q, setQ] = useState('')
   const [searchInput, setSearchInput] = useState('')
   const [fulltext, setFulltext] = useState(false)
+  /** 入口维度筛选（proxy / ext）。落 URL query，可分享、可回退 —— 与词榜跳转同口径 */
+  const [ingress, setIngress] = useState<string>(INGRESS_ALL)
   const [detailSeq, setDetailSeq] = useState<number | null>(null)
   const [detailOpen, setDetailOpen] = useState(false)
   // 审计行详情：原地弹窗（不再跳转审计中心）
@@ -148,6 +156,10 @@ export default function LogsPage() {
     if (urlFulltext) {
       setFulltext(true)
     }
+    // 入口维度**按 URL 原值镜像**（而不是「有才设」）：它只由本页写入 URL，
+    // 镜像才能让浏览器前进/后退真的切换筛选，也才能让「词条 ×N → 日志条数」对得上。
+    const urlIngress = (searchParams.get('ingress') || '').trim().toLowerCase()
+    setIngress(urlIngress === 'proxy' || urlIngress === 'ext' ? urlIngress : INGRESS_ALL)
   }, [searchParams])
 
   // 保留天数配置已移至高级设置页（Logs 筛选栏只留筛选控件）
@@ -160,8 +172,8 @@ export default function LogsPage() {
 
   // —— 事件查询：累积列表放进 query cache，游标从缓存数据派生 ——
   const logsKey = useMemo(
-    () => ['logs', { filterType, sensitive, q, fulltext }] as const,
-    [filterType, sensitive, q, fulltext],
+    () => ['logs', { filterType, sensitive, q, fulltext, ingress }] as const,
+    [filterType, sensitive, q, fulltext, ingress],
   )
   const logsQuery = useQuery<LogsCache>({
     queryKey: logsKey,
@@ -185,6 +197,7 @@ export default function LogsPage() {
           sensitive,
           q,
           fulltext,
+          ingress: ingress === INGRESS_ALL ? undefined : (ingress as 'proxy' | 'ext'),
           slim: true,
         }, signal)
         tail = resp.tail ?? tail
@@ -506,6 +519,35 @@ export default function LogsPage() {
           </SelectContent>
         </Select>
 
+        {/* 入口维度筛选：与首页/统计页的词榜分组**同一个值**，跳转时带着走 */}
+        <Select
+          value={ingress}
+          onValueChange={(v) => {
+            setIngress(v)
+            setPage(1)
+            // 落 URL query（可分享/可回退）——只做组件内 state 的话，
+            // 首页词条按入口分组、日志列表却不认这个参数，又回到「数字对不上」。
+            setSearchParams(
+              (prev) => {
+                const next = new URLSearchParams(prev)
+                if (v === INGRESS_ALL) next.delete('ingress')
+                else next.set('ingress', v)
+                return next
+              },
+              { replace: false },
+            )
+          }}
+        >
+          <SelectTrigger className="h-8 w-[132px] text-xs" data-testid="ingress-filter">
+            <SelectValue placeholder={t('logs.ingress.all')} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={INGRESS_ALL}>{t('logs.ingress.all')}</SelectItem>
+            <SelectItem value="proxy">{t('logs.ingress.proxy')}</SelectItem>
+            <SelectItem value="ext">{t('logs.ingress.ext')}</SelectItem>
+          </SelectContent>
+        </Select>
+
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -520,9 +562,18 @@ export default function LogsPage() {
               onClick={() => {
                 setSearchInput('')
                 setQ('')
-                if (searchParams.toString()) {
-                  setSearchParams({}, { replace: true })
-                }
+                // 只清「跳转带过来的搜索参数」（q/type/fulltext），**保留 ingress**：
+                // 这个按钮的语义是清搜索框，不是把入口筛选也一起重置。
+                setSearchParams(
+                  (prev) => {
+                    const next = new URLSearchParams(prev)
+                    next.delete('q')
+                    next.delete('type')
+                    next.delete('fulltext')
+                    return next
+                  },
+                  { replace: true },
+                )
               }}
               className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground/60 hover:text-foreground"
               title={t('common.reset')}
@@ -591,10 +642,11 @@ export default function LogsPage() {
         className="min-h-0 flex-1 overflow-auto rounded-xl border bg-card shadow-[var(--shadow-card)]"
       >
         <div className="min-w-[820px]">
-        {/* 表头（固定）：时间(两行 日期+时间) / 结果 / 上游 / 模型(宽列) / 处理摘要(脱敏/还原) / 状态 / 耗时 / 费用 */}
-        <div className="sticky top-0 z-10 grid grid-cols-[68px_92px_88px_minmax(180px,2fr)_minmax(130px,1fr)_54px_58px_64px] gap-2 border-b bg-card px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+        {/* 表头（固定）：时间(两行 日期+时间) / 结果 / 入口 / 上游 / 模型(宽列) / 处理摘要(脱敏/还原) / 状态 / 耗时 / 费用 */}
+        <div className="sticky top-0 z-10 grid grid-cols-[68px_92px_54px_88px_minmax(180px,2fr)_minmax(130px,1fr)_54px_58px_64px] gap-2 border-b bg-card px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
           <span>{t('logs.colTime')}</span>
           <span>{t('logs.colResult')}</span>
+          <span>{t('logs.colIngress')}</span>
           <span>{t('logs.colUpstream')}</span>
           <span>{t('logs.colModel')}</span>
           <span>{t('logs.colSummary')}</span>
@@ -611,7 +663,7 @@ export default function LogsPage() {
               <div
                 key={`${row._audit ? 'a' : 'e'}-${row.seq}-${vi.index}`}
                 className={cn(
-                  'absolute left-0 top-0 grid w-full grid-cols-[68px_92px_88px_minmax(180px,2fr)_minmax(130px,1fr)_54px_58px_64px] items-center gap-2 border-b px-3 text-[12px]',
+                  'absolute left-0 top-0 grid w-full grid-cols-[68px_92px_54px_88px_minmax(180px,2fr)_minmax(130px,1fr)_54px_58px_64px] items-center gap-2 border-b px-3 text-[12px]',
                   'transition-colors hover:bg-muted/40',
                   row._audit && 'bg-amber-500/5 hover:bg-amber-500/10',
                 )}
@@ -627,6 +679,14 @@ export default function LogsPage() {
                 <span className="flex items-center gap-1">
                   <EventTypeIcon type={row.type} className="h-3.5 w-3.5 shrink-0" />
                   <span className="text-[11px] font-medium">{t(EVENT_TYPE_META[row.type]?.labelKey ?? row.type)}</span>
+                </span>
+                {/* 入口：proxy=CLI 代理链路（老数据该列为空，按 proxy 解读）；ext=浏览器扩展。
+                    扩展事件的 host 是**页面域名**（chatgpt.com），与代理链路可能同值，
+                    所以「肉眼可辨」不成立 —— 必须显式标出来。 */}
+                <span className="truncate text-[10px] text-muted-foreground">
+                  {(row as { ingress?: string }).ingress === 'ext'
+                    ? t('logs.ingress.ext')
+                    : t('logs.ingress.proxy')}
                 </span>
                 {/* 上游：优先配置名 upstream，client_app（进程探测）仅作缺失回退 */}
                 <span className="truncate text-[11px] text-muted-foreground" title={String(row.upstream || row.client_app || '')}>

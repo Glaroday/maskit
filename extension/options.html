@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<!--
+  Data Maskit Browser Bridge — 设置页
+  文案走本页内联的中英对照表（options.js 的 I18N）。
+  manifest 故意不写 default_locale：它必须与 _locales/ 同进同出，只声明字段不建目录会让
+  扩展加载直接失败。
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Data Maskit Browser Bridge</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --bd: #e3e6ea;
+      --fg: #1f2328;
+      --fg2: #6b7280;
+      --accent: #2563eb;
+      --ok: #17803d;
+      --warn: #b45309;
+      --bad: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+      background: var(--bg); color: var(--fg);
+    }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+    h1 { font-size: 18px; margin: 0; }
+    .sub { color: var(--fg2); font-size: 12px; margin: 0 0 18px; }
+    .card {
+      background: var(--card); border: 1px solid var(--bd); border-radius: 10px;
+      padding: 16px 18px; margin-bottom: 14px;
+    }
+    .card h2 { font-size: 14px; margin: 0 0 4px; }
+    .card .hint { color: var(--fg2); font-size: 12px; margin: 0 0 12px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    label.chk { display: flex; gap: 8px; align-items: center; cursor: pointer; }
+    input[type="text"], input[type="password"] {
+      flex: 1 1 260px; min-width: 200px; padding: 7px 10px;
+      border: 1px solid var(--bd); border-radius: 7px; background: #fff; color: var(--fg);
+      font: inherit;
+    }
+    input:focus { outline: 2px solid rgba(37, 99, 235, .25); border-color: var(--accent); }
+    button {
+      padding: 7px 13px; border: 1px solid var(--bd); border-radius: 7px;
+      background: #fff; color: var(--fg); font: inherit; cursor: pointer;
+    }
+    button:hover { border-color: #c8ccd2; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.primary:hover { background: #1d4ed8; }
+    button.link { border: none; background: none; color: var(--accent); padding: 2px 4px; }
+    button.link.danger { color: var(--bad); }
+    ul.sites { list-style: none; margin: 0 0 12px; padding: 0; }
+    ul.sites li {
+      display: flex; align-items: center; gap: 10px; padding: 7px 0;
+      border-bottom: 1px dashed var(--bd);
+    }
+    ul.sites li:last-child { border-bottom: none; }
+    .domain { font-family: ui-monospace, Consolas, monospace; }
+    .tag {
+      font-size: 11px; padding: 1px 7px; border-radius: 999px;
+      border: 1px solid var(--bd); color: var(--fg2); white-space: nowrap;
+    }
+    .tag.warn { color: var(--warn); border-color: #f3d9a4; background: #fdf6e7; }
+    .tag.static { color: var(--ok); border-color: #bfe3cb; background: #eefaf1; }
+    .spacer { flex: 1; }
+    .preset { border-top: 1px dashed var(--bd); padding-top: 12px; margin-bottom: 14px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      padding: 4px 10px; font-size: 12px; border-radius: 999px;
+      border: 1px solid var(--bd); background: #fff; color: var(--fg); cursor: pointer;
+    }
+    .chip:hover { border-color: var(--accent); color: var(--accent); }
+    .chip .dot { color: var(--warn); margin-left: 4px; }
+    .msg { font-size: 12px; margin-top: 10px; min-height: 18px; }
+    .msg.ok { color: var(--ok); }
+    .msg.bad { color: var(--bad); }
+    .msg.warn { color: var(--warn); }
+    ul.notes { margin: 0; padding-left: 18px; color: var(--fg2); font-size: 12px; }
+    ul.notes li { margin: 3px 0; }
+    code { background: #f0f2f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    .kv { font-size: 12px; color: var(--fg2); margin-top: 8px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 data-i18n="title">Data Maskit Browser Bridge</h1>
+    <div class="row">
+      <button id="langBtn" class="link" type="button">English</button>
+    </div>
+  </header>
+  <p class="sub" data-i18n="subtitle"></p>
+
+  <section class="card">
+    <h2 data-i18n="secEngine"></h2>
+    <p class="hint" data-i18n="engineHint"></p>
+    <div class="row">
+      <input id="panelUrl" type="text" spellcheck="false" data-i18n-ph="panelUrlPh" />
+      <button id="testBtn" type="button" data-i18n="testBtn"></button>
+    </div>
+    <div id="testMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2 data-i18n="secToken"></h2>
+    <p class="hint" data-i18n="tokenHint"></p>
+    <div class="row">
+      <input id="token" type="password" spellcheck="false" autocomplete="off" data-i18n-ph="tokenPh" />
+      <button id="tokenToggle" type="button" data-i18n="showBtn"></button>
+      <button id="openPanelBtn" type="button" data-i18n="openPanelBtn"></button>
+    </div>
+    <div id="tokenMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2 data-i18n="secEnabled"></h2>
+    <label class="chk">
+      <input id="enabled" type="checkbox" />
+      <span data-i18n="enabledLabel"></span>
+    </label>
+    <div id="enabledMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2 data-i18n="secSites"></h2>
+    <p class="hint" data-i18n="sitesHint"></p>
+    <ul class="sites" id="siteList"></ul>
+
+    <div class="preset">
+      <p class="hint" data-i18n="presetHint"></p>
+      <div class="chips" id="presetList"></div>
+      <div class="row" style="margin-top:10px">
+        <button id="addAllPresetsBtn" type="button" data-i18n="addAllPresets"></button>
+      </div>
+    </div>
+
+    <div class="row">
+      <input id="newDomain" type="text" spellcheck="false" data-i18n-ph="domainPh" />
+      <button id="addBtn" type="button" class="primary" data-i18n="addBtn"></button>
+    </div>
+    <div id="siteMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2 data-i18n="secNotes"></h2>
+    <ul class="notes" id="notes"></ul>
+    <div class="kv" id="quota"></div>
+  </section>
+
+  <div class="row" style="justify-content:flex-end">
+    <button id="saveBtn" type="button" class="primary" data-i18n="saveBtn"></button>
+  </div>
+  <div id="saveMsg" class="msg"></div>
+</div>
+<script src="shared.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

@@ -139,6 +139,9 @@ export function ShareCard() {
             <canvas ref={canvasRef} className="block w-full" />
           </div>
 
+          {/* 口径标注：卡上主数字与标签分布只含代理链路，与首页口径不同，必须写出来 */}
+          <p className="text-xs text-muted-foreground">{t('stats.shareScopeProxyOnly')}</p>
+
           <div className="flex flex-wrap gap-2">
             <Button size="sm" className="gap-1.5" onClick={download}>
               <Download className="h-3.5 w-3.5" /> {t('share.saveImg')}

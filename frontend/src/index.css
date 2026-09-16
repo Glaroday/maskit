@@ -182,3 +182,62 @@
   }
 }
 
+/* 自定义背景图模式：侧边栏与主内容区域卡片共享半透明与毛玻璃磨砂质感，文字保持清晰 */
+.has-custom-bg aside,
+.has-custom-bg main .bg-card,
+.has-custom-bg main [data-card] {
+  background-color: hsl(var(--card) / var(--card-opacity, 0.45));
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+/* 顶栏磨砂与透明度联动：对齐整体视觉通透感 */
+.has-custom-bg header {
+  background-color: hsl(var(--background) / max(var(--card-opacity, 0.8), 0.72));
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+/* 浮层与下拉菜单微磨砂：在半透明卡片之上展现优雅层级 */
+.has-custom-bg [data-radix-popper-content-wrapper] [role="listbox"],
+.has-custom-bg .bg-popover {
+  background-color: hsl(var(--popover) / 0.95);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+/* 粘性表头（如 Logs 页）防穿透：提高表头不透明度，防止滚动内容在表头底层产生重影干扰 */
+.has-custom-bg main .sticky.bg-card,
+.has-custom-bg main .sticky > .bg-card,
+.has-custom-bg main [data-card] .sticky {
+  background-color: hsl(var(--card) / max(var(--card-opacity, 0.8), 0.94));
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+/* 浅色模式质感增强：增加内高光与边框对比度，防止在亮色壁纸上边缘失真 */
+:root:not([data-theme='dark']) .has-custom-bg aside,
+:root:not([data-theme='dark']) .has-custom-bg header,
+:root:not([data-theme='dark']) .has-custom-bg main .bg-card,
+:root:not([data-theme='dark']) .has-custom-bg main [data-card] {
+  border-color: hsl(var(--border) / 0.85);
+}
+
+:root:not([data-theme='dark']) .has-custom-bg main .bg-card,
+:root:not([data-theme='dark']) .has-custom-bg main [data-card] {
+  box-shadow: 0 4px 16px -2px rgb(15 23 42 / 0.08), inset 0 1px 0 0 rgb(255 255 255 / 0.9);
+}
+
+/* 深色模式质感增强：微调边框微光与阴影深度 */
+[data-theme='dark'] .has-custom-bg aside,
+[data-theme='dark'] .has-custom-bg header,
+[data-theme='dark'] .has-custom-bg main .bg-card,
+[data-theme='dark'] .has-custom-bg main [data-card] {
+  border-color: hsl(var(--border) / 0.65);
+}
+
+[data-theme='dark'] .has-custom-bg main .bg-card,
+[data-theme='dark'] .has-custom-bg main [data-card] {
+  box-shadow: 0 8px 24px -8px rgb(0 0 0 / 0.5), inset 0 1px 0 0 rgb(255 255 255 / 0.06);
+}
+

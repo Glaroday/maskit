@@ -150,6 +150,22 @@ print(response.choices[0].message.content)
 4. **脱敏路径**：默认已预置主流路径（如 `/v1/chat/completions` 等），直接按需勾选即可；
 5. 保存后，外部工具的 Base URL 填 `http://127.0.0.1:18709/v1` 即可正常使用！
 
+### 6. 浏览器扩展（ChatGPT / Claude 网页版）
+
+网页版 AI 没有 Base URL 可配，所以走扩展：`extension/` 把页面发出的 LLM 请求送进本地引擎打码，回包按占位符流式还原。
+
+1. Chrome / Edge 打开 `chrome://extensions` → 打开「开发者模式」→「加载已解压的扩展程序」→ 选仓库里的 `extension/` 目录；
+2. 面板「设置 → 浏览器扩展」打开**启用浏览器扩展链路**，复制生成的**访问令牌**；
+3. 打开扩展的「设置」页，填引擎地址（默认 `http://127.0.0.1:5801`）与令牌，并把 `chatgpt.com` / `claude.ai` 勾上（自定义站点可在同一页添加）。
+
+**排查提示（很重要）**
+
+- **扩展事件在「事件页」，不在「运行日志」**。「运行日志」是 mitmproxy 子进程的 stdout 通道，扩展端点不经它；反过来 mask 失败的告警行进的是「运行日志」。两边都看才算看全。
+- 老版本或想快速筛扩展流量：在事件页搜索框搜 **`/ext/`**（`path` 是结构化列，`/ext/mask` 与 `/ext/restore` 是固定值，一定筛得到）。
+- 事件页的「入口」筛选（全部 / 代理链路 / 浏览器扩展）与首页词条点击跳转共用同一口径，词条的 `×N` 与点进去的日志条数一致。
+- **未脱敏状态必须能看出来**：引擎没启动 → popup 黄「已直通」；令牌失效 → popup 红「token 失效」；面板关了开关 → popup 红「扩展已关闭」。**这三种情况下请求会以原文发往上游**——扩展不会替你断网（这是刻意的默认，见 `SECURITY.md`）。
+- 分享战绩卡**只统计代理链路**（卡面已标注口径），所以卡上的数字与首页不同，这是预期。
+
 ---
 
 ## 🚀 下载与部署
@@ -260,6 +276,19 @@ python engine/panel.py
 # 3. 前端界面二次开发（Vite 热重载，推荐）
 cd frontend && npm run dev
 ```
+
+**端到端冒烟（可选，推荐改扩展/桥接代码后必跑）**
+
+`tests/e2e_ext_bridge.py` 用**真 Chrome + 真扩展 + 本地 mock 站点 + 真引擎**跑 12 条链路断言（打码出网、SSE 劈 chunk 还原、multipart 守卫、默认桶直通、SW 回收后签发表存活等）。**不进 CI**（需要真浏览器）。
+
+前提：`pip install playwright && playwright install chromium`（用装了引擎依赖的那个解释器），以及**图形会话**——扩展只能在有头 Chromium 里加载，`headless=True` 走的是 headless_shell，不支持扩展。
+
+```bash
+python tests/e2e_ext_bridge.py             # 全跑
+python tests/e2e_ext_bridge.py -k multipart -v
+```
+
+> 为什么单测全绿还可能要跑它：桥接链路的失败默认是「静默直通」——页面看起来完全正常，只是**没打码**。真浏览器是唯一能验证这条链路的地方。
 
 ---
 

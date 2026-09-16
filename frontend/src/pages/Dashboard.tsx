@@ -45,6 +45,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { cn, formatCompactNumber, formatTokensShort, formatBytes, formatPercent } from '@/lib/utils'
 import { CRED_LABELS, maskWord } from '@/lib/sensitive-word'
+import { groupWordsByIngress, ingressQuery } from '@/lib/ingress-groups'
 import { toast } from '@/lib/toast'
 import { useI18n } from '@/lib/i18n'
 import { isTauri } from '@/lib/shield-fetch'
@@ -301,7 +302,7 @@ export default function Dashboard() {
       {/* ===== 大状态横幅 ===== */}
       <div
         className={cn(
-          'flex flex-wrap items-center gap-4 rounded-2xl border p-5 transition-all duration-300',
+          'flex flex-wrap items-center gap-4 rounded-2xl border p-5 transition-all duration-300 backdrop-blur-md',
           isStarting || isStopping
             ? 'border-amber-500/30 bg-gradient-to-br from-amber-500/10 to-amber-500/5'
             : running && filterOn
@@ -411,7 +412,7 @@ export default function Dashboard() {
 
       {/* 向导横幅 */}
       {status?.wizard_recommended && (
-        <div className="flex items-center gap-3 rounded-xl border bg-gradient-to-r from-primary/10 to-transparent p-4">
+        <div className="flex items-center gap-3 rounded-xl border bg-gradient-to-r from-primary/10 to-transparent p-4 backdrop-blur-md">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/15 font-bold text-primary">1</div>
           <div className="min-w-0 flex-1 text-sm">
             <div className="font-semibold">{t('dash.wizardTitle')}</div>
@@ -946,32 +947,57 @@ export default function Dashboard() {
             </div>
           </DialogHeader>
           <div className="space-y-2">
-            {(stats?.top_words ?? []).slice(0, 20).map((w) => {
-              const cred = CRED_LABELS.has(w.label)
-              const display = cred || !maskedPlain ? maskWord(w.word, cred) : w.word
-              const searchTerm = cred ? w.label : (w.word.startsWith('<') ? w.label : w.word)
-              return (
-                <div
-                  key={`${w.label}:${w.word}`}
-                  onClick={() => {
-                    setMaskedOpen(false)
-                    navigate(`/logs?q=${encodeURIComponent(searchTerm)}&fulltext=1`)
-                  }}
-                  className="group flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm transition-colors hover:border-primary/40 hover:bg-muted/60"
-                  title={t('dash.clickToFilterLogs')}
-                >
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{w.label}</span>
-                    <span className="truncate font-mono text-xs" title={display}>{display}</span>
-                    {cred && <LockKeyhole className="h-3 w-3 shrink-0 text-muted-foreground" aria-label={t('stats.credHint')} />}
+            {/* 按入口分组同屏（代理链路 / 浏览器扩展），各组各取 Top N。
+                组头计数让「×N 与日志条数一致」可核对，跳转恒带 &ingress=。 */}
+            {groupWordsByIngress(stats, 20)
+              .filter((g) => g.ingress === 'proxy' || !!cfg?.ext_bridge_enabled)
+              .map((g) => (
+                <div key={g.ingress} className="space-y-2">
+                  <div className="flex items-center gap-2 pt-1 text-[11px] font-semibold text-muted-foreground">
+                    <span>
+                      {g.ingress === 'ext'
+                        ? tf('logs.ingress.groupExt', { n: g.total.toLocaleString() })
+                        : tf('logs.ingress.groupProxy', { n: g.total.toLocaleString() })}
+                    </span>
+                    <span className="h-px flex-1 bg-border" />
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{w.count.toLocaleString()}</span>
-                    <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />
-                  </div>
+                  {/* ext 组为空但开关是开的 → 恰是「扩展装了但一条都没走通」的信号，
+                      保留组头并提示，不静默藏掉 */}
+                  {g.items.length === 0 && (
+                    <p className="py-3 text-center text-xs text-muted-foreground">
+                      {t('logs.ingress.emptyGroup')}
+                    </p>
+                  )}
+                  {g.items.map((w) => {
+                    const cred = CRED_LABELS.has(w.label)
+                    const display = cred || !maskedPlain ? maskWord(w.word, cred) : w.word
+                    const searchTerm = cred ? w.label : (w.word.startsWith('<') ? w.label : w.word)
+                    return (
+                      <div
+                        key={`${g.ingress}:${w.label}:${w.word}`}
+                        onClick={() => {
+                          setMaskedOpen(false)
+                          // 跳转必须带 ingress：否则词条按入口分组、日志列表却不认这个参数，
+                          // 又回到「数字对不上」
+                          navigate(`/logs?q=${encodeURIComponent(searchTerm)}&fulltext=1${ingressQuery(g.ingress)}`)
+                        }}
+                        className="group flex cursor-pointer items-center justify-between gap-3 rounded-lg border bg-muted/30 px-3 py-2 text-sm transition-colors hover:border-primary/40 hover:bg-muted/60"
+                        title={t('dash.clickToFilterLogs')}
+                      >
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{w.label}</span>
+                          <span className="truncate font-mono text-xs" title={display}>{display}</span>
+                          {cred && <LockKeyhole className="h-3 w-3 shrink-0 text-muted-foreground" aria-label={t('stats.credHint')} />}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="shrink-0 tabular-nums text-xs text-muted-foreground">×{w.count.toLocaleString()}</span>
+                          <ArrowRight className="h-3.5 w-3.5 text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
-              )
-            })}
+              ))}
             {(stats?.top_words ?? []).length === 0 && (
               <p className="py-8 text-center text-sm text-muted-foreground">{t('dash.noMaskedToday')}</p>
             )}

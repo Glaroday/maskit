@@ -16,6 +16,12 @@ export interface LogsParams {
   q?: string
   /** 全文搜索（扫 payload，性能重） */
   fulltext?: boolean
+  /**
+   * 入口维度过滤：`proxy`（CLI 代理链路）/ `ext`（浏览器扩展链路）。
+   * 与词榜分组**同口径**——首页词条跳转必须带上它，否则「词条 ×N」与
+   * 「点进去的日志条数」对不上，用户会判定统计坏了。
+   */
+  ingress?: 'proxy' | 'ext'
   /** 列表轻量模式（默认 true，明文只走详情回源） */
   slim?: boolean
 }
@@ -28,6 +34,7 @@ export function getLogs(params: LogsParams, signal?: AbortSignal): Promise<LogsR
   if (params.sensitive) search.set('sensitive', '1')
   if (params.q) search.set('q', params.q)
   if (params.fulltext) search.set('fulltext', '1')
+  if (params.ingress) search.set('ingress', params.ingress)
   if (params.slim !== false) search.set('slim', '1')
   const qs = search.toString()
   return shieldFetch<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`, { signal })

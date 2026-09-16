@@ -5,6 +5,16 @@
 ## [Unreleased]
 
 ### 新增 / Added
+- 扩展设置页新增「推荐站点」：18 个国内外常见 AI 站点一键授权添加（含 Gemini / Grok / Perplexity / Copilot / Mistral / Poe、DeepSeek / 豆包 / 通义千问 / Qwen / Kimi / 元宝 / 智谱 / 文心一言 / 讯飞星火 / 小米 MiMo），路径未实测的站点统一打「未实测」标记。
+  *New "Recommended sites" list in the extension options page: 18 common AI sites added with a single grant (Gemini, Grok, Perplexity, Copilot, Mistral, Poe, DeepSeek, Doubao, Tongyi Qianwen, Qwen, Kimi, Yuanbao, ChatGLM, ERNIE Bot, iFlytek Spark, Xiaomi MiMo). Sites whose request paths are unverified are marked as such.*
+- 浏览器扩展桥接（`extension/`，Chrome/Edge MV3）：把网页版 AI（ChatGPT / Claude）发出的请求接入本地引擎打码、回包流式还原。100% 本地运算，零外传。
+  *Browser extension bridge (`extension/`, Chrome/Edge MV3): routes web-AI (ChatGPT / Claude) requests through the local engine for masking and restores responses as they stream. 100% local, zero egress.*
+- 引擎新增 `/api/ext/ping|mask|restore|rotate-token` 四个端点与 `ext_bridge_enabled` / `ext_token` / `ext_block_when_engine_down` / `ext_record_events` 四个配置项。
+  *New engine endpoints `/api/ext/{ping,mask,restore,rotate-token}` and config keys `ext_bridge_enabled` / `ext_token` / `ext_block_when_engine_down` / `ext_record_events`.*
+- 事件与统计新增「入口」维度（代理链路 / 浏览器扩展）：事件页可筛选，词榜与首页词明细按入口分组同屏，分享战绩卡改为仅统计代理链路并在卡面标注口径。
+  *New "ingress" dimension (proxy link vs browser extension) in events and stats: filterable in the log page, word rankings grouped side by side, and the share card now covers only the proxy link with its scope stated on the card.*
+- 设置页新增「浏览器扩展」区块（链路开关、访问令牌、旋转确认），高级设置新增「记录浏览器扩展流量」开关（默认开）。
+  *New "Browser extension" settings section (toggle, token, rotation confirmation) and a "Record browser-extension traffic" switch under advanced settings (on by default).*
 - 内网 IPv6 规则（`IPV6_PRIVATE`，默认关）：fe80:: 链路本地与 fc00::/7 ULA，语义校验排除公网/文档段与 MAC 地址。
   *Private IPv6 rule (`IPV6_PRIVATE`, default off): fe80:: link-local and fc00::/7 ULA, with semantic validation excluding public/doc ranges and MAC addresses.*
 - USCC 校验位验证（GB 32100-2015 MOD31）：开启规则后误伤率压至 1/31。
@@ -13,14 +23,38 @@
   *README deployment docs: single-port mode (5802 path-prefix routing) section.*
 - 仪表盘新增「出口代理已启用但无客户端勾选」状态横幅与「MASKIT_PANEL_TOKEN 被忽略」提醒（stderr 双写 + 面板可见）。
   *Dashboard banners for "egress enabled but unused" and "MASKIT_PANEL_TOKEN rejected" (now also double-written to stderr).*
+- 浏览器扩展静态门禁（`scripts/check-extension.mjs`）并入全量门禁（13 → 14 项）：校验扩展 i18n 双语键集、脚本加载顺序、manifest 与静态站点清单一致性、驼峰 `runAt`、本机外请求等红线；新增 JS 引用的 DOM id 必须存在于对应 HTML（拦住「按钮点了没反应」那一类）。
+  *New browser-extension static gate (`scripts/check-extension.mjs`) added to the full gate set (13 → 14 items): checks i18n key parity, script load order, manifest/site-list consistency, camelCase `runAt`, and off-machine request red lines; now also asserts every DOM id referenced by JS exists in the matching HTML (catches the "buttons do nothing" class).*
 
 ### 修复 / Bug Fixes
+- 扩展设置页与后台的通信整体失灵（「测试连接」必失败、会话占用恒空白、添加站点拿不到重注册确认）：后台用 `!sender.tab` 判断"是不是扩展自己的页面"，而以标签页打开的设置页 `sender.tab` 是有值的，导致管理消息全部超时。已改为按 `sender.url` 的 scheme 判定，并加静态门禁拦住同类写法。
+  *Extension options page could not talk to its background worker at all ("Test connection" always failed, session usage stayed blank, added sites reported no confirmation) because the background judged "extension's own page" by `!sender.tab`, while an options page opened as a tab does have `sender.tab`. Now judged by the `sender.url` scheme, with a static gate to block the same mistake.*
+- 扩展添加站点：后台没回应时不再报「已保存」成功，改为黄标提示需重新加载（写进存储 ≠ 脚本真的注入了）。
+  *Adding a site no longer reports success when the background does not respond; it warns that a reload is needed (persisted ≠ actually injected).*
+- 扩展弹窗的「设置 / 刷新」按钮点了没反应：`popup.html` 漏写 `id="recentTitle"`，渲染时抛异常把初始化掐断在绑定按钮之前；已补齐 id，并把事件绑定提到取数之前，渲染失败不再连坐按钮。
+  *Extension popup's Settings/Refresh buttons did nothing: `popup.html` was missing `id="recentTitle"`, so a render-time error aborted initialisation before the click handlers were bound. The id is restored and binding now happens before data loading, so a render failure can no longer take the buttons down.*
 - 透传兜底层：https 出口代理按 TLS 编排 CONNECT（原明文直连必握手失败）；上游空闲超时 900s→300s，mid-stream 失败不再叠加错误状态行；同名多值请求头合并转发不再丢值；恢复透传 accept-encoding（gzip/deflate 流式解压后再还原）。
   *Passthrough: https egress proxies now do TLS-then-CONNECT (was plaintext and always failed); upstream idle timeout 900s→300s with no status-line corruption on mid-stream failures; duplicate request headers joined instead of dropped; Accept-Encoding passthrough restored (gzip/deflate stream-decompressed before restore).*
+- 扩展桥接：令牌失效或面板关开关时不再每个流式分片都重试（原先一条回答就把引擎 800 行运行日志冲干净），改为退避 + 每 5 秒低速探测，改对令牌后自动秒级恢复；popup 红标文案区分「token 失效」与「引擎未运行」。
+  *Extension bridge: no longer retries on every streaming chunk when the token is invalid or the panel switch is off (a single answer used to wipe the engine's 800-line runtime log). Now backed off with a 5s low-rate probe that self-heals seconds after the token is fixed; the popup red status distinguishes "token invalid" from "engine not running".*
+- 诊断包泄漏明文敏感词：词榜的词面在「统计记录明文」开启时是明文，原先原样进包（诊断包是发给开发者的），现只脱敏词面、保留类别与计数。
+  *Diagnostics bundle leaked plaintext sensitive words: word faces are plaintext when "record plaintext words" is on, and were shipped as-is in a bundle meant to be sent to developers. Now only the word face is scrubbed; labels and counts are kept.*
+- 重复的浏览器扩展设置页「在本机面板旋转令牌」按钮永远失败（该端点需要面板令牌，扩展只有扩展令牌），改为打开面板设置页。
+  *The browser-extension options page's "rotate token in the panel" button could never succeed (that endpoint requires the panel token while the extension only holds the extension token) — it now opens the panel settings page instead.*
+  - 三处测试结果不确定（两处读本机真实事件库、一处并发用例靠线程调度赌胜负），跑过真实代理或负载一变就随机红；已分别改为显式隔离与确定性握手复现。
+    *Three non-deterministic tests (two read the real local event store, one raced on thread scheduling) failed randomly once a real proxy run existed or load changed; now explicitly isolated, with the race reproduced deterministically via an explicit handshake.*
 - /v1 通配卡片不再同时展示两个相同的 Base URL 复制项。
   */v1 wildcard cards no longer show two identical Base URL copy entries.*
 
 ### 优化 / Changed
+- 全局 UI 视觉重构：新增深浅自适应「天境流光」旗舰默认壁纸与通透毛玻璃参数，侧边栏、顶栏、弹窗遮罩与浮层实现全景联动，消除厚重视觉割裂。
+  *Global UI visual overhaul: added an adaptive "Ambient Flow" flagship default wallpaper and frosted-glass preset, unifying sidebar, header, dialog overlay, and popovers with consistent translucency.*
+- 扩展内部重复的常量与函数（站点清单、路径未适配清单、域名校验与 match pattern）收敛为单一来源 `extension/shared.js`，消除三份实现互相漂移的隐患。
+  *Duplicated constants and helpers inside the extension (site list, unsupported-paths list, domain validation and match pattern) are consolidated into a single `extension/shared.js`, removing the risk of three implementations drifting apart.*
+- 扩展端点不再放行 `Origin: null`（无来源上下文没有合法调用方）；事件「入口」维度的取值改为白名单归一化（非法值回落 `proxy`，不再产生筛不出来的隐形分组）。
+  *Extension endpoints no longer allow `Origin: null` (no-source contexts have no legitimate caller); the events "ingress" dimension is now allowlist-normalized (unknown values fall back to `proxy` instead of forming an invisible, unfilterable bucket).*
+- 运行日志尾部通道补上 `ingress` 与 `client_app` 字段（原先该视图看不到入口、也看不到是谁发的）。
+  *Tail-channel log records now carry `ingress` and `client_app` (previously the tail view showed neither the ingress nor the caller).*
 - 「出口代理已启用但没人勾选」不再在每次保存配置时弹 toast（改为仪表盘常驻状态横幅）。
   *"Egress enabled but unused" no longer toasts on every config save (persistent dashboard banner instead).*
 

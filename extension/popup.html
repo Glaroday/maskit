@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<!--
+  Data Maskit Browser Bridge — 弹出面板
+  只展示**元数据**：状态、计数、path、action、status。
+  永不展示 body / 占位符 / 原文 / 响应文本。
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Data Maskit</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --bd: #e3e6ea;
+      --fg: #1f2328;
+      --fg2: #6b7280;
+      --ok: #17803d;
+      --warn: #b45309;
+      --bad: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      width: 390px; margin: 0; padding: 12px;
+      font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+      background: var(--bg); color: var(--fg);
+    }
+    .head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fg2); flex: none; }
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.bad { background: var(--bad); }
+    .status-text { font-weight: 600; flex: 1; }
+    .status-detail { color: var(--fg2); font-size: 11px; }
+    .box {
+      border: 1px solid var(--bd); border-radius: 8px;
+      padding: 9px 10px; margin-bottom: 9px;
+    }
+    .kv { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+    .kv + .kv { margin-top: 4px; }
+    .kv .k { color: var(--fg2); }
+    .kv .v { font-family: ui-monospace, Consolas, monospace; }
+    h3 {
+      font-size: 12px; margin: 0 0 7px; color: var(--fg2);
+      display: flex; align-items: center; gap: 6px;
+    }
+    h3 .spacer { flex: 1; }
+    h3 button { font-size: 11px; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th {
+      text-align: left; color: var(--fg2); font-weight: 500;
+      border-bottom: 1px solid var(--bd); padding: 3px 4px; white-space: nowrap;
+    }
+    td { padding: 3px 4px; border-bottom: 1px dashed #eef0f3; }
+    td.mono { font-family: ui-monospace, Consolas, monospace; }
+    .empty { color: var(--fg2); font-size: 11px; padding: 4px 0; }
+    .tag { font-size: 10px; padding: 0 5px; border-radius: 999px; border: 1px solid var(--bd); color: var(--fg2); }
+    .tag.ok { color: var(--ok); border-color: #bfe3cb; background: #eefaf1; }
+    .tag.warn { color: var(--warn); border-color: #f3d9a4; background: #fdf6e7; }
+    .tag.bad { color: var(--bad); border-color: #f2c4c4; background: #fdeeee; }
+    .scroll { max-height: 176px; overflow: auto; }
+    ul.paths { margin: 0; padding-left: 16px; font-size: 11px; color: var(--fg2); }
+    ul.paths li { font-family: ui-monospace, Consolas, monospace; }
+    footer { display: flex; gap: 8px; margin-top: 10px; }
+    button {
+      flex: 1; padding: 6px 10px; border: 1px solid var(--bd); border-radius: 7px;
+      background: #fff; color: var(--fg); font: inherit; cursor: pointer;
+    }
+    button:hover { border-color: #c8ccd2; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.primary:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <span id="dot" class="dot"></span>
+    <span id="statusText" class="status-text">…</span>
+    <span id="statusDetail" class="status-detail"></span>
+  </div>
+
+  <div class="box">
+    <div class="kv"><span class="k" data-i18n="kPage"></span><span class="v" id="pageHost">—</span></div>
+    <div class="kv"><span class="k" data-i18n="kActive"></span><span class="v" id="pageActive">—</span></div>
+    <div class="kv"><span class="k" data-i18n="kToday"></span><span class="v" id="today">—</span></div>
+    <div class="kv"><span class="k" data-i18n="kEngine"></span><span class="v" id="engineStats">—</span></div>
+  </div>
+
+  <div class="box">
+    <h3>
+      <span id="recentTitle" data-i18n="recentTitle"></span>
+      <span class="spacer"></span>
+      <button id="scopeBtn" type="button" style="flex:none"></button>
+    </h3>
+    <div class="scroll" id="recentWrap"></div>
+  </div>
+
+  <div class="box" id="unmatchedBox" hidden>
+    <h3><span data-i18n="unmatchedTitle"></span></h3>
+    <ul class="paths" id="unmatchedList"></ul>
+  </div>
+
+  <footer>
+    <button id="refreshBtn" type="button" data-i18n="refreshBtn"></button>
+    <button id="optionsBtn" type="button" class="primary" data-i18n="optionsBtn"></button>
+  </footer>
+
+  <script src="shared.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

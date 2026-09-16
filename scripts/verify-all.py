@@ -44,6 +44,13 @@ GATES = [
     {"group": "frontend", "name": "i18n dictionary parity", "cwd": "frontend", "argv": ["{node}", "../scripts/check-i18n.mjs"]},
     {"group": "frontend", "name": ".env import parser cases", "cwd": "frontend",
      "argv": ["{node}", "--experimental-strip-types", "../scripts/check-env-import.mjs"]},
+    # 浏览器扩展的静态门禁。放在 frontend 组（ci.yml 的 frontend job）只是因为
+    # 那个 job 已经把 node 装好了；扩展与前端是两套东西，别被分组名误导。
+    # 为什么必须有：extension/ 原先**没有任何自动化门禁**——python 单测碰不到它，
+    # e2e 要真浏览器且不进 verify-all。而它恰恰最脆（i18n 键拼错＝页面空文案、
+    # HTML 忘了引 shared.js＝整页 ReferenceError、run_at 写成蛇形＝动态注册静默失效）。
+    {"group": "frontend", "name": "Browser extension static checks", "cwd": "frontend",
+     "argv": ["{node}", "../scripts/check-extension.mjs"]},
     # ---- rust（ci.yml: rust job，工作目录 src-tauri/）----
     {"group": "rust", "name": "Cargo check", "cwd": "src-tauri", "argv": ["{cargo}", "check"]},
     {"group": "rust", "name": "Cargo test", "cwd": "src-tauri", "argv": ["{cargo}", "test", "--lib"]},

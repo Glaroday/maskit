@@ -74,6 +74,7 @@ import { AboutUpdateCard } from '@/components/settings/AboutUpdateCard'
 import { EnvImportDialog } from '@/components/settings/EnvImportDialog'
 
 import { BackgroundCard } from '@/components/settings/BackgroundCard'
+import { ExtBridgeCard } from '@/components/settings/ExtBridgeCard'
 
 // 内置规则分组（将 19 项规则按场景归类，降低视觉负荷与误伤风险）
 const BUILTIN_RULE_GROUPS: { key: string; labelKey: string; rules: string[] }[] = [
@@ -1805,6 +1806,10 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               <div className="space-y-2">
                 {([
                   ['record_plaintext_words', t('settings.sw.recordPlaintext'), t('settings.sw.recordPlaintextDesc')],
+                  // ext_record_events 放这一组而不是扩展卡片：落库发生在**引擎侧**，
+                  // 开关放引擎一处生效、用户不必重装扩展；它和 record_plaintext_words
+                  // 同属「落库/隐私」语义，放一起才不会出现「一个开关出现在两处」。
+                  ['ext_record_events', t('settings.sw.extRecordEvents'), t('settings.sw.extRecordEventsDesc')],
                   ['debug', t('settings.sw.debug'), t('settings.sw.debugDesc')],
                   ['start_minimized', t('settings.sw.startMinimized'), t('settings.sw.startMinimizedDesc')],
                 ] as [string, string, string][]).map(([k, label, desc]) => (
@@ -2342,6 +2347,9 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               )}
             </CardContent>
           </Card>
+
+          {/* 浏览器扩展链路（Browser Bridge） */}
+          <ExtBridgeCard cfg={cfg} toggle={toggle} saving={saving} />
 
           {/* 个性化背景 */}
           <BackgroundCard />

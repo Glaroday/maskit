@@ -83,3 +83,5 @@ Thumbs.db
 .pi-subagents/
 .codex/
 .workbuddy-ai/
+# 与 .workbuddy-ai 同族：AI 助手在本项目的本地记忆（memory/），属本机状态，不入公开仓库
+.workbuddy/

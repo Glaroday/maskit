@@ -119,6 +119,56 @@ class DiagnosticsPayloadTests(unittest.TestCase):
         for banned in ("dialog", "req_preview", "resp_preview", "original", "proxy_token"):
             self.assertNotIn(f'"{banned}"', blob, f"诊断包含禁用字段 {banned}")
 
+    def test_word_lists_are_scrubbed(self):
+        """词榜的词面必须脱敏。
+
+        **为什么单独立一条**：`test_no_secret_leaks` 读的是本机事件库的真实当日统计，
+        CI 上是空库 → 词榜为空 → 那条断言恒真，等于没测（"假绿"的经典形态，见模块
+        docstring 的血泪教训）。所以这里**自己造数据**：`record_plaintext_words` 默认
+        开启时 `today_stats()` 的词面就是明文敏感值，而诊断包是要**发给开发者**的。
+
+        顺带钉住"计数/标签保留"：脱敏不能把诊断价值一起抹掉。
+        """
+        plain_phone = "13812345678"
+        plain_email = "bob.smith@corp.example.com"
+        fake_stats = {
+            "masked_items": 3,
+            "by_label": {"PHONE": 2, "EMAIL": 1},
+            "top_words": [{"label": "PHONE", "word": plain_phone, "count": 2}],
+            "by_label_words": {
+                "PHONE": [{"word": plain_phone, "count": 2}],
+                "EMAIL": [{"word": plain_email, "count": 1}],
+            },
+            "words_by_ingress": {
+                "ext": {
+                    "top_words": [{"label": "EMAIL", "word": plain_email, "count": 1}],
+                    "by_label_words": {"EMAIL": [{"word": plain_email, "count": 1}]},
+                },
+                "proxy": {"top_words": [], "by_label_words": {}},
+            },
+        }
+        dumps = Path(_TMP) / "crash-dumps"
+        with mock.patch.object(panel, "DATA_ROOT", Path(_TMP)), \
+                mock.patch.object(panel, "_listening_port_pids", return_value={}), \
+                mock.patch.object(panel, "today_stats", return_value=fake_stats):
+            payload = panel._diagnostics_payload()
+        stats = payload["stats_today"]
+        blob = json.dumps(stats, ensure_ascii=False)
+
+        # 正对照：造的数据确实进包了（否则下面的"没泄漏"是空断言）
+        self.assertEqual(stats["masked_items"], 3)
+        self.assertEqual(stats["by_label"], {"PHONE": 2, "EMAIL": 1})
+        # 词面必须没了（三条路径都要覆盖：top_words / by_label_words / words_by_ingress）
+        self.assertNotIn(plain_phone, blob, "诊断包泄漏明文手机号（top_words / by_label_words）")
+        self.assertNotIn(plain_email, blob, "诊断包泄漏明文邮箱（含 words_by_ingress 分支）")
+        # 诊断价值保留：标签与计数不能一起被抹掉
+        self.assertEqual(stats["top_words"][0]["count"], 2)
+        self.assertEqual(stats["top_words"][0]["label"], "PHONE")
+        # 不能就地改坏调用方的对象（同一份 dict 也可能被 /api/stats/today 复用）
+        self.assertEqual(fake_stats["top_words"][0]["word"], plain_phone,
+                         "脱敏污染了传入的统计对象（必须 deepcopy）")
+        _ = dumps  # 仅确保 fixture 目录仍由 setUp 建好，与本节无关
+
     def test_custom_words_reported_as_count_only(self):
         """词库是用户要保护的内容本身（公司名、项目代号），只能报数量。"""
         cfg = panel.default_config()

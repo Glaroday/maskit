@@ -9,10 +9,11 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useVisibility } from '@/lib/useVisibility'
-import { getStatsHistory, getTodayStats, getStatsModels, getPriceSyncStatus, type StatsHistoryPoint } from '@/api/settings'
+import { getStatsHistory, getTodayStats, getStatsModels, getPriceSyncStatus, getConfig, type StatsHistoryPoint } from '@/api/settings'
 import { BarChart3, TrendingUp, Coins, ShieldCheck, ShieldAlert, RotateCcw, Layers, Trophy, Tags, LockKeyhole } from 'lucide-react'
 import { cn, formatCompactNumber, formatTokensShort } from '@/lib/utils'
 import { CRED_LABELS, maskWord } from '@/lib/sensitive-word'
+import { groupWordsByIngress } from '@/lib/ingress-groups'
 import { useI18n } from '@/lib/i18n'
 import dayjs from 'dayjs'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -341,7 +342,7 @@ function ModelRanking({ hidden }: { hidden: boolean }) {
  * 关掉后这里显示的是打码形态，属预期，不做特殊提示以外的处理。
  */
 function Leaderboards({ days, granularity, hidden }: { days: number; granularity: Granularity; hidden: boolean }) {
-  const { t } = useI18n()
+  const { t, tf } = useI18n()
   // 排行榜的数据源是 daily_words（只有按天摘要，**没有小时表**），所以窗口只能是「天」：
   // 小时粒度下拿不到小时级词表，只能给「今日」，但必须如实标注。旧实现把小时选择
   // 直接拼成 '24d' / '72d' 发给后端，而后端只认 7d / 30d / 纯整数，`int('24d')` 抛
@@ -355,12 +356,55 @@ function Leaderboards({ days, granularity, hidden }: { days: number; granularity
   })
   const [showPlain, setShowPlain] = useState(false)
   const [viewWord, setViewWord] = useState<RankRow | null>(null)
+  // 只看扩展开关来决定「空组是否整组不渲染」。走 react-query 的 ['config'] 缓存，
+  // 与 Dashboard/Settings 共用同一份，不会多打一次接口。
+  const { data: cfg } = useQuery({ queryKey: ['config'], queryFn: getConfig, enabled: !hidden })
 
   const words = (data?.top_words ?? []).slice(0, 10)
   const labels = Object.entries(data?.by_label ?? {})
     .map(([label, count]) => ({ label, count: Number(count) || 0 }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 10)
+
+  /**
+   * 敏感词排行榜**按入口分组同屏**（各组各取 Top 10）。
+   * 不做「默认只看代理」也不单开一栏：污染根因是量级不对称，分组就解决了；
+   * 单开一栏要维护两份口径必然漂移，而默认隐藏等于「我拦了但不告诉你拦了什么」。
+   * 分组后每组各自排名（rank 显式给出）、占比条也各自以组内 Top1 为分母。
+   *
+   * 空组规则：`ext_bridge_enabled=false` 时扩展组**整组不渲染**（功能没开）；
+   * 开关开着但该组为空 → 保留组头 + 「本周期无记录」，这恰是
+   * 「扩展装了但一条都没走通」的信号，不能静默藏掉。
+   */
+  const wordGroups = groupWordsByIngress(data, 10).filter(
+    (g) => g.ingress === 'proxy' || !!cfg?.ext_bridge_enabled,
+  )
+  const groupedWordRows: RankRow[] = wordGroups.flatMap((g) => {
+    const gMax = g.items[0]?.count ?? 0
+    return [
+      {
+        key: `hdr:${g.ingress}`,
+        name: '',
+        count: 0,
+        // 组头带计数：与首页一致，方便和日志页条数核对
+        _header: tf(g.ingress === 'ext' ? 'logs.ingress.groupExt' : 'logs.ingress.groupProxy', {
+          n: g.total.toLocaleString(),
+        }),
+      },
+      ...g.items.map((w, idx) => ({
+        key: `${g.ingress}:${w.label}:${w.word}`,
+        name: w.word,
+        tag: w.label,
+        count: w.count,
+        cred: CRED_LABELS.has(w.label),
+        rank: idx + 1,
+        barMax: gMax,
+      })),
+      ...(g.items.length === 0
+        ? [{ key: `note:${g.ingress}`, name: t('logs.ingress.emptyGroup'), count: 0, _note: true } as RankRow]
+        : []),
+    ]
+  })
 
   const wordMax = words[0]?.count ?? 0
   const labelMax = labels[0]?.count ?? 0
@@ -371,13 +415,7 @@ function Leaderboards({ days, granularity, hidden }: { days: number; granularity
         icon={Trophy}
         title={t('stats.wordRanking')}
         hint={`${t('stats.wordRankingHint')} · ${dayWindow}d`}
-        rows={words.map((w) => ({
-          key: `${w.label}:${w.word}`,
-          name: w.word,
-          tag: w.label,
-          count: w.count,
-          cred: CRED_LABELS.has(w.label),
-        }))}
+        rows={groupedWordRows}
         max={wordMax}
         color="#10b981"
         showPlain={showPlain}
@@ -430,6 +468,20 @@ interface RankRow {
   tag?: string
   count: number
   cred?: boolean
+  /**
+   * 分组组头行（不是数据行）：给「按入口分组同屏」用。
+   * 组头行的 name/count 无意义，渲染时整行换成一条分隔标题。
+   */
+  _header?: string
+  /**
+   * 显式名次。分组后每一组各自从 1 开始排名，不能再直接用数组下标
+   * （数组里还夹着组头行，下标会把组头也数进去）。
+   */
+  rank?: number
+  /** 该行占比条的分母（= 所在组的 Top1 值）。分组后不能共用全量 max */
+  barMax?: number
+  /** 「本周期无记录」这类说明行：渲染成一行淡色文字，不排名、不画条 */
+  _note?: boolean
 }
 
 /** 排行榜卡片：名次 + 词 + 占比条 + 次数。前三名用金银铜色区分，一眼看到重点。 */
@@ -477,6 +529,25 @@ function RankCard({
       ) : (
         <ol className="space-y-2">
           {rows.map((r, i) => {
+            // 组头行：分组同屏的分隔标题（「代理链路 N」/「浏览器扩展 M」）
+            if (r._header) {
+              return (
+                <li key={r.key} className="flex items-center gap-2 pt-1">
+                  <span className="shrink-0 text-[11px] font-semibold text-muted-foreground">{r._header}</span>
+                  <span className="h-px flex-1 bg-border" />
+                </li>
+              )
+            }
+            // 说明行（如「本周期无记录」）：不排名、不画占比条
+            if (r._note) {
+              return (
+                <li key={r.key} className="py-1 text-center text-xs text-muted-foreground">
+                  {r.name}
+                </li>
+              )
+            }
+            const rank = r.rank ?? i + 1
+            const barMax = r.barMax ?? max
             // 只有敏感词才需要打码；如果不是敏感词（如规则标签/类型分布），直接显示原名！
             const masked = onTogglePlain ? (r.cred || !showPlain) : false
             const display = masked ? maskWord(r.name, r.cred) : r.name
@@ -485,12 +556,12 @@ function RankCard({
                 <span
                   className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[11px] font-bold tabular-nums"
                   style={
-                    i < 3
-                      ? { background: `${medal[i]}22`, color: medal[i] }
+                    rank <= 3
+                      ? { background: `${medal[rank - 1]}22`, color: medal[rank - 1] }
                       : { background: 'hsl(var(--muted))', color: 'hsl(var(--muted-foreground))' }
                   }
                 >
-                  {i + 1}
+                  {rank}
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-1.5">
@@ -523,7 +594,7 @@ function RankCard({
                   <span className="mt-1 block h-1.5 w-full overflow-hidden rounded-full bg-muted">
                     <span
                       className="block h-full rounded-full transition-[width] duration-500"
-                      style={{ width: `${max > 0 ? Math.max(4, (r.count / max) * 100) : 0}%`, background: i < 3 ? medal[i] : color }}
+                      style={{ width: `${barMax > 0 ? Math.max(4, (r.count / barMax) * 100) : 0}%`, background: rank <= 3 ? medal[rank - 1] : color }}
                     />
                   </span>
                 </span>

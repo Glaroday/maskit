@@ -3046,6 +3046,115 @@ def _seed_known(text, sid):
             _touch_recent(token, recent[0])
 
 
+# ===================== 浏览器扩展桥接（Browser Bridge v1）专用入口 =====================
+# 这两个 helper 是 panel 的 /api/ext/mask 端点复用的入口，**不参与代理链路**。
+# 它们都必须由调用方（panel 侧）持 `_EXT_LOCK` 调用：本文件的历史前提是
+# "mitmproxy event loop 单线程同步执行"，`sessions` / `_RECENT_*` 都是无锁全局态，
+# panel 的 Flask 是 threaded，不加锁会让 `_prune_recent` 的 `list()` 快照构造期
+# 撞上并发插入 → RuntimeError。
+
+def _mask_event_items(sid, limit=30):
+    """构造与代理路径**同构**的 MASK 事件明细（items），供 panel 的 ext 端点落库。
+
+    字段结构与代理响应侧构造对齐（`tok/label/hash/length/preview` + 凭据类
+    `cred/digest` 或非凭据 `original` + 短词 `short`），这样 `_warmup_recent_from_db`
+    预热与前端明细弹窗对两条链路的行为一致（SPEC C11/T14）。
+
+    **唯一少一个字段：`roles`**（代理侧由 `role_texts` 反查「命中在第几个角色块」，
+    那个映射来自代理的请求解析过程，扩展链路拿不到）。前端对缺失的 `roles` 是
+    「不渲染归因角标」，不报错——所以这里是**有意的缺省，不是漏写**，别照抄代理侧
+    的构造列表去补（补不出来，只会拿到 `roles=None` 被静默跳过）。
+
+    **假定会话已由调用方显式建立**（端点先 `_new_session`），不做缺会话兜底——
+    端点显式建会话正是为了让 inflight 保护落在真会话上。
+    凭据类标签恒只回 digest+preview（不落原文），与项目隐私红线一致。
+    """
+    s = sessions.get(sid) or {}
+    fwd = s.get("fwd") or {}
+    labels = s.get("labels") or {}
+    last_hits = s.get("last_hits") or set()
+    # 本次命中的排前面，让事件的 count 与明细对得上（同代理路径口径）
+    ordered = [o for o in last_hits if o in fwd] + [o for o in fwd if o not in last_hits]
+    items = []
+    for orig in ordered[:limit]:
+        tok = fwd.get(orig, "")
+        if not tok:
+            continue
+        m = _PLACEHOLDER_PARTS_RX.match(tok)
+        label = labels.get(orig, "")
+        item = {
+            "tok": tok,
+            "label": label,
+            "hash": m.group(2) if m else "",
+            "length": len(orig),
+            "preview": _preview(orig, label),
+        }
+        if label in CREDENTIAL_LABELS:
+            item["cred"] = True
+            item["digest"] = _cred_digest(orig)
+        else:
+            item["original"] = orig
+        if len(orig) <= 2:
+            item["short"] = True
+        items.append(item)
+    return items
+
+
+def mask_body(text, sid):
+    """请求体脱敏（JSON 感知 + 就地替换），扩展链路的请求打码入口。
+
+    与代理路径的三级回写同源，目标是**别把客户端 body 的前缀整体挪位**：
+    1. `json.loads` 成对象 → `_mask_tree` 逐字符串叶子脱敏（协议位置跳过、业务区强制扫描）；
+    2. 首选 `_splice_mask` 在**原始文本上就地替换**（保住排版/转义风格），
+       并以 `json.loads(结果) == 脱敏后的树` 等价校验拦下过度替换；
+    3. 校验不过（或未 splice）退回整棵重序列化，separators 用紧凑形态。
+    解析失败（纯文本体）走 `mask()` 整段扫描。
+
+    零命中时**逐字节原样返回**（省一次序列化，也让上游前缀缓存能命中）。
+    深度超限等异常**向上抛**（端点转 (A) 阻断），绝不在这里静默放行明文。
+    """
+    if not text:
+        return text
+    try:
+        obj = json.loads(text)
+    except Exception:
+        obj = None
+    if not isinstance(obj, (dict, list)):
+        # 非 JSON 体（含合法 JSON 标量）：整段当纯文本扫描
+        out = mask(text, sid)
+        _seed_known(out, sid)
+        return out
+
+    changed = [False]
+    masked_root = _mask_tree(obj, sid, flag=changed)
+    if not changed[0]:
+        # 零改写：一个字都不动（保住前缀），但仍登记历史遗留占位符供响应侧还原
+        _seed_known(text, sid)
+        return text
+
+    masked_raw = None
+    try:
+        spliced = _splice_mask(
+            text.encode("utf-8"), masked_root,
+            {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
+        )
+    except Exception:
+        spliced = None
+    if spliced is not None:
+        try:
+            decoded = spliced.decode("utf-8")
+            if json.loads(decoded) == masked_root:
+                masked_raw = decoded
+        except Exception:
+            masked_raw = None
+    if masked_raw is None:
+        masked_raw = json.dumps(masked_root,
+                               ensure_ascii=("\\u" in text),
+                               separators=(",", ":"))
+    _seed_known(masked_raw, sid)
+    return masked_raw
+
+
 _logger = logging.getLogger("llm_shield")
 
 

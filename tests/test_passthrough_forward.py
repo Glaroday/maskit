@@ -111,6 +111,20 @@ class PassthroughForwardTests(unittest.TestCase):
         cls.ptsrv.server_close()
         cls.upstream.server_close()
 
+    def setUp(self):
+        """把 PT 还原映射钉成**空** —— 本类所有用例的前提都是「透传期无占位符」。
+
+        为什么必须显式隔离（实测踩过）：`_pt_restore_map()` 在未设 `LLM_SHIELD_DATA_DIR`
+        时会去读 `%APPDATA%\\Maskit` 的**真实**事件库。开发机上只要跑过一次真实代理，
+        映射就非空，PT 于是启用 gzip 解压链路（剥 `Content-Encoding`、改 EOF 定界），
+        `test_gzip_passthrough_when_no_restore_map` 就以「实现坏了」的假象失败
+        —— 本机当日 200+ 条事件即可复现。这不是产品缺陷，是用例读了生产数据；
+        门禁必须是确定性的，不能"取决于开发者今天有没有跑过代理"。
+        """
+        patcher = mock.patch.object(panel, "_pt_restore_map", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_get_forwards_and_echoes(self):
         raw = _http_request(self.pt_port, "GET", "/v1/models?api-version=1")
         self.assertIn(b"200", raw.split(b"\r\n", 1)[0])

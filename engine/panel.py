@@ -152,6 +152,7 @@ from event_store import (
     DB_PATH,
     LEGACY_JSONL_PATH,
     RETENTION_DAYS as LOG_RETENTION_DAYS,
+    INGRESS_VALUES,
     clear_events,
     console_decode,
     fetch_events,
@@ -216,6 +217,45 @@ if _DISABLE_ORIGIN_CHECK_ENV:
 # 配置级 Origin 校验开关（默认开；与 UI 开关 origin_check 同步）。与
 # _DISABLE_ORIGIN_CHECK_ENV 是「或」关系：任一关闭即放行。
 _origin_check_enabled = True
+# ── 浏览器扩展桥接（Browser Bridge v1）运行时状态 ──────────────────────────
+# 与 _origin_check_enabled 同款模式：load_config / save_config 写盘后由
+# _sync_runtime_config 原子同步，端点与 guard 不每次读盘。
+# ext_token 是 config.json 里第一个**长期**密钥（不随重启轮换），只对下面三个
+# 精确白名单端点有效；API_TOKEN 对全部 /api/* 有效（二选一）。
+# **精确白名单不用前缀**：否则扩展 token 能打到 /api/config、/api/ext/rotate-token。
+_EXT_ENDPOINTS = frozenset({"/api/ext/ping", "/api/ext/mask", "/api/ext/restore"})
+# 扩展上下文能出现的 Origin scheme。**扩展 ID 无法枚举**（解压加载/商店/profile 各异），
+# 所以只能按 scheme 放行；详见 _origin_ok() 里的实测说明与安全影响。
+_EXT_ORIGIN_SCHEMES = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
+_ext_cfg_state = {
+    "ext_bridge_enabled": False,
+    "ext_token": "",
+    "ext_block_when_engine_down": False,
+    "ext_record_events": True,
+}
+
+
+def _ext_cfg():
+    """当前生效的扩展桥接运行时配置（不读盘，避免每个请求一次 config 解析）。"""
+    return _ext_cfg_state
+
+
+def _ext_token_ok(token):
+    """校验扩展侧令牌：必须与 ext_token 精确相等（只对 _EXT_ENDPOINTS 有效）。
+
+    ext_token 未生成（空）时恒 False —— 不允许"没设 token 就全放行"。
+    compare_digest 对非 ASCII str 会抛 TypeError → 500，先转 bytes（同 API_TOKEN）。
+    """
+    ref = str(_ext_cfg_state.get("ext_token") or "")
+    if not ref or not token:
+        return False
+    try:
+        return secrets.compare_digest(token.encode("utf-8", "replace"),
+                                      ref.encode("utf-8", "replace"))
+    except Exception:
+        return False
+
+
 # 反代 HTTPS 终止时显式信任单跳 X-Forwarded-*。默认关闭，避免直接暴露面板时
 # 客户端伪造转发头绕过 Origin 同源校验；启用者必须确保前置代理覆盖而非追加这些头。
 TRUST_PROXY_ENV = "MASKIT_TRUST_PROXY"
@@ -368,6 +408,28 @@ def _origin_ok():
     origin = request.headers.get("Origin")
     if not origin:
         return True
+    # 扩展端点：合法调用方是浏览器扩展上下文，其 Origin 是 `chrome-extension://<扩展ID>`。
+    # **扩展 ID 随安装方式（解压加载 / 商店）与浏览器 profile 变化，引擎无从枚举**，
+    # 只能按 scheme 放行，再往下就只能靠 ext_token 这一道了（compare_digest 24 字符）。
+    #
+    # 实测修正（2026-09-15，真 Chrome + 扩展 + Playwright）：扩展 SW 的 **POST 确实带
+    # Origin**（值为 `chrome-extension://<id>` 且 host 权限已授予）。SPEC §3.2 注释里
+    # 「SW 的 fetch 不带 Origin（实测 C1）」只在 **GET/HEAD** 上成立——按 Fetch 规范，
+    # 非 GET/HEAD 请求一律附加 Origin。不加这条放行，全部 mask/restore 都会被
+    # `origin_rejected` 403 打回，而扩展侧把 403 当 (B) 直通 → **全站静默未脱敏**
+    # （页面看起来完全正常，这是最危险的一种失败）。
+    #
+    # 安全影响：Web 页面的 Origin 仍然被拒——万一 token 外泄，跨源页面也用不上这个端点。
+    #
+    # **不放行 `Origin: null`（2026-09-15 收紧）**：早期这里额外放行了 `origin == "null"`
+    # 以求稳（"万一某个 Chrome 版本把扩展 Origin 序列化成 null"），但按 Fetch 规范，
+    # `null` 只来自沙箱 iframe / `data:` / `file://` 这类**无来源**上下文，扩展上下文
+    # 恒有 `chrome-extension://<id>` 来源（真机 e2e 实测确认）。放行 null 等于给
+    # 「任意本地 HTML 文件 + 已知 token」多开一道门，而它没有任何合法调用方 ——
+    # 收益为零、风险为正，删掉。真出现 null 的现场，宁可先 403 留痕（可归因），
+    # 也不要静默放行。
+    if request.path in _EXT_ENDPOINTS and origin.lower().startswith(_EXT_ORIGIN_SCHEMES):
+        return True
     # 远程模式：SPA 与 API 同源托管，Origin 必须等于本次请求的 scheme://host，
     # 拒绝任何外站页面借用户浏览器发起的跨源调用（token 在内存里，但 CSRF 面仍要关死）。
     if REMOTE_MODE:
@@ -421,7 +483,22 @@ def api_guard():
     # API 令牌校验（主防线）：任何外部未授权请求在第一道防线直接阻断
     token = request.headers.get("X-Shield-Token", "")
     # compare_digest 对非 ASCII str 会抛 TypeError → 500，先转 bytes
-    if not secrets.compare_digest(token.encode("utf-8", "replace"), API_TOKEN.encode("utf-8")):
+    if request.path in _EXT_ENDPOINTS:
+        # 扩展端点：ext_token 或 API_TOKEN 二选一。ext_token **不得**用于其他
+        # /api/*（精确白名单而非前缀，否则 rotate-token 会被扩展 token 打到）。
+        if not (_ext_token_ok(token)
+                or secrets.compare_digest(token.encode("utf-8", "replace"), API_TOKEN.encode("utf-8"))):
+            return _guard_reject("invalid_token",
+                                 jsonify({"ok": False, "error": "invalid_token",
+                                          "message": "无效请求令牌"}))
+        # 用户关掉总开关的语义是「我要直连」，不是「我要断网」：回 403 且**不带
+        # blocking**，扩展侧按 (B) 默认桶直通（红线 2）。带 blocking 等于让
+        # 「面板关开关」变成「网页 AI 全站不可用」。
+        if not _ext_cfg_state.get("ext_bridge_enabled"):
+            return _guard_reject("ext_bridge_disabled",
+                                 jsonify({"ok": False, "error": "ext_bridge_disabled",
+                                          "message": "浏览器扩展桥接未启用"}))
+    elif not secrets.compare_digest(token.encode("utf-8", "replace"), API_TOKEN.encode("utf-8")):
         return _guard_reject("invalid_token",
                              jsonify({"ok": False, "error": "invalid_token",
                                       "message": "无效请求令牌"}))
@@ -586,6 +663,12 @@ def _emit_log(line: str):
 _TAIL_KEEP_FIELDS = {
     "seq", "ts", "type", "host", "path", "method", "status",
     "count", "restored", "http_status", "model", "upstream", "sid", "reason", "msg",
+    # ingress（proxy/ext）与 client_app 都是**非敏感的结构性字段**：
+    #   · ingress：入口维度。事件页早就能看见它，tail 通道不收的话两个视图口径不一致；
+    #   · client_app：tail 通道的「上游」列取的正是 upstream || client_app，
+    #     原本没收它 —— 于是 tail 里那一列**一直是空的**，排查时分不清是谁发的。
+    #     顺手一起补，二者都不含正文/占位符/原文。
+    "ingress", "client_app",
 }
 
 
@@ -3306,6 +3389,17 @@ def default_config():
         # 敏感词统计是否记录明文。默认开：打码 preview（1**@***.com）排出来的
         # 排行榜没有信息量，而数据只落本机 SQLite、不出网。关掉后库里永不出现明文。
         "record_plaintext_words": True,
+        # ── 浏览器扩展桥接（Browser Bridge v1，默认关）──
+        # ext_token 是 config.json 里第一个长期密钥：只对 /api/ext/{ping,mask,restore}
+        # 三个精确白名单端点有效（API_TOKEN 对全部 /api/* 有效）。首次启用时自动生成固化。
+        "ext_bridge_enabled": False,
+        "ext_token": "",
+        # (B) 类（引擎未启动 / 端口不通 / 403 直通类）是否改为阻断。默认 false=直通，
+        # 与 AGENTS 红线 3「透明直连兜底、绝不断网」同语义；(A) 类无开关、恒阻断。
+        "ext_block_when_engine_down": False,
+        # 扩展流量是否写入本地事件库与统计。**只管落库与统计**：脱敏/还原与
+        # 「未脱敏状态」可见性照常（详见 SECURITY.md 与 SPEC §5.3 三条边界）。
+        "ext_record_events": True,
         "stream_response": True,
         # 流式接管黑名单：确认某上游接管后断连时把 host 填进来，保持整包路径。
         # 默认空：曾预置的 opencode.ai 是误判（真因是引擎在无完整 SSE 事件可发时
@@ -3673,6 +3767,19 @@ def normalize_config(raw, warnings=None):
     if proxy_ups and not egress_enabled:
         warn.append(f"客户端「{', '.join(proxy_ups)}」勾选了「走代理」，但全局出口代理尚未启用或未填地址，将以直连方式转发")
 
+    # ── 浏览器扩展桥接 ──
+    # ext_token 只在「启用」时保证存在：启用了却没有 token = 扩展恒 403
+    # invalid_token，用户完全无从归因（面板只显示一把空钥匙）。空则自动生成
+    # 并随本次 normalize 的产物固化落盘（save_config 持久化的是本函数输出）。
+    ext_enabled = bool(raw.get("ext_bridge_enabled", False))
+    ext_token = str(raw.get("ext_token") or "").strip()
+    if ext_token and (len(ext_token) > 200 or not ext_token.isascii()
+                      or any(c.isspace() or ord(c) < 0x21 for c in ext_token)):
+        warn.append("扩展桥接令牌含不支持的字符，已重新生成")
+        ext_token = ""
+    if ext_enabled and not ext_token:
+        ext_token = secrets.token_urlsafe(24)
+
     return {
         "capture_mode": capture_mode,
         "target_domains": domains,
@@ -3694,6 +3801,10 @@ def normalize_config(raw, warnings=None):
         "response_scan": bool(raw.get("response_scan", True)),
         "origin_check": bool(raw.get("origin_check", True)),
         "record_plaintext_words": bool(raw.get("record_plaintext_words", True)),
+        "ext_bridge_enabled": ext_enabled,
+        "ext_token": ext_token,
+        "ext_block_when_engine_down": bool(raw.get("ext_block_when_engine_down", False)),
+        "ext_record_events": bool(raw.get("ext_record_events", True)),
         "stream_response": bool(raw.get("stream_response", True)),
         "stream_exclude_hosts": _normalize_host_list(raw.get("stream_exclude_hosts")),
         "stop_mode": stop_mode,
@@ -3793,6 +3904,14 @@ def _sync_runtime_config(cfg):
     global _origin_check_enabled
     if isinstance(cfg, dict):
         _origin_check_enabled = bool(cfg.get("origin_check", True))
+        # 扩展桥接四项开关同步进运行时状态（guard 与 /api/ext/* 读它，不读盘）。
+        # 先 clear 再 update：配置里缺键时必须是「回默认」而不是「留着上一份」。
+        _ext_cfg_state.update({
+            "ext_bridge_enabled": bool(cfg.get("ext_bridge_enabled", False)),
+            "ext_token": str(cfg.get("ext_token") or ""),
+            "ext_block_when_engine_down": bool(cfg.get("ext_block_when_engine_down", False)),
+            "ext_record_events": bool(cfg.get("ext_record_events", True)),
+        })
         try:
             set_record_plaintext_words(cfg.get("record_plaintext_words", True))
         except Exception:
@@ -5124,12 +5243,22 @@ def api_logs():
     event_type = request.args.get("type", "").strip().upper() or None
     if event_type and not re.fullmatch(r"[A-Z_]{1,32}", event_type):
         event_type = None
+    # 入口维度过滤（proxy / ext）。**不改 event_type 也没有源码兼容问题**：
+    # fetch_events 对非法/空值不过滤，老前端不带这个参数行为完全不变。
+    # 前端把入口筛选落 URL query（可分享/可回退），加上首页词条跳转带的 &ingress=，
+    # 「词条 ×N」与「点进去的日志条数」才是同一个口径。
+    ingress = request.args.get("ingress", "").strip().lower() or None
+    # 合法值集合与写入侧**同源**（`event_store.INGRESS_VALUES`）：早先这里手抄了
+    # ("proxy", "ext")，一旦将来新增入口（比如 `ext2`）就会出现「事件写得进去、
+    # 但筛选永远筛不出来」的静默不一致。非法值一律当"不过滤"，老前端不带参数行为不变。
+    if ingress not in INGRESS_VALUES:
+        ingress = None
     # First load shows the latest page; subsequent polls consume the oldest unseen
     # records. Fetch one extra row to tell the client whether it needs to catch up.
     incremental = since > 0
     ev = fetch_events(since=since, limit=limit + int(incremental), sensitive_only=sensitive_only,
                       query=query, fulltext=fulltext, event_type=event_type,
-                      max_limit=1001, ascending=incremental)
+                      max_limit=1001, ascending=incremental, ingress=ingress)
     has_more = incremental and len(ev) > limit
     ev = ev[:limit]
     next_since = ev[-1]["seq"] if ev else since
@@ -5404,6 +5533,195 @@ def api_logs_export():
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
     resp.headers["Content-Disposition"] = 'attachment; filename="maskit-events.json"'
     return resp
+
+
+# ============================ 浏览器扩展桥接（Browser Bridge v1） ============================
+# 扩展侧唯一通信对象是本机 panel（http://127.0.0.1:5801），只走 /api/ext/* 三个端点。
+# 全部脱敏/还原都复用 transparent 模块，落点在 **panel 进程** 那一份全局态
+# （与 mitmdump 子进程那份互不可见，见 SPEC §1.1/C16）。
+#
+# 并发模型：mitmproxy 的 event loop 是单线程同步执行，panel 的 Flask 却是 threaded；
+# 扩展是 panel 进程内第一个**高频**并发调用方。而 transparent 的 `_prune_recent`
+# 会对 `_RECENT_FWD` 做 `list()` 快照，构造期并发插入会 RuntimeError → 用模块级
+# `_EXT_LOCK` 把 transparent 调用段整体串行化。
+#
+# ⚠️ 锁序规矩：**禁止在 `_EXT_LOCK` 临界区内调用任何会碰 panel 配置锁（cfg_lock）
+# 的函数**（load_config / save_config / _sync_runtime_config 等）。`tr._maybe_reload`
+# 今天只读 transparent 自己的配置文件，实测不碰 panel 锁；一旦它将来改读 panel
+# 配置，就是 `_EXT_LOCK → cfg_lock` 与反向的经典死锁，届时应先重构锁边界。
+_EXT_LOCK = threading.Lock()
+# popup 的「今日累计」计数（只影响展示；`+=` 是读改写三步，故在锁内自增）。
+_EXT_STATS = {"mask": 0, "restore": 0}
+# `_sweep` 节流时间戳：restore 是每 SSE chunk 一次（代理路径是每请求一次），
+# 不节流则每个 chunk 都全表扫一遍 sessions。
+_EXT_LAST_SWEEP = 0.0
+_EXT_SWEEP_INTERVAL = 10.0
+# 请求体上限，**数值必须与 `transparent._MAX_REQUEST_BODY` 一致**（代理路径的同款红线：
+# 超限一律 (A) 阻断，绝不半脱敏放行）。这里不 import transparent 取值——panel 进程能否
+# import transparent 取决于跑在哪个解释器（见下面 mask 端点的失败路径注释），
+# 把「闸门」这种必须无条件生效的判断绑到一个可能 import 失败的模块上不可接受。
+_EXT_MAX_BODY = 32 * 1024 * 1024
+
+
+def _sweep_throttled(tr):
+    """锁内调用：≥10s 才真正跑一次 `tr._sweep`，防 restore 每 chunk 全表扫。
+
+    `tr` **必须由端点传入**（端点在函数内局部 import 的模块对象，模块级 helper
+    看不到）——早期版本在这里直接写 `tr._sweep()` 是 NameError，会被端点的
+    `except Exception` 吞掉后恒返回 (A) 阻断，而 (A) 不熔断，等于网页全站持续
+    网络错误。抽 helper 时先查作用域。
+    """
+    global _EXT_LAST_SWEEP
+    now = time.monotonic()
+    if now - _EXT_LAST_SWEEP > _EXT_SWEEP_INTERVAL:
+        tr._sweep()
+        _EXT_LAST_SWEEP = now
+
+
+@app.get("/api/ext/ping")
+def api_ext_ping():
+    """扩展存活探针：SW 每 60s 调一次，拿版本 / 开关 / 累计计数。"""
+    return jsonify({"ok": True, "version": __version__,
+                    "block_when_down": bool(_ext_cfg().get("ext_block_when_engine_down")),
+                    "record_events": bool(_ext_cfg().get("ext_record_events", True)),
+                    "stats": dict(_EXT_STATS)})
+
+
+@app.post("/api/ext/mask")
+def api_ext_mask():
+    """扩展请求体打码。sid 由**服务端**签发（客户端不能指定）。"""
+    # 体积闸门必须**先于**任何读体动作（`get_json` 会把流完整读进内存）。
+    # ⚠️ 只判 `content_length` 是不够的：无 `Content-Length` 时它是 None，
+    # `(None or 0) > LIMIT` 判成 `0 > LIMIT` = False ——**闸门被整个绕过**
+    # （实测 werkzeug：`Transfer-Encoding: chunked` → content_length is None）。
+    # 所以显式分块也一律拒绝。扩展侧发的是字符串体、恒带 Content-Length，
+    # 因此这条只会挡刻意分块的调用方，不影响正常链路。
+    # 注：若将来需要「对任意 framing 都强制生效」，正解是 `MAX_CONTENT_LENGTH`
+    # + 一个返回 `blocking:true` 的 413 errorhandler——**两者必须同时加**：
+    # 只加前者会拿到 Flask 的 HTML 413 页，扩展按「无 blocking」归进 (B) 默认桶，
+    # 于是超限体变成「未脱敏直通」，比现状更危险。
+    if (request.content_length or 0) > _EXT_MAX_BODY or request.headers.get("Transfer-Encoding"):
+        return jsonify({"ok": False, "error": "payload_too_large", "blocking": True}), 413
+    data = request.get_json(force=True, silent=True) or {}
+    text = data.get("text")
+    if not isinstance(text, str) or not text:
+        return jsonify({"ok": False, "error": "bad_request", "blocking": True}), 400
+    sid = "ext:" + secrets.token_hex(8)          # 服务端生成，客户端不能指定
+    t0 = time.perf_counter()
+    try:
+        import transparent as tr
+        with _EXT_LOCK:
+            tr._maybe_reload(force=True)
+            _sweep_throttled(tr)
+            # 显式建会话：mask() 内部虽会懒建，但懒建**只在真有字符串叶子被扫描时**
+            # 才发生——纯协议体或整棵命中 skip 规则时 sessions[sid] 根本不存在，
+            # 下面的 s["inflight"] = True 就写在随即被丢弃的临时 dict 上，
+            # inflight 保护从未生效，_sweep 按 TTL 回收会话后响应回来查不到 rev
+            # → 占位符泄漏。demo 端点与代理路径都先显式建会话，这里对齐。
+            # 注意**不传 source**：会话的 source 是「客户端 peer 信息」
+            # （transparent._client_source → {client, client_host, client_port}），
+            # 扩展链路没有 mitmproxy flow；塞 {"kind": "ext"} 只会被 _emit_skip /
+            # _emit_restore_summary 的 **source 摊成 payload 里一个孤立的 kind 键。
+            # 入口维度改用事件字段 ingress（与 source 正交）。
+            tr._new_session(sid)
+            masked = tr.mask_body(text, sid)
+            s = tr.sessions[sid]
+            items = tr._mask_event_items(sid)
+            s["inflight"] = True
+            _EXT_STATS["mask"] += 1              # += 是读改写三步，必须在锁内
+        if _ext_cfg().get("ext_record_events", True):
+            tr._emit("MASK", ingress="ext", sid=sid,
+                     count=len(s.get("last_hits") or set()),
+                     new_count=len(s.get("new_orig") or set()),
+                     items=items, host=str(data.get("host") or ""), path="/ext/mask",
+                     mask_ms=round((time.perf_counter() - t0) * 1000, 1))
+        return jsonify({"ok": True, "masked_text": masked, "sid": sid})
+    except Exception as e:
+        # (A) 类：引擎明确失败 → 无条件阻断（红线 2），无开关。
+        # 失败路径**必须留一条日志**，否则用户只看到「网页全站请求失败」、事件页
+        # 一片空白，无从归因（R14）。这一支恰好包含 `import transparent` 失败——
+        # panel 进程能否 import transparent 取决于它跑在哪个解释器。
+        # `_emit_log` 只依赖 panel 自己的环形缓冲，不依赖 transparent，任何情况下可用。
+        # 只记异常**类型名**、不记 message：message 可能带请求正文片段，而 log_buf
+        # 会被 `_diagnostics_payload` 收进诊断包，等于把 PII 写进诊断包。
+        try:
+            _emit_log(f"[panel] ext mask 失败: {type(e).__name__}")
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "engine_error", "blocking": True}), 503
+
+
+@app.post("/api/ext/restore")
+def api_ext_restore():
+    """扩展响应流还原。**还原方向恒透传**：失败也把原文交回客户端（红线 3）。"""
+    data = request.get_json(force=True, silent=True) or {}
+    text = data.get("text")
+    sid = str(data.get("sid") or "").strip()        # 扩展回传 mask 签发的 sid
+    stream_id = str(data.get("stream_id") or "").strip()
+    final = bool(data.get("final"))
+    escape = bool(data.get("escape"))               # 扩展按上下文判定（SSE 默认 true）
+    # sid 必须带 ext: 前缀 —— 否则扩展可以拿它去还原代理链路/他人会话的占位符。
+    if not isinstance(text, str) or not sid.startswith("ext:") or not stream_id:
+        return jsonify({"ok": False, "error": "bad_request"}), 400
+    s = None
+    try:
+        import transparent as tr
+        with _EXT_LOCK:
+            _sweep_throttled(tr)
+            tr._touch(sid)
+            out = tr.restore(text, sid, channel=f"ext:{stream_id}",
+                             escape=escape, final=final)
+        if final:
+            with _EXT_LOCK:
+                s = tr.sessions.get(sid) or {}
+                if s:
+                    s["inflight"] = False
+                _EXT_STATS["restore"] += 1          # += 读改写三步，必须在锁内
+                # 锁内取值：还原计数由 `tr.restore()` 在会话里维护，出锁再读属于
+                # 对同一 dict 的延迟读（本身无害），但锁内一次取干净更不容易被后人改坏。
+                restored = int(s.get("restored") or 0)
+                # unresolved/degraded 是**纯诊断计数**：`_update_stats` 不消费它们，
+                # 只被日志页 renderSummary 用来标「未还原」「兜底还原」。扩展链路原先
+                # 不发这两个字段 → 模型改写占位符时页面露出裸 `{{...}}`，而事件页那一行
+                # 什么告警都不显示，用户无从判断是"引擎坏了"还是"模型在编"（代理链路
+                # 正是因为看得见才没有踩这个坑）。这里补齐，两个字段都不进任何聚合。
+                unresolved = int(s.get("unresolved") or 0)
+                degraded = int(s.get("degraded") or 0)
+            if _ext_cfg().get("ext_record_events", True):
+                # ⚠️ **不要**"顺手"补 status / restore_status / model / usage：
+                # SPEC §5.2(3) 明确要求扩展 RESTORE 不带它们，判据在 `_update_stats`——
+                # `status` 一进就会写 `daily_status`、`model`/`usage` 会写
+                # `daily_tokens`/`daily_models`，等于让浏览器流量污染这三张按「代理口径」
+                # 阅读的统计表。缺 status 的代价只是日志页那一列显示 `—`，是可接受的；
+                # 补上它则是统计口径出错，且出错无声。
+                tr._emit("RESTORE", ingress="ext", sid=sid,
+                         restored=restored, unresolved=unresolved, degraded=degraded,
+                         host=str(data.get("host") or ""), path="/ext/restore")
+        return jsonify({"ok": True, "text": out})
+    except Exception as e:
+        # restore 是**每 chunk 一次**，逐次记录会把 800 行环形缓冲冲干净 ——
+        # 只在 final（每条流一次）记一行。
+        if final:
+            try:
+                _emit_log(f"[panel] ext restore 失败(final): {type(e).__name__}")
+            except Exception:
+                pass
+        return jsonify({"ok": False, "text": text})     # 还原方向恒透传
+
+
+@app.post("/api/ext/rotate-token")
+def api_ext_rotate_token():
+    """轮换扩展令牌（API_TOKEN 鉴权，**不在** ext_token 白名单内）。
+
+    轮换后果：扩展持旧 token → 全部请求 403 invalid_token → (B) 类直通（未脱敏）
+    直到用户到扩展设置更新 token。面板 UI 的旋转确认弹窗与此处应当表述一致；
+    `_backup_config_file` 保留的历史 config.json.bak-* 里也含旧 token。
+    """
+    new_token = secrets.token_urlsafe(24)
+    cfg = load_config()
+    cfg["ext_token"] = new_token
+    save_config(cfg)
+    return jsonify({"ok": True, "ext_token": new_token})
 
 
 @app.post("/api/demo/mask")
@@ -6209,6 +6527,49 @@ def _is_allowed_external_url(url):
         return False
 
 
+def _diag_scrub_word_lists(stats):
+    """把诊断包里词榜的**词面**过一遍 `_scrub_text`（计数与标签原样保留）。
+
+    为什么必须做（实测缺陷）：`today_stats()` 的词榜在 `record_plaintext_words` 开启
+    （**默认就是开**）时存的是**明文敏感值**——那是给用户自己在面板上看的数据，本来就该
+    明文。但诊断包是**要发给开发者**的（见本函数调用处的隐私承诺：连日志、崩溃现场这些
+    自由文本里的凭据与 PII 都要打码），明文一起带走等于把用户的手机号/邮箱/自定义词表
+    原封不动外发——诊断包最不能出的就是这种错。
+
+    只脱敏词面、保留 `label`/`count`：诊断需要的正是「哪一类、命中多少」，
+    而不是「具体命中了什么」。`copy.deepcopy` 是防止污染调用方（同一份 dict 也可能
+    被 `/api/stats/today` 复用）。
+    """
+    if not isinstance(stats, dict):
+        return stats
+    try:
+        out = copy.deepcopy(stats)
+    except Exception:
+        return stats
+
+    def scrub_pairs(pairs):
+        if not isinstance(pairs, list):
+            return
+        for item in pairs:
+            if isinstance(item, dict) and isinstance(item.get("word"), str):
+                item["word"] = _scrub_text(item["word"], 120)
+
+    def scrub_label_map(by_label):
+        if isinstance(by_label, dict):
+            for pairs in by_label.values():
+                scrub_pairs(pairs)
+
+    scrub_pairs(out.get("top_words"))
+    scrub_label_map(out.get("by_label_words"))
+    by_ingress = out.get("words_by_ingress")
+    if isinstance(by_ingress, dict):
+        for view in by_ingress.values():
+            if isinstance(view, dict):
+                scrub_pairs(view.get("top_words"))
+                scrub_label_map(view.get("by_label_words"))
+    return out
+
+
 def _diagnostics_payload(error_limit=60):
     """组装诊断包。任何一节取数失败都降级成错误字符串，不让整包生成失败——
     诊断包恰恰是在系统半死不活的时候才用得上。"""
@@ -6313,7 +6674,9 @@ def _diagnostics_payload(error_limit=60):
         out["recent_errors"] = {"error": _safe_public_text(e, 240)}
 
     try:
-        out["stats_today"] = today_stats()
+        # 词榜必须过 `_diag_scrub_word_lists`：`today_stats()` 在 record_plaintext_words
+        # 开启（默认）时词面是**明文**，而诊断包是要发给开发者看的（见该 helper 的说明）。
+        out["stats_today"] = _diag_scrub_word_lists(today_stats())
     except Exception as e:
         out["stats_today"] = {"error": _safe_public_text(e, 240)}
 

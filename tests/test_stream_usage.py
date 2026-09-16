@@ -18,6 +18,18 @@ def event(data):
 
 
 class StreamingUsageTests(unittest.TestCase):
+    def setUp(self):
+        """把 PT 还原映射钉成**空** —— `forward_response` 断言的是「逐字节原样透传」。
+
+        `_pt_restore_map()` 未设 `LLM_SHIELD_DATA_DIR` 时会读 `%APPDATA%\\Maskit` 的
+        **真实**事件库；开发机上只要跑过一次真实代理，映射就非空，PT 于是启用还原链路
+        并重写文本帧（实测把 `\\r\\n` 归一成 `\\n`），用例就以「透传改坏了字节」的假象失败。
+        门禁必须确定性——不能取决于开发者今天有没有跑过代理。
+        """
+        patcher = mock.patch.object(panel, "_pt_restore_map", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_anthropic_snapshots_merge_without_summing_cumulative_counts(self):
         start = {"type": "message_start", "message": {"usage": {"input_tokens": 25, "output_tokens": 1}}}
         updates = [{"type": "message_delta", "usage": {"output_tokens": n}} for n in (10, 15)]

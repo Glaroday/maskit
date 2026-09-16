@@ -149,6 +149,22 @@ print(response.choices[0].message.content)
 4. **Masking Paths**: simply enter `/v1` (prefix matching automatically covers `/v1/chat/completions`, `/v1/models`, etc.);
 5. Save, then set your AI tool's Base URL to `http://127.0.0.1:18709/v1`!
 
+### 6. Browser Extension (ChatGPT / Claude Web)
+
+The web apps have no Base URL to point at, so the extension under `extension/` routes the page's LLM requests through the local engine and restores placeholders as the response streams.
+
+1. In Chrome / Edge open `chrome://extensions`, enable **Developer mode**, then **Load unpacked** and pick the repo's `extension/` folder;
+2. In the panel go to **Settings → Browser extension**, turn on **Enable the browser-extension bridge**, and copy the generated **access token**;
+3. Open the extension's options page, fill in the engine URL (default `http://127.0.0.1:5801`) and the token, and tick `chatgpt.com` / `claude.ai` (add custom sites on the same page).
+
+**Troubleshooting notes (important)**
+
+- **Extension events live in the Events page, not in Runtime logs.** Runtime logs are the mitmproxy subprocess stdout channel and never see extension endpoints; conversely the "mask failed" alert line *does* land there. Check both.
+- To filter extension traffic quickly, search **`/ext/`** in the events search box (`path` is a structured column and `/ext/mask` / `/ext/restore` are fixed values).
+- The **ingress** filter (All / Proxy link / Browser extension) shares one scope with the dashboard word entries, so a word's `×N` matches the log count after you click it.
+- **Unmasked states are always visible**: engine down → popup shows a yellow "passthrough"; bad token → red "token invalid"; bridge disabled → red "extension disabled". **In all three cases requests leave unmasked** — the extension will not cut your network (deliberate default; see `SECURITY.md`).
+- The share card covers the **proxy link only** (the scope is printed on the card), so its totals differ from the dashboard on purpose.
+
 ---
 
 ## 🚀 Download & Deployment
@@ -258,6 +274,19 @@ python engine/panel.py
 # 3. Frontend dev server (Vite hot-reload, recommended)
 cd frontend && npm run dev
 ```
+
+**End-to-end smoke (optional; run it after touching the extension / bridge code)**
+
+`tests/e2e_ext_bridge.py` drives **real Chrome + the real extension + a local mock site + the real engine** through 12 link-level assertions (masked outbound body, cross-chunk SSE restoration, multipart guard, default-bucket passthrough, sid table surviving SW recycle, …). It is **not part of CI** (it needs a real browser).
+
+Prerequisites: `pip install playwright && playwright install chromium` (using the interpreter that has the engine deps) and a **graphical session** — extensions only load in headed Chromium; Playwright's `headless=True` uses headless_shell, which does not support extensions.
+
+```bash
+python tests/e2e_ext_bridge.py             # run all
+python tests/e2e_ext_bridge.py -k multipart -v
+```
+
+> Why run it when unit tests are green: bridge failures are **silent passthrough** by default — the page looks perfectly normal and simply is not masked. A real browser is the only place this link can be verified.
 
 ---
 
