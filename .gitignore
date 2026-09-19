@@ -29,9 +29,12 @@ dist/
 dist_releases/
 dist_engine/
 build_engine/
+dist_extension/
 build_temp/
 *.spec.bak
 proxy_token
+engine/models/
+_test_env*
 _smoke_data/
 ai-coding/
 frontend/.playwright-cli/

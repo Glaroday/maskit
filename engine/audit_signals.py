@@ -17,6 +17,7 @@
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
+import base64
 import functools
 import hashlib
 import math
@@ -45,7 +46,14 @@ SECRET_REGEX_PATTERNS = [
     (re.compile(r"[?&]key=[A-Za-z0-9_\-]{25,}"), "google_key_url_param"),
     (re.compile(r"ya29\.[A-Za-z0-9_.~+/\-]{20,}"), "gcp_oauth_token"),
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*"), "jwt_token"),
-    (re.compile(r"-----BEGIN[A-Z \-]*PRIVATE KEY-----[\s\S]*?-----END[A-Z \-]*PRIVATE KEY-----"), "pem_private_key"),
+    # ⚠️ 绝不能写成 `-----BEGIN…[\s\S]*?-----END…`（审计 M1）。没有 END 时惰性量词
+    # 会从**每一个** BEGIN 位置一路尝试到字符串末尾，实测 1.5/3/6.1/12.1KB 耗时
+    # 4.4/43/502/3425 ms（每翻倍 ×10，典型 O(n²)）。而 `scan_error_leak` 拿的是
+    # 全量 body：上游回一个 4xx + 几百 KB 的畸形页就能把 mitmproxy 事件循环 CPU 打满。
+    # 只认 PEM **头**即可 —— evidence 本来也只取前 80 字符，而「私钥头出现在响应里」
+    # 本身就是确凿的泄漏信号（被截断的错误页里 END 往往已经丢了，旧写法反而漏报）。
+    # `[A-Z \-]{0,40}` 的定长上界保证整体线性。
+    (re.compile(r"-----BEGIN[A-Z \-]{0,40}PRIVATE KEY-----"), "pem_private_key"),
     (re.compile(r"(?<=://)[^\s'\"]*:[^\s'\"@]+(?=@)"), "db_connstring_password"),
 ]
 
@@ -242,12 +250,45 @@ def _families_match(a, b):
     return fa == fb
 
 
+# 同家族「档位词」表：这些词说的是**能力档位**（通用命名，不是厂商/型号枚举），
+# 用于在家族相同时识别「偷偷换档」——`gpt-4o -> gpt-4o-mini`、
+# `claude-opus -> claude-haiku` 家族都一样，只差档位词。
+#
+# 为什么只比档位词、不比版本号：`claude-sonnet-4` 与 `claude-3.5-sonnet` 这类版本
+# 别名在同家族的合法行为里大量存在（单测 test_identity_swap_model_same_family_no_hit
+# 锁的就是它），按版本号比会持续误报。档位词是能力语义而非版本号，才具备可判性。
+_MODEL_TIER_LOW = frozenset({
+    "nano", "mini", "small", "lite", "light", "tiny", "flash", "haiku", "instant", "fast", "chat",
+})
+_MODEL_TIER_HIGH = frozenset({
+    "pro", "max", "ultra", "opus", "sonnet", "large", "plus", "advanced", "reasoning", "thinking",
+})
+_MODEL_TIER_WORDS = _MODEL_TIER_LOW | _MODEL_TIER_HIGH
+
+
+def _model_tier_words(model):
+    """提取模型名里的能力档位词集合（`gpt-4o-mini` -> {'mini'}）。"""
+    m = str(model or "").strip().lower()
+    if not m:
+        return frozenset()
+    if "/" in m:
+        m = m.split("/")[-1]
+    return frozenset(w for w in re.split(r"[^a-z0-9]+", m) if w in _MODEL_TIER_WORDS)
+
+
+def _tier_suffix(tiers):
+    """证据里的档位词后缀：`gpt-4o` 这类无档位词的显式写成 [none]，避免看着像漏了。"""
+    return " [%s]" % ",".join(sorted(tiers)) if tiers else " [none]"
+
+
 def scan_identity_swap(text, model_field=None, req_model=None):
     """S2 模型替换扫描（对比式，零硬编码）。
 
-    只比较请求 model（客户端指定，基准真相）与响应 model 字段（模型自报信息），
-    家族不一致才记录。删除「我是/I am」等自然语言身份句式判定：角色扮演、用户要求
-    复述或 relay 文案都可能触发，不能作为换芯证据。
+    只比较请求 model（客户端指定，基准真相）与响应 model 字段（模型自报信息）：
+    家族不一致（换壳）记 HIGH；家族一致但档位词不同（换档，如 gpt-4o -> gpt-4o-mini）
+    记 MEDIUM（换档是「偷偷降级」，家族级对比天生看不见）。删除「我是/I am」等
+    自然语言身份句式判定：角色扮演、用户要求复述或 relay 文案都可能触发，
+    不能作为换芯证据。
 
     Args:
         text: 保留参数以兼容现有调用；不再用自然语言文本做身份判定。
@@ -268,16 +309,25 @@ def scan_identity_swap(text, model_field=None, req_model=None):
                 "kind": "model_mismatch",
             })
 
-    # 只保留客观字段对比。自然语言身份声称无法区分 relay 换芯、角色扮演和用户要求，
-    # 不属于可验证的安全判据（2026-08-18）。
-    if model_field is not None and isinstance(model_field, str) and model_field.strip():
-        if req_model and not _families_match(req_model, model_field):
-            results.append({
-                "signal": "identity_swap",
-                "severity": HIGH,
-                "evidence": f"model_mismatch: req={req_model[:60]} resp={model_field[:60]}",
-                "kind": "model_mismatch",
-            })
+    # 2) 同家族换档检测：家族一致但能力档位词不同。
+    #    为什么必须单独一档：家族级对比对 `gpt-4o -> gpt-4o-mini` 必然零告警，
+    #    而「偷偷降档」正是最隐蔽的一类换芯（用户按贵档付费、拿到便宜档输出）。
+    #    版本号差异仍然不报（同家族版本别名是合法常态，见 docstring）。
+    if model_field is not None and isinstance(model_field, str) and model_field.strip() and req_model:
+        fam_req, fam_resp = _model_family(req_model), _model_family(model_field)
+        if fam_req and fam_req == fam_resp:
+            tiers_req, tiers_resp = _model_tier_words(req_model), _model_tier_words(model_field)
+            if tiers_req != tiers_resp:
+                results.append({
+                    "signal": "identity_swap",
+                    "severity": MEDIUM,
+                    "evidence": (
+                        f"model_tier_mismatch: req={req_model[:60]}{_tier_suffix(tiers_req)} "
+                        f"resp={model_field[:60]}{_tier_suffix(tiers_resp)}"
+                    ),
+                    "kind": "model_tier_mismatch",
+                })
+
     return results
 
 
@@ -474,6 +524,186 @@ _AUTOFETCH_URL_RE = re.compile(
 # query 里挂着长编码串 = 正在往外带数据。正常图片 URL（CDN、图表、logo）不长这样。
 _EXFIL_PAYLOAD_RE = re.compile(r"[?&][\w.\-]{1,24}=([A-Za-z0-9+/%_\-]{24,})")
 
+# ========== S6 扩展：提示词注入 / 系统提示词索要 / 凭据外发指令（2026-09-19） ==========
+# 与 S9 同一条纪律：只认**结构槽位**（动词 + 宾语 + 目标），不判「模型是不是在讲解」。
+# 所有判据都吃调用方传入的 request_text 做回声抑制——请求里本来就有的内容，
+# 上游并没有凭空多注入任何东西（用户自己问「什么是忽略以上指令」时模型复述不算）。
+#
+# 分档原则（误报是这类检测的头号死因，见 tests/test_audit_noise_regression.py）：
+#   ① 自带客观载荷的形态（协议级系统分隔符 / 凭据外发指令带目标 / 索要系统提示词）
+#      —— 结构本身足够具体，单独命中即报 MEDIUM；
+#   ② 泛化的「忽略以上所有指令」句式 —— 单独出现**不足以定罪**：模型讲解提示词注入
+#      时就会原样写出这句话。它只在同一段回复里另有客观载荷（①/隐藏 Unicode/
+#      自动外发 URL）时才上报。这一档是「讲解」与「投毒」的分界线。
+_ZH_OVERRIDE_VERBS = r"(?:忽略|无视|忘记|忘掉|抛弃|舍弃|覆盖|推翻|绕过|不必理会|不要理会)"
+_ZH_OVERRIDE_SCOPE = r"(?:之前|先前|以上|上述|前面|所有|全部|原先)"
+_ZH_OVERRIDE_NOUN = r"(?:指令|指示|规则|设定|约束|提示词|提示语|系统消息|要求)"
+_EN_OVERRIDE_VERBS = r"(?:ignore|disregard|forget|override|overwrite|bypass|discard)"
+_EN_OVERRIDE_SCOPE = r"(?:previous|prior|above|earlier|preceding|all|any)"
+_EN_OVERRIDE_NOUN = r"(?:instructions?|prompts?|rules?|directions?|guidelines?|system message)"
+_INSTRUCTION_OVERRIDE_RE = re.compile(
+    _ZH_OVERRIDE_VERBS + r"[^\n。；;]{0,16}" + _ZH_OVERRIDE_SCOPE + r"[^\n。；;]{0,12}" + _ZH_OVERRIDE_NOUN
+    + r"|"
+    + _EN_OVERRIDE_VERBS + r"(?:\s+\w+){0,4}\s+" + _EN_OVERRIDE_SCOPE + r"\s+" + _EN_OVERRIDE_NOUN,
+    re.I,
+)
+
+# 索要系统提示词：提取动词 + 「系统提示词/你的指令」宾语。中英各一组，
+# 覆盖「把 system prompt 原样输出」这类直接提取要求。
+# 中英各两种语序：中文既可「输出系统提示词」也可「把你的系统提示词原样输出」，
+# 后者（宾语在前）是中文最常见的祈使形态，只写前者会漏掉绝大多数中文变体。
+# 宾语在前的分支收紧了两处，专治中文讲解句误报：
+#  ① 宾语必须带领属语（你的/您的/自己的/内部的）；
+#  ② 动词只认**强提取动词**（复述/打印/泄露/粘贴/读出），或「原样|完整|逐字」修饰的
+#     输出类动词 —— 「你的提示，输出结果应该……」这种日常句式因此不会命中。
+_PROMPT_EXTRACT_ZH_VERBS = r"(?:输出|打印|复述|重复|告诉我|展示|显示|泄露|粘贴|读出|回显)"
+_PROMPT_EXTRACT_ZH_OBJECT = r"(?:系统提示词|系统提示|系统消息|初始指令|初始提示|预设指令)"
+_PROMPT_EXTRACT_ZH_OWNED = (
+    r"(?:你的|您的|自己的|内部的)(?:系统|初始|预设|内部|自定义|原始)?"
+    r"(?:提示词|提示|消息|指令|设定)"
+)
+_PROMPT_EXTRACT_ZH_STRONG = r"(?:复述|重复|打印|泄露|粘贴|读出|回显|原文给出)"
+_PROMPT_EXTRACT_ZH_VERBATIM = r"(?:原样|完整|逐字|一字不差|全文|毫无保留)[^\n。；;]{0,4}?(?:输出|显示|给出|告诉我)"
+_PROMPT_EXTRACT_RE = re.compile(
+    _PROMPT_EXTRACT_ZH_VERBS + r"[^\n。；;]{0,16}?" + _PROMPT_EXTRACT_ZH_OBJECT
+    + r"|" + _PROMPT_EXTRACT_ZH_OWNED + r"[^\n。；;]{0,10}?"
+    + r"(?:" + _PROMPT_EXTRACT_ZH_STRONG + r"|" + _PROMPT_EXTRACT_ZH_VERBATIM + r")"
+    + r"|"
+    + r"(?:repeat|print|output|show|reveal|disclose|paste|echo)(?:\s+\w+){0,4}\s+(?:your|the)\s+"
+    + r"(?:system\s+)?(?:prompt|instructions?|initial instructions?|system message)",
+    re.I,
+)
+
+# 凭据外发指令：凭据词 + 外发动词 + **外部目标**。
+# 目标只认 URL（带 scheme）与邮箱 —— 这两者不可能是「把 key 存进本地配置」的合法建议，
+# 因此误报面极小；不列 TLD 枚举（避免重蹈「可疑 TLD」那版噪声）。
+_CRED_NOUN_RE = (
+    r"(?:api[\s_\-]?key|apikey|access[\s_\-]?key|secret[\s_\-]?key|secret|token|"
+    r"密钥|私钥|密码|口令|凭据|凭证|credential|环境变量|\.env\b)"
+)
+_ZH_EXFIL_VERB_RE = r"(?:发送|发给|上传|提交|粘贴|填入|回传|转发|传给|发往|泄漏给|暴露给)"
+_EN_EXFIL_VERB_RE = r"(?:send|upload|submit|paste|post|forward|transmit|exfiltrate|share)"
+_EXFIL_TARGET_RE = r"(?:https?://|@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+_CREDENTIAL_EXFIL_RE = re.compile(
+    _CRED_NOUN_RE + r"[^\n。；;]{0,24}?" + _ZH_EXFIL_VERB_RE + r"[^\n。；;]{0,16}?" + _EXFIL_TARGET_RE
+    + r"|" + _CRED_NOUN_RE + r"[^\n。；;]{0,24}?" + _EN_EXFIL_VERB_RE + r"[^\n。；;]{0,16}?" + _EXFIL_TARGET_RE
+    + r"|" + _EN_EXFIL_VERB_RE + r"(?:\s+\w+){0,3}\s+" + _CRED_NOUN_RE + r"[\s\S]{0,24}?" + _EXFIL_TARGET_RE,
+    re.I,
+)
+
+# 协议级系统分隔符：注入者用真实对话模板的标记伪造「系统轮次」。
+# 两种形态分开判，是为了不误伤「模型在讲解这些标记」：
+#  - 分隔符标记（<|im_start|> / [INST] / <<SYS>>）：伪造一个系统轮次**至少要两个**
+#    （开 + 闭/换角色），而讲解时通常只引用一个 → 要求同一条回复里出现 **>=2 个**才报。
+#  - Markdown 伪系统标题（`### System:`）：单次出现即有可能，但必须**不在 code block 里**
+#    （code block 里的是被引用的格式说明，不是正文指令）。
+_FAKE_SYSTEM_MARKER_RE = re.compile(
+    r"<\|(?:im_start|im_end|start_header_id|end_header_id|system|assistant|user)\|>"
+    r"|\[\/?INST\]|<<\/?SYS>>",
+    re.I,
+)
+_FAKE_SYSTEM_HEADING_RE = re.compile(
+    r"^\s{0,3}#{2,4}\s*(?:system|instruction|系统提示|系统指令)\s*[:：]",
+    re.I | re.M,
+)
+
+# 编码绕过：base64 / \uXXXX / HTML 实体。只在直接扫描零命中时对解码结果再扫一遍
+# （见 scan_response_poison 末尾），避免给普通代码回复增加无谓开销与重复告警。
+_B64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
+_UNICODE_ESC_RUN_RE = re.compile(r"(?:\\u[0-9a-fA-F]{4}){3,}")
+_HTML_ENTITY_RUN_RE = re.compile(r"(?:&#[0-9]{2,7};|&#x[0-9a-fA-F]{2,6};){3,}")
+_DECODE_MAX_CANDIDATES = 32
+_DECODE_CONTEXT_CHARS = 120
+
+
+def _decode_candidates(text):
+    """抽出文本里可解码的编码片段并解码（base64 / \\uXXXX / HTML 实体）。
+
+    纯函数、永不抛异常：任何解码失败都跳过该片段。只返回**全可打印**的解码结果，
+    二进制垃圾不进入二次扫描。
+    """
+    out = []
+    if not text:
+        return out
+    try:
+        count = 0
+        for m in _B64_RUN_RE.finditer(text):
+            if count >= _DECODE_MAX_CANDIDATES:
+                break
+            count += 1
+            chunk = m.group(0)
+            if len(chunk) > 4096:
+                continue
+            try:
+                raw = base64.b64decode(chunk + "=" * (-len(chunk) % 4), validate=True)
+                decoded = raw.decode("utf-8")
+            except Exception:
+                continue
+            if decoded and all(ch.isprintable() or ch in "\n\r\t" for ch in decoded):
+                out.append(decoded)
+        # 转义/实体只覆盖片段时，攻击话术往往一半转义一半明文
+        # （`\u0069gnore previous instructions`）——只把解码片段丢掉上下文会漏判，
+        # 所以连**前后各 120 字符窗口**一起拼成候选文本再扫。
+        for m in _UNICODE_ESC_RUN_RE.finditer(text):
+            if len(out) >= _DECODE_MAX_CANDIDATES * 2:
+                break
+            try:
+                decoded = re.sub(r"\\u([0-9a-fA-F]{4})",
+                                 lambda mm: chr(int(mm.group(1), 16)), m.group(0))
+                out.append(decoded + text[m.end():m.end() + _DECODE_CONTEXT_CHARS])
+                out.append(text[max(0, m.start() - _DECODE_CONTEXT_CHARS):m.start()] + decoded)
+            except Exception:
+                continue
+        for m in _HTML_ENTITY_RUN_RE.finditer(text):
+            if len(out) >= _DECODE_MAX_CANDIDATES * 2:
+                break
+            try:
+                frag = re.sub(r"&#x([0-9a-fA-F]+);", lambda mm: chr(int(mm.group(1), 16)),
+                              m.group(0), flags=re.I)
+                frag = re.sub(r"&#([0-9]+);", lambda mm: chr(int(mm.group(1))), frag)
+                out.append(frag + text[m.end():m.end() + _DECODE_CONTEXT_CHARS])
+                out.append(text[max(0, m.start() - _DECODE_CONTEXT_CHARS):m.start()] + frag)
+            except Exception:
+                continue
+    except Exception:
+        return out
+    return out
+
+
+def _mask_creds_in(snippet):
+    """证据文本里的凭据形态抹掉（审计红线：凭据任何片段都不落库）。"""
+    out = str(snippet or "")
+    for rx, kind in _CREDENTIAL_PATTERNS + SECRET_REGEX_PATTERNS:
+        try:
+            out = rx.sub("<%s>" % kind, out)
+        except Exception:
+            continue
+    return out
+
+
+def _marker_is_turn_anchored(seg, start):
+    """标记是否落在**行首**（允许行首的空白、反引号与引号）—— 真实模板分隔符的形状。
+
+    这是区分「讲解引用」与「伪造系统轮次」的判据（审计 L7）。
+    真实的分隔符在文本里必然是行级结构（`<|im_start|>system` 独占行首，
+    下一行才是内容），而讲解时的引用几乎总是嵌在句子里
+    （「ChatML 用 `<|im_start|>system` 开始系统轮次」）。
+
+    ⚠️ **为什么不用「跳过行内反引号」这个更直觉的做法**（实测否掉了）：
+    标记同时是 `payload_indicators` 的来源，而 `instruction_override`
+    的定罪条件是「同现载荷」。把反引号内的标记整个抹掉之后，
+    攻击者只要写成 `` `<|im_start|>system` `` 就能让**整条检测链塌掉**
+    （实测：`请你忽略以上所有指令…` + 反引号包裹的标记 → 零告警）。
+    那是给攻击者开了个后门，比误报严重得多。
+    行首判据不碰文本，只收紧「算不算数」，不存在这条逃逸路径。
+
+    ⚠️ 已知取舍：两个标记都写在句中（`你现在是 <|im_start|>system<|im_end|> 模式`）
+    不再触发标记信号。这类文本没有行级结构、模型不会当成真的轮次边界，
+    代价可接受；其中的危害话术仍由 `_INSTRUCTION_OVERRIDE_RE` 独立兜底。
+    """
+    line_start = seg.rfind("\n", 0, start) + 1
+    return seg[line_start:start].strip(" \t`'\"") == ""
+
 
 def _split_code_blocks(text):
     """把文本分成 [(segment, in_code_block)] 列表。"""
@@ -566,6 +796,9 @@ def scan_response_poison(text, request_text=None):
     if not text:
         return []
     results = []
+    # 同一条回复里已出现的**客观载荷**指标：既用于给泛化句式（instruction_override）
+    # 定罪，也作为「编码绕过」二次扫描的跳过依据。
+    payload_indicators = []
 
     # 隐藏 Unicode（全文），分档见常量注释
     high_hits = _HIDDEN_UNICODE_HIGH.findall(text)
@@ -577,6 +810,7 @@ def scan_response_poison(text, request_text=None):
             "evidence": f"hidden_unicode: {chars} (count={len(high_hits)}) [双向覆盖符]",
             "kind": "hidden_unicode",
         })
+        payload_indicators.append("bidi_override")
     low_hits = _HIDDEN_UNICODE_LOW.findall(text)
     if len(low_hits) >= _HIDDEN_LOW_THRESHOLD:
         chars = ",".join(f"U+{ord(c):04X}" for c in low_hits[:5])
@@ -586,6 +820,7 @@ def scan_response_poison(text, request_text=None):
             "evidence": f"hidden_unicode: {chars} (count={len(low_hits)}) [零宽字符成规模出现]",
             "kind": "hidden_unicode",
         })
+        payload_indicators.append("hidden_unicode")
 
     # 自动拉取型外链（非 code block——code block 里的图片不会被渲染，拉不出去）
     for seg, in_code in _split_code_blocks(text):
@@ -603,6 +838,7 @@ def scan_response_poison(text, request_text=None):
                 "evidence": _url_evidence(url, len(payload.group(1))),
                 "kind": "exfil_url",
             })
+            payload_indicators.append("exfil_url")
 
     # 凭据回流扫描（审计规则专项 P2）：检测回复中出现 API key/token/JWT 形态的串。
     # 场景：恶意 relay 回显其他用户 key（钓鱼/嫁祸），或模型幻觉出看似真实的 key。
@@ -618,6 +854,113 @@ def scan_response_poison(text, request_text=None):
                 "evidence": _redact_evidence(m.group(), kind),
                 "kind": f"credential_echo:{kind}",
             })
+
+    # ── S6 扩展：提示词注入 / 系统提示词索要 / 凭据外发指令（2026-09-19）──
+    # 分档与回声抑制规则见文件上方常量块的设计说明。
+    # 标记只在**非代码块**正文里数，且至少一个必须**行首锚定**（审计 L7）。
+    # 两层缺一不可：
+    #   · 跳过代码围栏 —— 讲解模板最常写进 ``` 块；
+    #   · 要求行首锚定 —— 只跳围栏不够，审计报告自己举的例子是**行内**形态
+    #     （「ChatML 用 `<|im_start|>system` 开始…」），实测修完围栏后它仍误报 MEDIUM。
+    # 与下方「伪系统标题」判定口径统一（那条本来就已经跳过代码块）。
+    markers = []
+    anchored = False
+    for _seg, _in_code in _split_code_blocks(text):
+        if _in_code:
+            continue
+        for _m in _FAKE_SYSTEM_MARKER_RE.finditer(_seg):
+            markers.append(_m.group(0))
+            if _marker_is_turn_anchored(_seg, _m.start()):
+                anchored = True
+    if (len(markers) >= 2 and anchored
+            and not (request_text and all(mk in request_text for mk in set(markers)))):
+        results.append({
+            "signal": "response_poison",
+            "severity": MEDIUM,
+            "evidence": (f"fake_system_block: {','.join(sorted(set(markers)))[:60]} "
+                         f"(count={len(markers)}) [伪造协议级系统轮次]"),
+            "kind": "fake_system_block",
+        })
+        payload_indicators.append("fake_system_block")
+
+    for seg, in_code in _split_code_blocks(text):
+        if in_code:
+            continue
+        for m in _FAKE_SYSTEM_HEADING_RE.finditer(seg):
+            snippet = m.group(0).strip()
+            if request_text and snippet in request_text:
+                continue
+            results.append({
+                "signal": "response_poison",
+                "severity": MEDIUM,
+                "evidence": f"fake_system_block: {_mask_creds_in(snippet[:40])} [正文出现伪系统标题]",
+                "kind": "fake_system_block",
+            })
+            payload_indicators.append("fake_system_block")
+            break
+        break        # 只扫第一段非 code block 正文，避免同一形态重复报
+
+    for m in _PROMPT_EXTRACT_RE.finditer(text):
+        snippet = m.group(0)
+        if request_text and snippet in request_text:
+            continue
+        results.append({
+            "signal": "response_poison",
+            "severity": MEDIUM,
+            "evidence": f"prompt_extraction: {_mask_creds_in(snippet[:80])}",
+            "kind": "prompt_extraction",
+        })
+        payload_indicators.append("prompt_extraction")
+        break
+
+    for m in _CREDENTIAL_EXFIL_RE.finditer(text):
+        snippet = m.group(0)
+        if request_text and snippet in request_text:
+            continue
+        results.append({
+            "signal": "response_poison",
+            "severity": MEDIUM,
+            "evidence": f"credential_exfil_instruction: {_mask_creds_in(snippet[:80])}",
+            "kind": "credential_exfil_instruction",
+        })
+        payload_indicators.append("credential_exfil_instruction")
+        break
+
+    # 泛化指令覆盖：**单独出现不报**（模型讲解提示词注入时就会写出这句话），
+    # 只有同一段回复里另有客观载荷时才定罪。
+    if payload_indicators:
+        for m in _INSTRUCTION_OVERRIDE_RE.finditer(text):
+            snippet = m.group(0)
+            if request_text and snippet in request_text:
+                continue
+            results.append({
+                "signal": "response_poison",
+                "severity": MEDIUM,
+                "evidence": (f"instruction_override: {_mask_creds_in(snippet[:80])} "
+                             f"[同现载荷: {','.join(sorted(set(payload_indicators)))}]"),
+                "kind": "instruction_override",
+            })
+            break
+
+    # 编码绕过：直接扫描零命中时，解码候选片段后再扫一遍（只认指令类判据）。
+    # ⚠️ 候选只从**非代码块**正文里抽（审计 L7）：代码块里出现 base64 是常态
+    # （图片/哈希/文件内容/示例数据），解码后碰巧命中一条宽泛的英文句式就报
+    # MEDIUM 是纯噪声。真正的编码绕过是把话术塞进**回复正文**，不在围栏里。
+    if not results:
+        prose = "\n".join(seg for seg, in_code in _split_code_blocks(text) if not in_code)
+        for decoded in _decode_candidates(prose)[:_DECODE_MAX_CANDIDATES]:
+            if not (_INSTRUCTION_OVERRIDE_RE.search(decoded) or _PROMPT_EXTRACT_RE.search(decoded)
+                    or _CREDENTIAL_EXFIL_RE.search(decoded) or _FAKE_SYSTEM_MARKER_RE.search(decoded)):
+                continue
+            digest = hashlib.sha256(decoded.encode("utf-8", "replace")).hexdigest()[:16]
+            results.append({
+                "signal": "response_poison",
+                "severity": MEDIUM,
+                "evidence": (f"encoded_instruction: {_mask_creds_in(decoded[:80])} "
+                             f"[base64/转义解码后命中注入判据 len={len(decoded)} sha256={digest}]"),
+                "kind": "encoded_instruction",
+            })
+            break
 
     return dedupe_findings(results)
 

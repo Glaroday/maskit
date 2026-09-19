@@ -204,6 +204,47 @@ class ShieldEngineTests(unittest.TestCase):
         masked2 = tr.mask("code " + fake, sid2)
         self.assertIn(fake, masked2)
 
+    def test_jwt_response_scan_verifies_header(self):
+        """响应侧扫描：伪三段串不得触发 SCAN_WARN，真实 JWT 正确识别。"""
+        import base64 as b64
+        header = b64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').decode().rstrip("=")
+        real = f"{header}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        fake_head = b64.urlsafe_b64encode(b"not-json-at-all").decode().rstrip("=")
+        fake = f"{fake_head}.abcdefgh.uvwxyz123456"
+
+        events = []
+        old_emit = tr._emit
+        old_scan = tr.RESPONSE_SCAN
+        old_rules = dict(tr.BUILTIN_RULES)
+        try:
+            tr.RESPONSE_SCAN = True
+            tr.BUILTIN_RULES["JWT"] = True
+            tr._emit = lambda typ, **kw: events.append((typ, kw))
+
+            # 1. 伪造三段串：不应触发 SCAN_WARN
+            class _FakeFlow:
+                class response:
+                    content = f"data: {fake}".encode("utf-8")
+            sid = "jwt-scan-fake"
+            tr._new_session(sid)
+            tr._scan_response(_FakeFlow, sid, "api.openai.com", "POST", "/v1/chat/completions", {})
+            warns = [kw for typ, kw in events if typ == "SCAN_WARN"]
+            self.assertEqual(len(warns), 0, "伪三段串不得触发 SCAN_WARN 告警")
+
+            # 2. 真实 JWT：应触发 SCAN_WARN
+            _FakeFlow.response.content = f"token: {real}".encode("utf-8")
+            sid2 = "jwt-scan-real"
+            tr._new_session(sid2)
+            tr._scan_response(_FakeFlow, sid2, "api.openai.com", "POST", "/v1/chat/completions", {})
+            warns2 = [kw for typ, kw in events if typ == "SCAN_WARN"]
+            self.assertEqual(len(warns2), 1, "真实 JWT 必须触发 SCAN_WARN 告警")
+            jwt_items = [it for it in warns2[0]["items"] if it.get("label") == "JWT"]
+            self.assertTrue(len(jwt_items) > 0, "告警 items 中必须包含 JWT 标签")
+        finally:
+            tr._emit = old_emit
+            tr.RESPONSE_SCAN = old_scan
+            tr.BUILTIN_RULES = old_rules
+
     def test_secret_rule_no_nested_placeholder(self):
         """SECRET 嵌套占位符回归：api_key=sk-xxx 只产生 1 个占位符，
         还原后无 {{ 残留（曾前缀规则先换、SECRET 再包一层，嵌套残留）。"""
@@ -3132,6 +3173,17 @@ class PanelConfigTests(unittest.TestCase):
         up_srv = http.server.HTTPServer(("127.0.0.1", 18990), FakeUp)
         threading.Thread(target=up_srv.serve_forever, daemon=True).start()
         try:
+            # 事件库隔离：透传链路会真实 enqueue PASS 事件，不隔离就会把假
+            # 事件写进开发者本机真实库（污染 /api/stats 与每日用量）。
+            old_db = event_store.DB_PATH
+            event_store.DB_PATH = Path(tempfile.mkdtemp()) / "pt-events.sqlite3"
+            event_store._reset_writer()
+
+            def _restore_db():
+                event_store._reset_writer()
+                event_store.DB_PATH = old_db
+
+            self.addCleanup(_restore_db)
             tmp = Path(tempfile.mkdtemp()) / "config.json"
             # 深拷贝：default_config() 的 upstreams 是浅拷贝，直接改 u['target']
             # 会污染共享的 shield_defaults.DEFAULT_UPSTREAMS（tr/panel 同一对象）
@@ -4792,13 +4844,30 @@ class NewRulesTests(unittest.TestCase):
         self.assertNotIn("张三", r, "普通词仍应生效（坏正则词被跳过）")
 
     # ---- 整词匹配 ----
-    def test_whole_word_boundary(self):
+    def test_whole_word_boundary_ascii(self):
+        """ASCII 词：整词语义必须真的成立（不是靠断言写法自证）。
+
+        旧断言是 `assertNotIn(" 手机", r)`——带前导空格，而输出里永远没有这个子串，
+        恒为真（vacuous），整词模式实际上没有任何用例守。这里改成：
+        被包裹在更长的词里 = 必须保留；独立出现 = 必须打码。
+        """
+        tr.CUSTOM_WORDS.update({"Acme": "ORG"})
+        tr.SENSITIVE_WORD_WHOLE.add("Acme")
+        r = self._mask("AcmeCorp 与 Acme 签约")
+        self.assertIn("AcmeCorp", r, "整词模式下更长的词不应被误伤")
+        self.assertNotIn("Acme 签约", r, "独立出现的词必须打码")
+
+    def test_whole_word_cjk_still_masks(self):
+        """中文词开整词匹配不得变成「永不脱敏」（漏脱敏，比误伤严重）。
+
+        汉字之间没有词边界，`手机` 两侧几乎永远是汉字：把 CJK 放进两侧边界字符类，
+        等于开了整词匹配的中文词 100% 漏打码（实测 `手机壳和手机` 一个都不打码）。
+        无分词器时中文词的「整词」无法表达，规则是退化回子串匹配。
+        """
         tr.CUSTOM_WORDS.update({"手机": "DEV"})
         tr.SENSITIVE_WORD_WHOLE.add("手机")
         r = self._mask("手机壳和手机")
-        # 整词模式：两侧加边界，'手机壳'中的手机不应命中，单独的'手机'应命中
-        self.assertIn("手机壳", r, "整词模式下子串不应误伤")
-        self.assertNotIn(" 手机", r, "独立词应命中")
+        self.assertNotIn("手机", r, "整词开关不得把中文词的脱敏关掉")
 
     # ---- 大小写不敏感 ----
     def test_case_insensitive_word(self):
@@ -4940,6 +5009,170 @@ class AuditFailClosedBlockTests(unittest.TestCase):
             tr.AUDIT_FAIL_CLOSED = old_fc
         self.assertFalse(any(typ == "BLOCK" for typ in emitted), f"关掉 fail-closed 不应阻断: {emitted}")
         self.assertEqual(flow.response.status_code, 500)
+
+
+def _ner_model_ready():
+    """模型文件 + 依赖都可用的判定（供 skipUnless 用）。"""
+    try:
+        import ner_engine
+        if not ner_engine.is_ner_available():
+            return False
+        return bool(ner_engine._init_ner())
+    except Exception:
+        return False
+
+
+_NER_MODEL_READY = _ner_model_ready()
+
+
+class NerEngineGuardrailTests(unittest.TestCase):
+    """NER 的成本护栏（与模型文件无关，CI 上必跑）。
+
+    背景：模型跑在脱敏主链路上，mask() 会对请求体每个字符串叶子各调一次。
+    没有长度上限时实测单条 10 万字符要 69 秒，直接把 mitmproxy 的事件循环冻住。
+    """
+
+    def test_length_cap_skips_and_is_visible(self):
+        import ner_engine
+        before = ner_engine.status()["skips"].get("too_long", 0)
+        ents = ner_engine.extract_entities("啊" * (ner_engine.MAX_TEXT_CHARS + 1))
+        self.assertEqual(ents, [])
+        self.assertGreater(ner_engine.status()["skips"].get("too_long", 0), before,
+                           "超长跳过必须计数/留痕，不能静默")
+
+    def test_exhausted_budget_skips_instead_of_running(self):
+        import ner_engine
+        before = ner_engine.status()["skips"].get("budget_exhausted", 0)
+        with mock.patch.object(ner_engine, "_init_ner", return_value=True):
+            ner_engine.begin_budget(0.0)
+            try:
+                ents = ner_engine.extract_entities("张小明在北京工作。")
+            finally:
+                ner_engine.end_budget()
+        self.assertEqual(ents, [])
+        self.assertGreater(ner_engine.status()["skips"].get("budget_exhausted", 0), before,
+                           "预算耗尽必须计数/留痕，不能静默")
+
+    def test_leaked_budget_window_self_heals(self):
+        """漏调 end_budget 时：预算期内按耗尽处理，但绝不永久停掉后续识别。"""
+        import ner_engine
+        ner_engine.begin_budget(0.0)
+        try:
+            self.assertIsNone(ner_engine._current_deadline(), "预算期内必须按耗尽处理")
+            # 模拟预算窗口早已过去（异常路径漏调 end_budget）
+            ner_engine.begin_budget(-120.0)
+            self.assertIsNotNone(ner_engine._current_deadline(),
+                                 "超过宽限期必须自愈，不能永久停掉识别")
+        finally:
+            ner_engine.end_budget()
+
+
+class NerEngineIntegrationTests(unittest.TestCase):
+    """本地 ONNX 实体识别（NER）与 transparent.py 脱敏还原管线的集成。
+
+    分两层：打桩用例不依赖模型（CI 必跑，锁死「实体与占位符相交不得漏明文」
+    「失败必须可见」这些与模型无关的契约）；端到端用例用 skipUnless 守卫
+    （模型 98MB 且被 .gitignore 排除，CI/干净克隆上本来就没有）。
+    """
+
+    def setUp(self):
+        tr.sessions.clear()
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._NER_WARNED.discard("model_missing")
+        self._old_ner = tr.NER_ENABLED
+
+    def tearDown(self):
+        tr.NER_ENABLED = self._old_ner
+
+    def _stub_ner(self, ents):
+        """打桩 ner_engine：模型可用 + 返回指定实体（与模型文件无关）。"""
+        import ner_engine
+        for patcher in (
+            mock.patch.object(ner_engine, "is_ner_available", return_value=True),
+            mock.patch.object(ner_engine, "extract_entities", return_value=ents),
+            mock.patch.object(ner_engine, "status", return_value={"available": True, "last_error": ""}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_entity_intersecting_placeholder_leaves_no_plaintext(self):
+        """实体把已有占位符包在中间时，两侧明文必须都被打码。
+
+        旧实现用 `not _PLACEHOLDER_RX.search(orig)` 整段丢弃 → 整段（含明文）原样出网。
+        """
+        text = "公司注册地：上海市浦东新区{{TERM_ab12cd}}世纪大道100号。"
+        frag = "上海市浦东新区{{TERM_ab12cd}}世纪大道100号"
+        start = text.index(frag)
+        self._stub_ner([{"type": "ADDR", "start": start, "end": start + len(frag), "text": frag}])
+        tr.NER_ENABLED = True
+        sid = "test-ner-intersect"
+        tr._new_session(sid)
+        masked = tr.mask(text, sid)
+        self.assertNotIn("上海市浦东新区", masked, "占位符相交时明文片段不得放行")
+        self.assertNotIn("世纪大道100号", masked, "占位符相交时明文片段不得放行")
+        self.assertIn("{{TERM_ab12cd}}", masked, "既有占位符必须原样保留，不得被劈开或套娃")
+        self.assertEqual(tr.restore(masked, sid, final=True), text)
+
+    def test_entity_split_by_placeholder_braces_still_masked(self):
+        """模型只吃到 `{` / `}}` 残渣（被占位符劈开的实体）时，剩余明文同样必须打码。"""
+        text = "北京市朝阳区{{TERM_ab12cd}}建国路88号院3号楼。"
+        first_end = text.index("{{TERM") + 1
+        second_start = text.index("}}建国路")
+        second_text = "}}建国路88号院3号楼"
+        self._stub_ner([
+            {"type": "ADDR", "start": 0, "end": first_end, "text": text[:first_end]},
+            {"type": "ADDR", "start": second_start, "end": second_start + len(second_text),
+             "text": second_text},
+        ])
+        tr.NER_ENABLED = True
+        sid = "test-ner-brace-split"
+        tr._new_session(sid)
+        masked = tr.mask(text, sid)
+        self.assertNotIn("北京市朝阳区", masked)
+        self.assertNotIn("建国路88号院3号楼", masked)
+        self.assertIn("{{TERM_ab12cd}}", masked)
+        self.assertEqual(tr.restore(masked, sid, final=True), text)
+
+    def test_ner_unavailable_is_reported_not_silent(self):
+        """开启 NER 但模型不可用：不改写文本，但必须留下可诊断记录。"""
+        import ner_engine
+        with mock.patch.object(ner_engine, "is_ner_available", return_value=False), \
+             mock.patch.object(ner_engine, "status", return_value={"model_dir": "/nonexistent"}):
+            tr.NER_ENABLED = True
+            sid = "test-ner-missing-model"
+            tr._new_session(sid)
+            text = "张小明在北京工作。"
+            self.assertEqual(tr.mask(text, sid), text)
+        self.assertIn("model_missing", tr._NER_WARNED,
+                      "模型缺失必须留痕，否则表现为「开了没效果」")
+
+    def test_ner_disabled_by_default(self):
+        """默认关闭 NER 时，不进行语义实体猜想，保护确定性规则边界。"""
+        old_ner = tr.NER_ENABLED
+        tr.NER_ENABLED = False
+        try:
+            sid = "test-ner-disabled"
+            tr._new_session(sid)
+            text = "张小明在北京腾讯科技公司工作。"
+            masked = tr.mask(text, sid)
+            self.assertIn("张小明", masked)
+            self.assertIn("北京腾讯科技公司", masked)
+        finally:
+            tr.NER_ENABLED = old_ner
+
+    @unittest.skipUnless(_NER_MODEL_READY, "本地 NER 模型/依赖不可用，跳过端到端用例")
+    def test_ner_entity_mask_and_restore_cycle(self):
+        tr.NER_ENABLED = True
+        sid = "test-ner-cycle"
+        tr._new_session(sid)
+        text = "请联系甲方张小明，他在北京腾讯科技公司工作，经常去北京协和医院就医，家住海淀区中关村南大街1号。"
+        masked = tr.mask(text, sid)
+        self.assertNotIn("张小明", masked)
+        self.assertIn("{{NAME_", masked)
+        self.assertIn("{{ORG_", masked)
+        restored = tr.restore(masked, sid, final=True)
+        self.assertEqual(restored, text, "NER 识别出的占位符还原后必须与原文完全一致")
 
 
 if __name__ == "__main__":

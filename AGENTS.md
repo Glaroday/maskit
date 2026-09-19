@@ -78,7 +78,7 @@ Data Maskit 是一款专为大模型打造的**100% 本地隐私脱敏与还原�
 
 ## 4. 验证与测试流程
 
-代码变更后必须通过全量门禁。**唯一清单是 `scripts/verify-all.py`**（本地与 CI 共用，14 项）：
+代码变更后必须通过全量门禁。**唯一清单是 `scripts/verify-all.py`**（本地与 CI 共用，15 项）：
 
 ```powershell
 python scripts/verify-all.py                 # 全跑
@@ -109,13 +109,12 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 > 找不到时脚本会跳过 shell 校验并告警（CI 在 ubuntu 上必跑）。
 
 > **Windows 本地 Python 解释器**：裸 `python` 可能解析到未装 flask/mitmproxy 的版本
-> （实测 3.14），导致 python 组门禁直接 ImportError。跑本地门禁时显式指定 3.13
-> 解释器（已装齐 flask + mitmproxy + pyinstaller）：
+> （实测 3.14），导致 python 组门禁直接 ImportError。`verify-all.py` 已内置 `py -3.13`
+> 自动探测与适配；若需显式指定解释器可传 `--python` 参数或环境变量：
 > ```powershell
-> python scripts/verify-all.py --python "C:\Python313\python.exe"
+> python scripts/verify-all.py --python "D:\path\to\Python313\python.exe"
 > ```
-> 或先 `$env:MASKIT_PYTHON = "C:\Python313\python.exe"` 再直接跑；
-> 解释器路径变化时以 `py -3.13 -c "import sys; print(sys.executable)"` 的实际输出为准。
+> 或先 `$env:MASKIT_PYTHON = "D:\path\to\Python313\python.exe"` 再直接跑。
 
 ### 运行时文件约定
 

@@ -15,6 +15,7 @@ mitmproxy 本地显式代理 - 只拦目标站点聊天接口，脱敏请求 + �
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
 import codecs
+import contextlib
 import datetime
 import ipaddress
 import json
@@ -194,7 +195,11 @@ RULES = [
     # 语义校验 _ipv6_private_ok 保证只脱私网段。公网 IPv6（2001:... 等）不做
     # ——误伤面与 IP_PUBLIC 同源（版本号/UUID 形态），有真实需求再评估。
     # UUID 含 4 个连字符无冒号，不会进候选。
-    (re.compile(r"(?<![0-9A-Fa-f:.])[0-9A-Fa-f:]{2,45}(?![0-9A-Fa-f:])"), "IPV6_PRIVATE", 0),
+    # 前视断言不得排除 `:`：`gateway:fd00::5`、`IPV6:fe80::1` 这类「键:值」写法里
+    # 地址紧跟冒号，排除 `:` 会让整段一个起点都匹配不上（IPv4 的 ID_BOUND_L 只排除
+    # 字母数字，两类规则的边界本就不该不一致）。hex 与 `.` 仍排除，防止从长 hex 串
+    # 中间起匹配；更长的地址会被贪婪吃成一条候选，再由语义校验否掉。
+    (re.compile(r"(?<![0-9A-Fa-f.])[0-9A-Fa-f:]{2,45}(?![0-9A-Fa-f:])"), "IPV6_PRIVATE", 0),
     # 公网 IPv4：放 network 规则末尾（IP_INTERNAL 之后），作为泛化规则兜底。
     # 严格限定各段 0-255，语义校验由 _ip_public_ok 剔除私网保留段、组播与知名公共 DNS。
     (re.compile(IP_PUBLIC_BOUND_L + r"(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?|[1-9])(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})" + IP_PUBLIC_BOUND_R), "IP_PUBLIC", 0),
@@ -259,17 +264,26 @@ _RULE_MARKERS = {
     # IPv6 私网首组必是 fe80-febf（fe8/fe9/fea/feb）或 fc00-fdff（fc/fd），
     # 用前缀做特征比 ":" 保守得多——':' 在任何 URL/JSON 里都命中，启用该规则
     # 后等于每条消息全量跑宽正则 + 海量 ipaddress 异常（31KB 文本实测 ~3400 次）。
-    # 大小写两种形态都要列（marker 是大小写敏感子串）。
-    "IPV6_PRIVATE": ("fe8", "fe9", "fea", "feb", "fc", "fd",
-                     "FE8", "FE9", "FEA", "FEB", "FC", "FD"),
+    # 只列小写：该规则按大小写不敏感比对（见 _RULE_MARKERS_CI）。此前只列全小写与
+    # 全大写，`Fe80::1` / `fE80::1` 这种混合大小写在预检处就被整条跳过且不留痕迹。
+    "IPV6_PRIVATE": ("fe8", "fe9", "fea", "feb", "fc", "fd"),
 }
 
+
+# 预检必须大小写不敏感的规则（marker 是小写形态，比对前把文本降一次大小写）。
+# 只对已启用该规则的文本生效（_rule_enabled 在调用点先短路），开销可忽略。
+_RULE_MARKERS_CI = frozenset({"IPV6_PRIVATE"})
 
 def _rule_may_hit(text, label):
     """特征预检：文本不含规则必含特征时跳过该规则扫描（性能）。"""
     markers = _RULE_MARKERS.get(label)
     if not markers:
         return True
+    if label in _RULE_MARKERS_CI:
+        # marker 只列了小写形态，比对前统一降一次大小写。不这么做的话，
+        # `Fe80::1` / `fE80::1` 这类混合大小写在预检处就被判「不命中」，
+        # 整条规则被静默跳过且不留痕（CGNAT 的 marker 漏加踩过同一个坑）。
+        text = text.lower()
     return any(m in text for m in markers)
 
 
@@ -356,6 +370,8 @@ AUDIT_SIGNALS = dict(DEFAULT_AUDIT_SIGNALS)
 # 审计严重信号触发时自动停用该 upstream（默认关，用户自选）。
 # 检测到 CRITICAL（如跨请求污染=relay 存了并复述了前序数据）时阻断后续请求（审计规则专项 P2）。
 AUDIT_FAIL_CLOSED = False
+# AI 实体识别开关（默认关闭，需用户显式开启，避免概率模型干扰确定性规则）
+NER_ENABLED = False
 # 主动探针注入的 canary nonce 注册表（跨请求污染检测用）
 # 结构：{nonce: ts}，按 ts 清理过期 nonce，避免无界增长
 _AUDIT_CANARY_REGISTRY = {}
@@ -371,6 +387,12 @@ _SSE_BUF_MAX = 4 * 1024 * 1024
 # 响应侧扫描体长上限：几 MB 文本 × 全量规则正则会霸占事件循环，扫描是防御性功能，
 # 超长只扫前段（代价：超长响应的尾部命中可能漏，属刻意取舍）。
 _SCAN_BODY_MAX = 512 * 1024
+# 扩展链路单会话的 stream_id 缓冲条目上限（审计 M2）。stream_id 由页面提供、
+# 完全可控，而 `ext_frames` 是会话内的一个普通 dict：启用站点上的任意脚本都能在
+# 会话 TTL 内不断换 id 把引擎内存撑大。超限按插入序淘汰最老的一条 ——
+# 淘汰只丢「半帧缓冲」，被淘汰的流下次调用从空缓冲重来，最差结果是该条流上
+# 跨帧切开的占位符拼不回来，而那是没有这套缓冲时的本来行为。
+_EXT_FRAMES_MAX = 64
 # 流式逐回调调试日志开关（SHIELD_STREAM_DEBUG=1）。默认关：SSE 每秒几十次回调，
 # 常开会把日志刷爆并拖慢转发。断流排障时临时打开。
 _STREAM_DEBUG = (os.environ.get("SHIELD_STREAM_DEBUG") or "").strip() not in ("", "0", "false", "False")
@@ -982,6 +1004,50 @@ def _new_token(label):
 _RECENT_FWD = {}   # orig -> [token, label, ts]
 _RECENT_REV = {}   # token -> [orig, label, ts]
 _RECENT_MAX = 2000
+
+# 自定义敏感词持久化映射表（仅内存常驻，不随 TTL/LRU 淘汰）：
+# 解决长任务、Agent 工具调用时因超过复用表 TTL 或引擎重启导致无法还原的问题。
+# 自定义敏感词来自用户明确配置的 CUSTOM_WORDS，其原文已在配置文件中受控持久化，
+# 因此其内存映射在运行时永久常驻，且通过确定性派生算法保证跨重启后缀一致。
+_CUSTOM_WORD_FWD = {}  # orig -> token
+_CUSTOM_WORD_REV = {}  # token -> [orig, label, ts]
+
+
+def _deterministic_suffix(orig, used_suffixes=None):
+    """为自定义敏感词生成确定性的 6 位纯辅音后缀。
+
+    使用 SHA-256 确定性派生，在词表内发生碰撞时递增计数器避让。
+    保证相同的敏感词在多次重启、跨会话中始终获得稳定相同的占位符，
+    最大化上游 Prompt Cache 命中率并保证长任务工具调用可靠还原。
+    """
+    counter = 0
+    while True:
+        seed = f"maskit_cw:{counter}:{orig}".encode("utf-8")
+        h = hashlib.sha256(seed).digest()
+        suffix = "".join(_TOKEN_ALPHABET[b % len(_TOKEN_ALPHABET)] for b in h[:6])
+        if used_suffixes is None or suffix not in used_suffixes:
+            return suffix
+        counter += 1
+
+
+def _is_custom_word_orig(orig):
+    """该原文是否属于**当前启用**的自定义敏感词（决定是否永久豁免 TTL/LRU）。
+
+    必须连启用状态一起判：词或整组被禁用后仍返回 True 的话，它的映射会绕过
+    TTL 与 LRU 永久驻留，与「复用表到期即失效」的原文驻留窗口契约冲突
+    （见 SECURITY.md）。label 优先取已签发的 REV 记录，退回配置里的 label。
+    """
+    tok = _CUSTOM_WORD_FWD.get(orig)
+    if tok is not None:
+        rec = _CUSTOM_WORD_REV.get(tok)
+        return _custom_word_enabled(orig, (rec[1] if rec else None) or CUSTOM_WORDS.get(orig, ""))
+    if orig in CUSTOM_WORDS:
+        return _custom_word_enabled(orig, CUSTOM_WORDS.get(orig, ""))
+    return False
+
+
+def _is_custom_word_token(tok):
+    return tok in _CUSTOM_WORD_REV
 # 启动预热时最多回读的事件条数（见 _warmup_recent_from_db）。复用表本来就有
 # _RECENT_MAX 封顶，读再多也留不住，这个上限只是防止重度使用下几万条事件
 # 逐条 json.loads 把引擎启动拖慢。
@@ -1054,17 +1120,29 @@ def _prune_recent(now=None):
     """
     now = now or time.time()
     ttl = _recent_ttl()
-    stale = [k for k, v in list(_RECENT_FWD.items()) if now - v[2] > ttl]
+    stale = [
+        k for k, v in list(_RECENT_FWD.items())
+        if not _is_custom_word_orig(k) and now - v[2] > ttl
+    ]
     for k in stale:
         tok = _RECENT_FWD.pop(k, [None])[0]
         _RECENT_REV.pop(tok, None)
         _suffix_index_del(tok)
     if len(_RECENT_FWD) > _RECENT_MAX:
-        oldest = sorted(list(_RECENT_FWD.items()), key=lambda kv: kv[1][2])
-        for k, v in oldest[: len(_RECENT_FWD) - _RECENT_MAX]:
-            _RECENT_FWD.pop(k, None)
-            _RECENT_REV.pop(v[0], None)
-            _suffix_index_del(v[0])
+        evictable = [
+            (k, v) for k, v in _RECENT_FWD.items()
+            if not _is_custom_word_orig(k)
+        ]
+        # 配额只按**可淘汰**条数算：自定义词的规模由词表封顶，不该挤占普通条目的额度。
+        # 拿总长度算欠额，词表越大就越先清掉普通 PII 的复用条目——词表接近
+        # _RECENT_MAX 时，刚签发的普通占位符会被当场淘汰（复用与后缀容错一起失效）。
+        over = len(evictable) - _RECENT_MAX
+        if over > 0:
+            oldest = sorted(evictable, key=lambda kv: kv[1][2])
+            for k, v in oldest[:over]:
+                _RECENT_FWD.pop(k, None)
+                _RECENT_REV.pop(v[0], None)
+                _suffix_index_del(v[0])
 
 
 def _warmup_recent_from_db():
@@ -1161,7 +1239,7 @@ def _recall_token(orig, label):
     # 安全防套娃：如果 orig 自身就是占位符，严禁为其分配新 token！
     if isinstance(orig, str) and _PLACEHOLDER_RX.match(orig):
         # 尝试反查其真实明文
-        rec = _RECENT_REV.get(orig)
+        rec = _RECENT_REV.get(orig) or _CUSTOM_WORD_REV.get(orig)
         if rec and not _PLACEHOLDER_RX.match(rec[0]):
             orig = rec[0]
             label = rec[1] or label
@@ -1169,9 +1247,16 @@ def _recall_token(orig, label):
             # 查不到真实明文，直接原样返回自身，绝不套娃生成新占位符
             return orig
 
+    # 自定义敏感词优先使用稳定永久映射
+    perm_token = _CUSTOM_WORD_FWD.get(orig)
+    if perm_token:
+        _touch_recent(perm_token, orig)
+        _suffix_index_add(perm_token)
+        return perm_token
+
     now = time.time()
     hit = _RECENT_FWD.get(orig)
-    if hit and now - hit[2] <= _recent_ttl():
+    if hit and (_is_custom_word_orig(orig) or now - hit[2] <= _recent_ttl()):
         hit[2] = now
         rev = _RECENT_REV.get(hit[0])
         if rev:
@@ -1202,8 +1287,14 @@ def _remember(fwd, labels, orig, label):
     则意味着缓存必然从这个位置起失效。
     """
     if orig not in fwd:
+        perm_token = _CUSTOM_WORD_FWD.get(orig)
+        if perm_token:
+            fwd[orig] = perm_token
+            labels[orig] = label
+            _touch_recent(perm_token, orig)
+            return True
         hit = _RECENT_FWD.get(orig)
-        reused = bool(hit) and time.time() - hit[2] <= _recent_ttl()
+        reused = bool(hit) and (_is_custom_word_orig(orig) or time.time() - hit[2] <= _recent_ttl())
         fwd[orig] = _recall_token(orig, label)
         labels[orig] = label
         return reused
@@ -1225,6 +1316,7 @@ def _refresh_custom_words_sorted():
     """显式重建排序词表（热重载与测试直改词表后调用，用于预热）。"""
     global _CUSTOM_WORDS_SORTED
     _CUSTOM_WORDS_SORTED = _sorted_custom_words()
+    _sync_custom_word_mappings()
 
 
 def _custom_words_sorted():
@@ -1242,6 +1334,7 @@ def _custom_words_sorted():
     cur = _sorted_custom_words()
     if cur != _CUSTOM_WORDS_SORTED:
         _CUSTOM_WORDS_SORTED = cur
+        _sync_custom_word_mappings()
     return _CUSTOM_WORDS_SORTED
 
 
@@ -1961,6 +2054,11 @@ def _custom_word_enabled(word, label):
 # 单字词两侧不能是 CJK/字母数字，避免「密」打中「密码」、「加」打中「加密」。
 # 两字及以上仍子串匹配（「张三」左右常是汉字，加 CJK 边界会漏）；两字高频词靠 UI 禁用/默认关控制。
 _SINGLE_WORD_BOUND = r"A-Za-z0-9_\u4e00-\u9fff"
+# 整词开关用的边界**不含汉字**：汉字之间不存在词边界，`手机` 两侧几乎永远是汉字，
+# 用 CJK 做边界等于该词永不命中——实测「开关整词匹配」会把中文词的脱敏整个关掉，
+# 且界面上毫无提示（漏脱敏，不是误伤）。无分词器时中文词的「整词」无法表达，
+# 退化回子串匹配（宁可多打码，不可漏打码）；ASCII 词边界照旧，Acme 不会命中 AcmeCorp。
+_WHOLE_WORD_BOUND = r"A-Za-z0-9_"
 _CUSTOM_WORD_RX_CACHE = {}
 # 合并正则缓存：500 词 × 10 万字符从 O(词数×长度) 降到 O(长度)（审计性能项）。
 # 词表/禁用状态变化时 key 失效重建；key 计算是 O(词数) 的元组比较，微秒级。
@@ -2029,8 +2127,12 @@ def _custom_combined_regex():
             continue
         esc = re.escape(word)
         if len(word) == 1 or word in SENSITIVE_WORD_WHOLE:
-            # 单字词或显式整词开关：两侧加边界（不为字母数字/汉字），避免子串误伤
-            parts.append(rf"(?<![{_SINGLE_WORD_BOUND}]){esc}(?![{_SINGLE_WORD_BOUND}])")
+            # 单字词或显式整词开关：两侧加边界，避免子串误伤。
+            # 边界字符类分档：单字词用 _SINGLE_WORD_BOUND（含汉字，避免「密」打中
+            # 「密码」）；整词开关用 _WHOLE_WORD_BOUND（不含汉字）——否则中文词永不命中，
+            # 见该常量处的说明。单字判在前，故单字词的行为未变。
+            bound = _SINGLE_WORD_BOUND if len(word) == 1 else _WHOLE_WORD_BOUND
+            parts.append(rf"(?<![{bound}]){esc}(?![{bound}])")
         else:
             parts.append(esc)
     if skipped:
@@ -2046,6 +2148,65 @@ def _custom_combined_regex():
     _CUSTOM_COMBINED_CACHE["key"] = key
     _CUSTOM_COMBINED_CACHE["rx"] = rx
     return rx
+
+
+def _sync_custom_word_mappings():
+    """同步自定义敏感词的永久映射表。
+
+    在启动、热重载或 CUSTOM_WORDS 变动时调用。
+    为启用的自定义敏感词生成稳定、跨会话确定性的 6 位纯辅音占位符并永久常驻，
+    永不被 TTL 清理或超量淘汰，确保多轮会话或长任务调用工具时稳定还原。
+    """
+    global _CUSTOM_WORD_FWD, _CUSTOM_WORD_REV
+    now = time.time()
+    active_words = {}
+    for word, label in _custom_words_sorted():
+        if word and _custom_word_enabled(word, label):
+            active_words[word] = label
+
+    # 清理已从配置中移除或禁用的词
+    stale_words = [w for w in list(_CUSTOM_WORD_FWD.keys()) if w not in active_words]
+    for w in stale_words:
+        tok = _CUSTOM_WORD_FWD.pop(w, None)
+        if tok:
+            _CUSTOM_WORD_REV.pop(tok, None)
+
+    # 避让集合必须并入**全局后缀索引**（_RECENT_SUFFIX，含规则/NER/历史已签发的活跃
+    # token），不能只避让自定义词自己的后缀：否则新词一旦撞上某个活跃 token 的后缀
+    # （标签相同时 = 完整 token 相同），下面 `_RECENT_REV[tok] = ...` 会把那个 token
+    # 静默改指向新词——换会话 / 会话过期后 restore 会把 A 的原文填到 B 的位置上。
+    # 后缀空间 19^6≈4700 万、活跃至多 2000 条，实测约 4.3e-5/词，撞上即静默错值。
+    used_suffixes = {
+        _token_suffix(tok) for tok in _CUSTOM_WORD_REV
+    } | set(_RECENT_SUFFIX)
+    for word, label in active_words.items():
+        if word in _CUSTOM_WORD_FWD:
+            tok = _CUSTOM_WORD_FWD[word]
+            old_label = _CUSTOM_WORD_REV.get(tok, [None, None])[1]
+            if old_label == label and _safe_label(old_label) == _safe_label(label):
+                if tok in _CUSTOM_WORD_REV:
+                    _CUSTOM_WORD_REV[tok][2] = now
+                continue
+            # 标签变更时注销旧 token，重新派生
+            _CUSTOM_WORD_REV.pop(tok, None)
+            _RECENT_REV.pop(tok, None)
+            _suffix_index_del(tok)
+
+        suffix = _deterministic_suffix(word, used_suffixes)
+        used_suffixes.add(suffix)
+        lab = _safe_label(label)
+        tok = "{{%s_%s}}" % (lab, suffix)
+        prev = _RECENT_FWD.get(word)
+        if prev and prev[0] != tok:
+            # 预热/历史带进来的旧 token：换新 token 后必须注销，否则它会留在
+            # REV 与后缀索引里长驻成孤儿（_prune_recent 只按 FWD 扫，碰不到）
+            _RECENT_REV.pop(prev[0], None)
+            _suffix_index_del(prev[0])
+        _CUSTOM_WORD_FWD[word] = tok
+        _CUSTOM_WORD_REV[tok] = [word, label, now]
+        _RECENT_FWD[word] = [tok, label, now]
+        _RECENT_REV[tok] = [word, label, now]
+        _suffix_index_add(tok)
 
 
 def _request_scope(body):
@@ -2173,6 +2334,12 @@ _SUFFIX_PAT = r"(?:[0-9a-f]{6}|[bcdfghjkmnpqrstvwxz]{6})"
 
 # 完整占位符 / 行尾半截占位符（流式时可能被切在两个 chunk 之间）
 _PLACEHOLDER_RX = re.compile(r"\{\{[A-Z0-9]{1,12}_" + _SUFFIX_PAT + r"\}\}")
+# 兼容内部空白与标签改写的双花括号占位符（用于还原时的容错第一遍）
+# 覆盖模型习惯在 {{ 与标签之间加空格（如 Jinja 语法风格 `{{ APIKEY_xxxx }}`），
+# 避免原先按宽松正则替换导致留下 `{{ ` 和 ` }}` 破坏工具命令。
+_BRACED_PLACEHOLDER_RX = re.compile(
+    r"\{\{\s*([A-Za-z0-9_]{1,12})_(" + _SUFFIX_PAT + r")\s*\}\}"
+)
 # 「裸露 / 半残」占位符：模型经常把 {{ }} 剥掉或只剩一半再吐回来。
 #
 # 实测（deepseek-v4-flash，真实调用）：让它把脱敏后的 token 拼进一条 curl，
@@ -2182,7 +2349,9 @@ _PLACEHOLDER_RX = re.compile(r"\{\{[A-Z0-9]{1,12}_" + _SUFFIX_PAT + r"\}\}")
 #
 # 这条只做兜底修复，且**只替换我们自己发过的 token**（必须能在会话/复用表里查到），
 # 所以不存在误伤：LABEL_后缀 这种组合（6 位纯辅音或存量 hex6）正常文本里不会自然出现，何况还要求查得到。
-_LOOSE_PLACEHOLDER_RX = re.compile(r"\{{0,2}([A-Z0-9]{1,12}_" + _SUFFIX_PAT + r")\}{0,2}")
+_LOOSE_PLACEHOLDER_RX = re.compile(
+    r"\{{1,2}\s*([A-Za-z0-9_]{1,12}_" + _SUFFIX_PAT + r")\s*\}{0,2}|([A-Z0-9]{1,12}_" + _SUFFIX_PAT + r")"
+)
 # 行尾半截占位符（流式时可能被切在两个 chunk 之间），需要扣住等下一块拼。
 #
 # 反斜杠必须进入缓冲范围：模型输出 `\{\{X\}\}` 时，chunk 边界可能正好落在
@@ -2212,13 +2381,15 @@ _LOOSE_PLACEHOLDER_RX = re.compile(r"\{{0,2}([A-Z0-9]{1,12}_" + _SUFFIX_PAT + r"
 #
 # `{` 本身仍然是必需的——所以不含花括号的普通文本（`C:\Users\` 之外，
 # 比如「今天天气」）不会被扣住。
-_PARTIAL_RX = re.compile(r"(?:\\{0,3}\{){1,3}[A-Za-z0-9_]{0,20}\\{0,3}\}?\\{0,3}$|\\{1,3}$")
+_PARTIAL_RX = re.compile(r"(?:\\{0,3}\{){1,3}\s{0,4}[A-Za-z0-9_]{0,20}\s{0,4}\\{0,3}\}?\\{0,3}$|\\{1,3}$")
 # 扣留上限：必须 ≥ _PARTIAL_RX 能匹配出的最长片段，否则「扣不下」会退化成
 # 「就地处理半截占位符」——比如此前是 24，而二次转义的完整片段长 25，
 # 于是它总是不被扣留、还原后留下 `\\}` 残渣。
-# 反斜杠封顶后模式的理论上限 = 3 单元×4 + 20 + (3+1+3) = 39，故放到 40。
+# 反斜杠与空白都封顶后，模式的理论上限 = 3 单元×4 + 4 + 20 + 4 + (3+1+3) = 47，
+# 故放到 48。空白原是无界 `\s*`，那样「理论最长」根本无从计算，扣留上限也就
+# 失去依据（`{{` 后跟 40+ 空白的半截块扣不下，退化成留残渣）。
 # 保持小而具体：只是「一段疑似半截占位符」，不是缓冲任意文本。
-_PARTIAL_MAX = 40
+_PARTIAL_MAX = 48
 # 从完整占位符里拆出 label 与后缀。多处要用，别再各写各的正则——
 # 0.1.12 就有三处各自写死 [0-9a-f]{6}，改格式时漏一处就是静默失效。
 _PLACEHOLDER_PARTS_RX = re.compile(r"^\{\{([A-Z0-9]{1,12})_(" + _SUFFIX_PAT + r")\}\}$")
@@ -2251,14 +2422,14 @@ _PLACEHOLDER_PARTS_RX = re.compile(r"^\{\{([A-Z0-9]{1,12})_(" + _SUFFIX_PAT + r"
 # 与转义遍；不带花括号的形态仍交给宽松正则，且宽松正则不许走后缀索引
 # （理由见 _RECENT_SUFFIX 的注释）。
 _ESCAPED_PLACEHOLDER_RX = re.compile(
-    r"(?:\\{0,3}\{){1,3}(?:\\{0,3})([A-Za-z0-9_]{1,12})_(" + _SUFFIX_PAT + r")(?:\\{0,3}\}){1,3}",
+    r"(?:\\{0,3}\{){1,3}(?:\\{0,3})\s*([A-Za-z0-9_]{1,12})_(" + _SUFFIX_PAT + r")\s*(?:\\{0,3}\}){1,3}",
     re.IGNORECASE,
 )
 # 从「带花括号但标签可能被改写」的形态里取后缀。标签允许含下划线：
 # 模型会自己把 `IPPRIVATE` 补成 `IP_PRIVATE`，用 _PLACEHOLDER_PARTS_RX
 # （标签字符类不含下划线）解析不了这种。
 _ANY_BRACED_SUFFIX_RX = re.compile(
-    r"^\{\{([A-Za-z0-9_]{1,12})_(" + _SUFFIX_PAT + r")\}\}$", re.IGNORECASE
+    r"^\{\{\s*([A-Za-z0-9_]{1,12})_(" + _SUFFIX_PAT + r")\s*\}\}$", re.IGNORECASE
 )
 
 
@@ -2271,7 +2442,7 @@ def _token_suffix(token):
     """
     if not isinstance(token, str) or not token.startswith("{{") or not token.endswith("}}"):
         return ""
-    body = token[2:-2]
+    body = token[2:-2].strip()
     if "_" not in body:
         return ""
     return body.rsplit("_", 1)[1].lower()
@@ -2281,7 +2452,7 @@ def _token_label(token):
     """取 token 的标签部分（原样，未归一化）；形态不对返回空串。"""
     if not isinstance(token, str) or not token.startswith("{{") or not token.endswith("}}"):
         return ""
-    body = token[2:-2]
+    body = token[2:-2].strip()
     if "_" not in body:
         return ""
     return body.rsplit("_", 1)[0]
@@ -2409,6 +2580,104 @@ def _mask_excluding_placeholders(text, rx, sub_fn):
     return "".join(result)
 
 
+# ── NER（语义实体识别）辅助 ───────────────────────────────────────────────────
+# NER 是概率模型，与上面那套确定性规则之间有三条硬边界：
+#   1. 必须排在确定性规则之后跑，同一原文以确定性命中为准；
+#   2. 只能**按区间**替换，且与已有占位符相交时只脱敏「非占位符片段」；
+#   3. 长度上限 / 时间预算 / 失败可见性由 ner_engine 负责（见该模块头部成本模型）。
+# 先前的实现在这里踩了两个坑（均实测复现，2026-09-19）：
+#   - `not _PLACEHOLDER_RX.search(orig)` 守卫是**整段丢弃**：多轮历史带回的占位符
+#     会把同一实体（含其中的明文）整段放过；
+#   - 用 `re.compile(re.escape(orig))` 做**全文子串替换**：实体在长文本里出现 N 次
+#     就扫 N 遍全文（10 万字符实测 69 秒），而这段跑在 mitmproxy 的 asyncio 事件
+#     循环上，会冻结全部 upstream 端口的连接。
+_NER_WARNED = set()
+
+
+def _ner_warn_once(key, msg):
+    """NER 的失败必须可见（静默降级等于「以为开了、其实没脱」），但同类只记一次。"""
+    if key in _NER_WARNED:
+        return
+    _NER_WARNED.add(key)
+    try:
+        _log(f"[transparent] {msg}")
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _ner_doc_budget(seconds):
+    """给一段连续调用（如整份 Office 文档逐 run 脱敏）设 NER 总预算。
+
+    单条短文本实测约 10ms，几千个 run 会线性堆到分钟级，而扩展侧 HTTP 超时更短，
+    用户看到的就是「文件没脱敏」。超预算后只停用语义识别，确定性规则照常生效。
+    """
+    try:
+        import ner_engine
+    except Exception:
+        yield
+        return
+    ner_engine.begin_budget(seconds)
+    try:
+        yield
+    finally:
+        ner_engine.end_budget()
+
+
+def _mask_by_spans(text, spans):
+    """按 [start, end, repl) 区间一次性重建文本（spans 须已按 start 排序）。"""
+    if not spans:
+        return text
+    out = []
+    cursor = 0
+    for start, end, repl in spans:
+        if start < cursor:
+            continue          # 与已接受区间重叠：跳过，绝不让替换错位
+        out.append(text[cursor:start])
+        out.append(repl)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+def _ner_entity_spans(text, entities):
+    """把 NER 实体转成可安全替换的区间列表 [(start, end, label), ...]。
+
+    实体与已有占位符相交时，只取**不在占位符内**的片段，并按占位符边界切开：
+    - 模型常把 `上海市浦东新区{{TERM_x}}世纪大道100号` 识别成一个地址。整段替换会把
+      明文片段与既有占位符混成一个新 token；整段丢弃则明文照原样出网。
+      切成两段分别打码，才既不丢保护、也不污染已有占位符。
+    - 被占位符切碎的残渣（如 `{` / `}}`）不是实体：片段 strip 后不足 2 字即放弃。
+    """
+    ph = [(m.start(), m.end()) for m in _PLACEHOLDER_RX.finditer(text)]
+    spans = []
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        try:
+            start = int(ent["start"])
+            end = int(ent["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        label = str(ent.get("type") or "TERM")
+        if end - start < 2 or start < 0 or end > len(text):
+            continue
+        cursor = start
+        for ps, pe in ph:
+            if pe <= cursor:
+                continue
+            if ps >= end:
+                break
+            if ps > cursor:
+                spans.append((cursor, min(ps, end), label))
+            cursor = max(cursor, pe)
+            if cursor >= end:
+                break
+        if cursor < end:
+            spans.append((cursor, end, label))
+    return spans
+
+
 def mask(text, sid):
     """脱敏文本。返回脱敏后的文本。
 
@@ -2533,6 +2802,37 @@ def mask(text, sid):
                 return m.group(0)
             text = _mask_excluding_placeholders(text, rx, _rule_sub)
 
+    # ── AI 实体识别（NER）：人名 (NAME) / 机构 (ORG) / 详细地址 (ADDR) ──
+    # 排在全部确定性规则之后：同一原文以规则/自定义词为准，语义模型只补规则覆盖不到
+    # 的自由文本。按区间替换的实现与边界见 _ner_entity_spans。
+    if NER_ENABLED:
+        try:
+            import ner_engine
+            if not ner_engine.is_ner_available():
+                _ner_warn_once("model_missing",
+                               "NER 已开启但模型文件不可用（%s），本次未做实体识别"
+                               % ner_engine.status().get("model_dir"))
+            else:
+                entities = ner_engine.extract_entities(text)
+                planned = []
+                for s0, e0, lbl in _ner_entity_spans(text, entities):
+                    raw_frag = text[s0:e0]
+                    frag = raw_frag.strip()
+                    if len(frag) < 2:
+                        continue
+                    # 实体区间两端可能带空白，收窄到 strip 后的边界，
+                    # 免得把空格/换行一起换成占位符（还原后会丢排版）。
+                    lead = len(raw_frag) - len(raw_frag.lstrip())
+                    _hit(frag, lbl)
+                    token = fwd.get(frag)
+                    if token:
+                        planned.append((s0 + lead, s0 + lead + len(frag), token))
+                if planned:
+                    planned.sort()
+                    text = _mask_by_spans(text, planned)
+        except Exception as e:
+            _ner_warn_once("runtime", "NER 识别降级，本次未做实体识别: %s: %s" % (type(e).__name__, e))
+
     # last_hits / new_orig 累积而非覆盖：mask() 被 _mask_tree 对每个字符串叶子
     # 各调一次，覆盖会让 count 只反映最后一个叶子的命中（曾导致 MASK 行
     # 「脱敏列 0、明细 2 项」自相矛盾）。
@@ -2597,9 +2897,17 @@ def _lookup(token, sid):
 
     if hit is None:
         recent = _RECENT_REV.get(token)
-        if recent and time.time() - recent[2] <= _recent_ttl():
-            _touch_recent(token, recent[0])
-            hit = recent[0]
+        if recent:
+            if _is_custom_word_orig(recent[0]) or _is_custom_word_token(token) or time.time() - recent[2] <= _recent_ttl():
+                _touch_recent(token, recent[0])
+                hit = recent[0]
+
+    # 兜底：如果 _RECENT_REV 没命中（例如外部重置了复用表），直接查永久映射表
+    if hit is None:
+        c_rec = _CUSTOM_WORD_REV.get(token)
+        if c_rec:
+            hit = c_rec[0]
+            _touch_recent(token, hit)
 
     # 防占位符套娃解包（如 A 被误脱敏为 B，递归解包直到真实明文）
     depth = 0
@@ -2612,8 +2920,13 @@ def _lookup(token, sid):
             rec = _RECENT_REV.get(hit)
             # 内层同样校验 TTL：套娃解包走的是「外层校验过、内层没校验」的缝隙，
             # 会用一条早已过期的映射完成还原，突破 24h 原文保留窗口契约
-            if rec and time.time() - rec[2] <= _recent_ttl():
-                inner = rec[0]
+            if rec:
+                if _is_custom_word_orig(rec[0]) or _is_custom_word_token(hit) or time.time() - rec[2] <= _recent_ttl():
+                    inner = rec[0]
+            if inner is None:
+                c_rec = _CUSTOM_WORD_REV.get(hit)
+                if c_rec:
+                    inner = c_rec[0]
         if inner is not None and inner != hit:
             hit = inner
         else:
@@ -2657,45 +2970,53 @@ def restore(text, sid, channel="", escape=False, final=False):
         return ""
 
     def _sub(m):
-        token = m.group(0)
-        orig = _lookup(token, sid)
+        whole = m.group(0)
+        lab_raw = m.group(1)
+        suffix = m.group(2)
+        canon = "{{%s_%s}}" % (lab_raw.upper(), suffix.lower())
+        orig = _lookup(canon, sid)
         via_suffix = False
+        real_token = canon if orig is not None else None
         if orig is None:
-            # 标签被模型改写（补回下划线 / 全小写 / 整段换名）时按后缀反查。
-            # 这里是严格遍，形态由 _PLACEHOLDER_RX 保证带花括号，可以安全走后缀索引。
-            #
-            # 按当前 _PLACEHOLDER_RX 的字符类（`[A-Z0-9]{1,12}`，不含下划线）这条路
-            # 其实到不了：能过严格正则的标签必然与签发时一致，_suffix_real_token 会因
-            # real == token 直接返回 None。保留它是因为一旦将来放宽严格正则（比如允许
-            # 标签含下划线，好让 `{{IP_PRIVATE_x}}` 在严格遍就命中），这里就是兜底。
-            orig = _lookup_by_suffix(token, sid)
-            via_suffix = orig is not None
+            # 标签被模型改写（补回下划线 / 全小写 / 变异）时按后缀反查。
+            # 这里是双花括号形态，由 _BRACED_PLACEHOLDER_RX 保证带花括号，可以安全走后缀索引。
+            real = _suffix_real_token(canon)
+            if real is not None:
+                orig = _lookup(real, sid)
+                if orig is not None:
+                    real_token = real
+                    via_suffix = True
+            if orig is None:
+                orig = _lookup_by_suffix(canon, sid)
+                if orig is not None:
+                    via_suffix = True
+                    real_token = canon
         if orig is None:
             # 占位符查不到原文（复用表被淘汰/会话被扫掉/客户端历史带入的孤儿）：
-            # 原样返回（不能猜），但必须计数，RESTORE 事件里能看见"有占位符没还原"
-            s["unresolved"] = s.get("unresolved", 0) + 1
-            return token
+            # 只有当它是标准的紧凑形态时才计数 unresolved，原样返回（不能猜）
+            if _PLACEHOLDER_RX.match(whole):
+                s["unresolved"] = s.get("unresolved", 0) + 1
+            return whole
         s["restored"] = s.get("restored", 0) + 1
-        s["restored_tokens"].add(token)
+        s["restored_tokens"].add(real_token or canon)
         s.setdefault("restored_origs", set()).add(orig)
-        if via_suffix:
-            # 靠改写容错救回来的，与宽松兜底同性质：是成功路径，但说明模型在
-            # 改写占位符，属于「哪天彻底还原不回来」的前兆，要能看见。
+        if via_suffix or whole != canon:
+            # 靠空格容错或改写容错救回来的，计入 degraded
             s["degraded"] = s.get("degraded", 0) + 1
         return json.dumps(orig, ensure_ascii=False)[1:-1] if escape else orig
 
-    out = _PLACEHOLDER_RX.sub(_sub, confirmed)
+    out = _BRACED_PLACEHOLDER_RX.sub(_sub, confirmed)
 
-    # 第二遍：转义形态 `\{\{X\}\}`。
+    # 第二遍：转义形态 `\{\{X\}\}` / `\\{\\{X\\}\\}`，含内部可选空白。
     #
     # 必须跑在宽松遍之前：宽松正则不带花括号匹配，在转义形态上只吃得到中间
     # 一段，替换完会留下 `\{\` 与 `\}\}` 残渣 —— IP 出来了但命令仍然是坏的，
-    # 用户会误判成「还原成功」。这一遍把整个转义块（连同反斜杠）一起替换掉。
+    # 用户会误判成「还原成功」。这一遍把整个转义块（连同反斜杠与内部空白）一起替换掉。
     # 同样只认查得到原文的 token，查不到原样放回，绝不猜。
     if "_" in out:
         def _esc_sub(m):
             whole = m.group(0)
-            canon = "{{%s_%s}}" % (m.group(1), m.group(2))
+            canon = "{{%s_%s}}" % (m.group(1).upper(), m.group(2).lower())
             orig = _lookup(canon, sid)
             real = canon if orig is not None else None
             if orig is None:
@@ -2713,7 +3034,7 @@ def restore(text, sid, channel="", escape=False, final=False):
             return json.dumps(orig, ensure_ascii=False)[1:-1] if escape else orig
         out = _ESCAPED_PLACEHOLDER_RX.sub(_esc_sub, out)
 
-    # 第三遍：捞回被模型剥了花括号 / 只剩一半的占位符。
+    # 第三遍：捞回被模型剥了花括号 / 只剩单花括号的占位符。
     # 只在前面两遍之后跑，且只认「查得到原文」的 token——查不到就原样放回，绝不猜。
     # **这一遍不走后缀索引**：裸 token 可能只是被 chunk 切开的残片，按后缀命中
     # 就会把残片替换成明文（见 _RECENT_SUFFIX 注释）。
@@ -2725,13 +3046,22 @@ def restore(text, sid, channel="", escape=False, final=False):
         def _loose_sub(m):
             whole = m.group(0)
             if whole.startswith("{{") and whole.endswith("}}"):
-                return whole  # 严格形态第一遍已处理
-            orig = _lookup("{{" + m.group(1) + "}}", sid)
+                return whole  # 双花括号形态第一遍已处理
+            tok_body = (m.group(1) or m.group(2) or "").strip()
+            canon = "{{" + tok_body + "}}"
+            orig = _lookup(canon, sid)
+            real = canon if orig is not None else None
+            if orig is None and whole.startswith("{"):
+                real = _suffix_real_token(canon)
+                if real is not None:
+                    orig = _lookup(real, sid)
             if orig is None:
                 return whole
             s["restored"] = s.get("restored", 0) + 1
             s["degraded"] = s.get("degraded", 0) + 1
             s.setdefault("restored_origs", set()).add(orig)
+            if real is not None:
+                s["restored_tokens"].add(real)
             return json.dumps(orig, ensure_ascii=False)[1:-1] if escape else orig
         out = _LOOSE_PLACEHOLDER_RX.sub(_loose_sub, out)
     return out
@@ -2745,6 +3075,19 @@ def restore_final(text, sid, escape=False):
 _JSON_STR_KEYS = {"arguments", "partial_json"}
 
 
+_RESTORE_MAX_DEPTH = 24
+
+
+def _count_unresolved(sid, n=1):
+    """会话级 unresolved 计数（与 restore() 维护同一字段，只用于诊断展示）。"""
+    s = sessions.get(sid)
+    if isinstance(s, dict):
+        try:
+            s["unresolved"] = int(s.get("unresolved") or 0) + n
+        except Exception:
+            pass
+
+
 def _restore_tree(obj, sid, key=None, depth=0):
     """递归还原 JSON 里所有字符串叶子。
 
@@ -2752,7 +3095,11 @@ def _restore_tree(obj, sid, key=None, depth=0):
     Responses output[]…），逐个格式硬编码必然漏。占位符只可能出现在我们脱敏过的
     位置，整树扫一遍是安全的，且天然覆盖 tool 调用参数。
     """
-    if depth > 24:
+    if depth > _RESTORE_MAX_DEPTH:
+        # 超深不再静默：请求侧同深度是 fail-closed（_mask_tree 抛 json_depth_exceeded），
+        # 响应侧此前直接原样返回——占位符就此永久留在回复里，而会话计数毫无变化，
+        # 排障时分不清「这里没还原」和「本来就没有占位符」。
+        _count_unresolved(sid, 1)
         return obj
     if isinstance(obj, str):
         return restore_final(obj, sid, escape=key in _JSON_STR_KEYS)
@@ -2822,6 +3169,70 @@ _MASK_CORRELATION_ID_KEYS = {"tool_call_id", "tool_use_id", "call_id"}
 # 业务区容器 key：进入后任何字段都照常扫描
 _MASK_BUSINESS_KEYS = {"input", "arguments", "parameters", "partial_json", "documents"}
 _MASK_MAX_DEPTH = 24
+
+# 数值型协议字段：这些键的**数值**是协议参数（采样参数、用量计数、序号），
+# 不是业务数据。{"seed": 1234567890123456} 这种随机大整数完全可能被 Luhn 校验
+# 误判成卡号 —— 一旦改写，请求当场被上游拒绝。所以数值分支对它们一律豁免。
+# ⚠️ 只对**数值**豁免，字符串形态照常扫描（`{"seed": "13800138000"}` 仍会命中）。
+_MASK_SKIP_NUMERIC_KEYS = {
+    "max_tokens", "max_completion_tokens", "max_tokens_to_sample", "budget_tokens",
+    "temperature", "top_p", "top_k", "n", "seed", "index", "created", "logprobs",
+    "top_logprobs", "presence_penalty", "frequency_penalty", "best_of", "timeout",
+    "prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens",
+    "cache_creation_input_tokens", "cache_read_input_tokens", "reasoning_tokens",
+    "status_code", "http_status", "retry", "attempt", "weight", "priority",
+}
+
+# 对象**键名**的白名单：集合内的键永不脱敏，集合外一律当「数据键」扫描。
+#
+# 为什么需要这个集合：旧实现「键名一律不脱敏」让 `{"13800138000": "safe"}` 这种
+# PII-as-key 形态整条明文上行（审计 B2 实测）。但直接放开又会踩另一个坑 ——
+# 用户自定义短词（比如加个 "con"）会命中 `content`，把协议骨架打坏，
+# 代价是**每个请求都坏**，比漏一个罕见载荷形状严重得多。
+#
+# 所以判据从「要不要扫」翻转成「哪些键是结构键」：这里穷举协议/角色/JSON Schema
+# 词汇，命中即豁免；剩下的键才是数据键。新增协议字段时**必须同步加到这里**，
+# 否则该字段名会被当数据脱敏（症状：上游报参数非法）。
+_MASK_PROTECTED_KEY_NAMES = frozenset(
+    set(_MASK_SKIP_SCALAR_KEYS)
+    | set(_MASK_SKIP_SUBTREE_KEYS)
+    | set(_MASK_SKIP_KEYS)
+    | set(_MASK_CORRELATION_ID_KEYS)
+    | set(_MASK_ROLE_TYPE_PARENTS)
+    | set(_MASK_PROTOCOL_PARENTS)
+    | set(_MASK_PROTOCOL_ID_PARENTS)
+    | set(_MASK_BUSINESS_KEYS)
+    | {
+        # 对话协议骨架
+        "role", "type", "content", "contents", "parts", "messages", "message",
+        "system", "user", "assistant", "tool", "tools", "function", "functions",
+        "prompt", "input", "output", "text", "delta", "choices", "candidates",
+        "usage", "error", "code", "status", "version", "headers", "request",
+        "response", "metadata", "stream", "stop", "stop_sequences", "logit_bias",
+        "response_format", "stream_options", "parallel_tool_calls", "tool_choice",
+        "system_instruction", "generationConfig", "safetySettings", "toolConfig",
+        "functionDeclarations", "functionCall", "inline_data", "image_url", "source",
+        "anthropic_version", "thinking", "signature",
+        # JSON Schema 词汇（response_format / format 里可能是整份 schema）
+        "schema", "json_schema", "format", "definitions", "$defs", "$ref", "$schema",
+        "properties", "required", "items", "enum", "const", "description", "title",
+        "additionalProperties", "anyOf", "oneOf", "allOf", "not", "if", "then", "else",
+        "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+        "minLength", "maxLength", "minItems", "maxItems", "pattern", "default",
+        "examples", "nullable", "strict", "name", "strict_mode",
+        # 缓存 / 计费 / 诊断指令
+        "cache_control", "ttl", "ephemeral",
+        # 对话协议顶级控制参数（涵盖各大模型标准字段，对齐 PROTOCOL_TOP_KEYS）
+        "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens",
+        "max_output_tokens", "presence_penalty", "frequency_penalty", "seed",
+        "logprobs", "top_logprobs", "modalities", "audio", "prediction", "store",
+        "service_tier", "reasoning", "reasoning_effort", "thinking_budget",
+        "betas", "anthropic_beta", "context_management", "mcp_servers", "container",
+        "generation_config", "safety_settings", "candidate_count", "systemInstruction",
+        "session_id", "request_id", "keep_alive", "options", "api_key", "x_api_key",
+        "authorization", "instructions", "tool_config",
+    }
+)
 # 顶层非对象 JSON 的合成根键：只在 request() 内部存在，发往上游前一定会拆掉。
 # 取一个绝不会与真实字段重名、且不落在任何跳过名单里的名字，保证叶子照常被扫描。
 _ROOT_WRAP_KEY = "__shield_root__"
@@ -2959,6 +3370,51 @@ def _mask_hit(obj, sid, flag=None):
     return out
 
 
+def _leaf_exempt(key, parent, in_business):
+    """叶子（字符串 / 数值）是否落在「协议位置」从而豁免扫描。
+
+    抽成独立函数是因为 str 与数值两个分支必须用**同一套**判据：数值型漏检
+    （审计 B2）的根因之一就是数值分支压根没有判据、直接 `return obj`。
+
+    判据细节（按优先级）：
+    - 工具调用关联 ID：**不分业务区，一律豁免**。它是上游生成的不透明句柄
+      （call_abc123），客户端要拿它把工具结果回连到上一轮函数调用。脱敏它必然断链，
+      而且保护不了任何东西——里面没有用户原文，有也是上游必须逐字匹配的那份。
+      所以这条判定必须在 in_business 之前。
+      提前的原因（2026-08-17 外部审计）：OpenAI Responses API 把协议信封放进
+      input[] 里 —— {"input":[{"type":"function_call_output","call_id":...}]}。
+      而 input 是业务区容器，`if not in_business` 那一大块整个不进，
+      于是 call_id 被当普通文本脱敏：call_ACME_9x → call_{{CUSTOMER_ed24da}}_9x。
+      Chat Completions 的 tool_call_id 在 messages[] 里（非业务区）所以一直没事，
+      两边行为不一致纯属遗漏，不是设计。
+    - 业务区内一律不豁免（见 `_mask_tree` 的说明）。
+    - 业务区外按「完整路径 + 协议位置」判定，禁止裸字段名豁免。
+      只列关联 ID，不含 name/url/id 等——那些在业务对象里确实可能载有原文
+      （customer.id、正文里的 url），维持按位置判定（见 AGENTS 约束 12）。
+    """
+    if key in _MASK_CORRELATION_ID_KEYS:
+        return True
+    if in_business:
+        return False
+    if key in _MASK_SKIP_SCALAR_KEYS:
+        return True
+    if key in ("role", "type") and (parent is None or parent in _MASK_ROLE_TYPE_PARENTS):
+        return True
+    if key in _MASK_SKIP_KEYS:
+        # 协议位置判定（业务区内不豁免）：
+        # - name：仅工具定义/调用位置的工具名（tools[].function.name / tool_use.name）
+        # - url/data/b64_json：仅媒体容器里的图片 URL/base64（改了就破图）
+        # - id：仅协议容器（messages/content/tool_calls/response/output 等）的关联 ID
+        if key == "name" and parent not in _MASK_PROTOCOL_PARENTS:
+            return False
+        if key in ("url", "data", "b64_json", "image_url") and parent not in _MASK_PROTOCOL_PARENTS:
+            return False
+        if key == "id" and parent not in _MASK_PROTOCOL_ID_PARENTS:
+            return False
+        return True
+    return False
+
+
 def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
     """递归脱敏 JSON 里的字符串叶子（完整路径判定 + 业务区强制扫描）。
 
@@ -2978,39 +3434,30 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
         # 业务区（tool_use.input / function.arguments 等参数容器）内一律扫描：
         # 不应用任何全局字段名豁免——input 里的 type/role/model/id 都可能是业务数据
         # （审计实测：input.type 放手机号曾原文上行）。只有业务区外的协议位置才跳过。
-        # 工具调用关联 ID：**不分业务区，一律豁免**。
-        # 它是上游生成的不透明句柄（call_abc123），客户端要拿它把工具结果回连到上一轮
-        # 函数调用。脱敏它必然断链，而且保护不了任何东西——里面没有用户原文，
-        # 有也是上游必须逐字匹配的那份。所以这条判定必须在 in_business 之前。
-        #
-        # 提前的原因（2026-08-17 外部审计）：OpenAI Responses API 把协议信封放进
-        # input[] 里 —— {"input":[{"type":"function_call_output","call_id":...}]}。
-        # 而 input 是业务区容器，`if not in_business` 那一大块整个不进，
-        # 于是 call_id 被当普通文本脱敏：call_ACME_9x → call_{{CUSTOMER_ed24da}}_9x。
-        # Chat Completions 的 tool_call_id 在 messages[] 里（非业务区）所以一直没事，
-        # 两边行为不一致纯属遗漏，不是设计。
-        #
-        # 只列关联 ID，不含 name/url/id 等——那些在业务对象里确实可能载有原文
-        # （customer.id、正文里的 url），维持按位置判定（见 AGENTS 约束 12）。
-        if key in _MASK_CORRELATION_ID_KEYS:
-            return obj
-        if not in_business and key in _MASK_SKIP_SCALAR_KEYS:
-            return obj
-        if not in_business and key in ("role", "type") and (parent is None or parent in _MASK_ROLE_TYPE_PARENTS):
-            return obj
-        if not in_business and key in _MASK_SKIP_KEYS:
-            # 协议位置判定（业务区内不豁免）：
-            # - name：仅工具定义/调用位置的工具名（tools[].function.name / tool_use.name）
-            # - url/data/b64_json：仅媒体容器里的图片 URL/base64（改了就破图）
-            # - id：仅协议容器（messages/content/tool_calls/response/output 等）的关联 ID
-            if key == "name" and parent not in _MASK_PROTOCOL_PARENTS:
-                return _mask_hit(obj, sid, flag)
-            if key in ("url", "data", "b64_json", "image_url") and parent not in _MASK_PROTOCOL_PARENTS:
-                return _mask_hit(obj, sid, flag)
-            if key == "id" and parent not in _MASK_PROTOCOL_ID_PARENTS:
-                return _mask_hit(obj, sid, flag)
+        # 判据抽到 `_leaf_exempt`：数值分支必须用同一套，否则两边行为会漂。
+        if _leaf_exempt(key, parent, in_business):
             return obj
         return _mask_hit(obj, sid, flag)
+    # bool 是 int 的子类，必须先判掉：否则 True/False 会被 str() 成 "True"/"False"
+    # 送去过规则（虽然默认词表不会命中，但自定义词表里加个 "True" 就会）。
+    if isinstance(obj, bool) or obj is None:
+        return obj
+    if isinstance(obj, (int, float)):
+        # 数值型标量（审计 B2 阻断项）。规则全是文本正则，而旧实现到这里直接
+        # `return obj` —— 于是 {"phone": 13800138000} 这种形态**既不命中也不抛异常**，
+        # changed 保持 False → 零改写分支把客户端原始字节原样放行，明文出网；
+        # 而 fail-closed 只兜异常，兜不住「静默判定为无需改写」。
+        # 修法：取字符串形态过一遍规则，命中才把整个值换成占位符（类型由 number
+        # 变 string，上游读到的就是占位符，与字符串形态的脱敏结果一致）。
+        if key in _MASK_SKIP_NUMERIC_KEYS or _leaf_exempt(key, parent, in_business):
+            return obj
+        s = repr(obj) if isinstance(obj, float) else str(obj)
+        out = mask(s, sid)
+        if out != s:
+            if flag is not None:
+                flag[0] = True
+            return out
+        return obj
     if isinstance(obj, list):
         return [_mask_tree(v, sid, key, parent, path, depth + 1, flag) for v in obj]
     if isinstance(obj, dict):
@@ -3018,15 +3465,26 @@ def _mask_tree(obj, sid, key=None, parent=None, path=(), depth=0, flag=None):
         # _MASK_SKIP_SCALAR_KEYS 对对象值无效（见该集合上方的注释）。
         if not in_business and key in _MASK_SKIP_SUBTREE_KEYS:
             return obj
-        # 对象**键名不脱敏**，这是有意保留的边界，不是遗漏：
-        # 1) 键名承载结构语义（content/type/role/messages…），一旦被自定义短词误命中
-        #    （用户加个 "con" 就会命中 content），整条请求的协议骨架当场崩掉——代价是
-        #    每个请求都坏，而收益只是覆盖「PII 恰好是键名」这一种罕见载荷形状；
-        # 2) 真正常见的 PII-as-key 场景（tool_calls[].function.arguments、
-        #    partial_json）在上游是 JSON **字符串**，走的是下面的 str 分支，
-        #    整个 JSON 文本（含键名）都会被扫描，本来就没漏。
-        # 若要覆盖剩余场景，必须先能可靠区分「数据键」与「结构键」，否则误伤面大于收益。
-        return {k: _mask_tree(v, sid, k, key, path + (k,), depth + 1, flag) for k, v in obj.items()}
+        # 键名脱敏（2026-09 起，审计 B2）。旧实现是「键名一律不脱敏」，理由是
+        # 键名承载结构语义、自定义短词误命中会把协议骨架打坏。这个顾虑成立，
+        # 但它同时让 {"13800138000": "safe"} 这种 PII-as-key 形态整条明文上行。
+        #
+        # 现在的判据翻转成**结构键白名单**：`_MASK_PROTECTED_KEY_NAMES` 内的键永不
+        # 脱敏，集合外一律当数据键扫描。于是「用户加个 con 命中 content」这类误伤
+        # 被白名单挡住，而手机号/身份证当键名时能被打上。
+        # 注意 path 仍用**原键** k 推进：in_business 判定必须看客户端真实的键名，
+        # 用脱敏后的占位符去判会让下游整棵子树丢失业务区语义。
+        masked_obj = {}
+        for k, v in obj.items():
+            new_key = k
+            if isinstance(k, str) and k not in _MASK_PROTECTED_KEY_NAMES:
+                masked_key = mask(k, sid)
+                if masked_key != k:
+                    new_key = masked_key
+                    if flag is not None:
+                        flag[0] = True
+            masked_obj[new_key] = _mask_tree(v, sid, k, key, path + (k,), depth + 1, flag)
+        return masked_obj
     return obj
 
 
@@ -3101,6 +3559,34 @@ def _mask_event_items(sid, limit=30):
     return items
 
 
+_DUP_KEY_WARNED = [False]
+
+
+def _load_json_pairs(text):
+    """解析 JSON，并同时报告**是否存在重复键**。返回 (obj, has_dupes)。
+
+    为什么要单独判重复键：`json.loads` 对重复键取「后者覆盖前者」，解析结果无法
+    代表原文。于是 `{"a":"13800138000","a":"safe"}` 的树里只剩 "safe"，`_mask_tree`
+    扫不到那个手机号 → changed 保持 False → 零改写分支把**原始字节**原样放行
+    （审计 B2 实测）。命中其它字段时同样不能走 `_splice_mask`：丢掉的键不在替换表里，
+    而等价校验又会因为「splice 结果解析回来仍等于脱敏树」而误判通过，明文照样出网。
+
+    解析失败返回 (None, False) —— 由调用方走各自的「非 JSON 体」分支。
+    """
+    dupes = [False]
+
+    def _pairs(pairs):
+        d = dict(pairs)
+        if not dupes[0] and len(d) != len(pairs):
+            dupes[0] = True
+        return d
+
+    try:
+        return json.loads(text, object_pairs_hook=_pairs), dupes[0]
+    except Exception:
+        return None, False
+
+
 def mask_body(text, sid):
     """请求体脱敏（JSON 感知 + 就地替换），扩展链路的请求打码入口。
 
@@ -3112,14 +3598,21 @@ def mask_body(text, sid):
     解析失败（纯文本体）走 `mask()` 整段扫描。
 
     零命中时**逐字节原样返回**（省一次序列化，也让上游前缀缓存能命中）。
+    例外是**含重复键**的体：树里已丢掉被覆盖的那个值，零改写会放行原文，
+    所以强制走重序列化（见 `_load_json_pairs`）。
+
     深度超限等异常**向上抛**（端点转 (A) 阻断），绝不在这里静默放行明文。
     """
     if not text:
         return text
-    try:
-        obj = json.loads(text)
-    except Exception:
-        obj = None
+    obj, has_dupes = _load_json_pairs(text)
+    if has_dupes and not _DUP_KEY_WARNED[0]:
+        _DUP_KEY_WARNED[0] = True
+        try:
+            _log("[mask] 请求体存在重复键：该请求已改为整棵重序列化，"
+                 "被覆盖的字段值不会明文上行（首次告警，后续静默）")
+        except Exception:
+            pass
     if not isinstance(obj, (dict, list)):
         # 非 JSON 体（含合法 JSON 标量）：整段当纯文本扫描
         out = mask(text, sid)
@@ -3128,26 +3621,27 @@ def mask_body(text, sid):
 
     changed = [False]
     masked_root = _mask_tree(obj, sid, flag=changed)
-    if not changed[0]:
+    if not changed[0] and not has_dupes:
         # 零改写：一个字都不动（保住前缀），但仍登记历史遗留占位符供响应侧还原
         _seed_known(text, sid)
         return text
 
     masked_raw = None
-    try:
-        spliced = _splice_mask(
-            text.encode("utf-8"), masked_root,
-            {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
-        )
-    except Exception:
-        spliced = None
-    if spliced is not None:
+    if not has_dupes:
         try:
-            decoded = spliced.decode("utf-8")
-            if json.loads(decoded) == masked_root:
-                masked_raw = decoded
+            spliced = _splice_mask(
+                text.encode("utf-8"), masked_root,
+                {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
+            )
         except Exception:
-            masked_raw = None
+            spliced = None
+        if spliced is not None:
+            try:
+                decoded = spliced.decode("utf-8")
+                if json.loads(decoded) == masked_root:
+                    masked_raw = decoded
+            except Exception:
+                masked_raw = None
     if masked_raw is None:
         masked_raw = json.dumps(masked_root,
                                ensure_ascii=("\\u" in text),
@@ -3241,6 +3735,14 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
         else:
             content = resp.content or b""
         body_text = content.decode("utf-8", errors="replace") if content else ""
+        # 审计扫描的**输入上限**（审计 M1）。此前全量 body_text 直接喂给
+        # `scan_error_leak` / `scan_response_poison` / `scan_dangerous_action`，
+        # 而上游完全可以回一个 4xx + 几百 KB 的畸形 body：单是 PEM 正则的
+        # 灾难性回溯就足以把 mitmproxy 事件循环 CPU 打满（实测 12KB 就要 3.4s）。
+        # 响应侧扫描是**防御性**功能，前段命中已覆盖绝大多数幻觉/泄漏场景。
+        # ⚠️ 只截断送给扫描器的副本：`body_text` 本身要保持全量，
+        # `_parse_response_payload`（SSE/JSON 结构化解析）不能吃截断后的文本。
+        scan_text = body_text[:_SCAN_BODY_MAX] if body_text else ""
         # 回声抑制用的请求体文本：请求里本来就有的危险命令/凭据不算「上游注入」。
         # 生产库实测这是最有效的一条去噪规则——编程助手的对话里 rm、curl|sh
         # 天天出现，只有上游凭空多出来的那条才值得报。
@@ -3248,6 +3750,7 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
             req_text = (getattr(flow.request, "content", None) or b"").decode("utf-8", errors="replace")
         except Exception:
             req_text = ""
+        scan_req_text = req_text[:_SCAN_BODY_MAX] if req_text else ""
         req_hash = _hash_body(getattr(flow.request, "content", None))
         resp_hash = _hash_body(content)
         common = {
@@ -3262,17 +3765,17 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
             # 上游域名检测已移除（2026-08-18）：错误页出现用户**已配置**的上游地址
             # 是诊断信息而不是面向客户端的信息泄露，改由普通 ERR/状态日志排障；
             # 留在这里只会把审计中心刷成上游错误页的噪音场。
-            findings.extend(_audit.scan_error_leak(status_code, body_text, hdrs_text))
+            findings.extend(_audit.scan_error_leak(status_code, scan_text, hdrs_text))
 
         # S6 response_poison（被动+主动，200/4xx 都扫）
-        if AUDIT_SIGNALS.get("response_poison") and body_text:
-            findings.extend(_audit.scan_response_poison(body_text, req_text))
+        if AUDIT_SIGNALS.get("response_poison") and scan_text:
+            findings.extend(_audit.scan_response_poison(scan_text, scan_req_text))
 
         # S9 dangerous_action：模型下发的破坏性命令（rm -rf / / DROP DATABASE / 强推…）
         # 必须扫**还原后**的文本：占位符状态下路径和主机名都是假的，判不准也没意义。
         # 只告警不阻断——设计取舍见 audit_signals.scan_dangerous_action 的注释。
-        if AUDIT_SIGNALS.get("dangerous_action") and body_text:
-            findings.extend(_audit.scan_dangerous_action(body_text, req_text))
+        if AUDIT_SIGNALS.get("dangerous_action") and scan_text:
+            findings.extend(_audit.scan_dangerous_action(scan_text, scan_req_text))
 
         # S2 identity_swap + S4 sse_anomaly：需解析 body
         if body_text and ("json" in ct or "event-stream" in ct):
@@ -3288,8 +3791,16 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
                     req_model = _extract_model(req_body)
                 except Exception:
                     pass
-                for chunk in text_chunks:
-                    findings.extend(_audit.scan_identity_swap(chunk, model_field, req_model))
+                # ⚠️ 必须**只调一次**，不能放在 `for chunk in text_chunks` 里（审计 B4）。
+                # `scan_identity_swap` 的判据只有 `model_field` + `req_model`，第一个
+                # 参数（文本）完全不参与判定（见 audit_signals.scan_identity_swap）。
+                # 放进循环的后果是：tool_use-only / reasoning-only / 空文本响应
+                # （Anthropic 非流式 tool_use、流式 delta.partial_json、OpenAI
+                # content:null 拒答）的 `text_chunks` 为空 → 整段跳过 → 换芯检测
+                # 在编程助手最主流的响应形态上完全失效，而 `model_field` 明明已解析出来。
+                # 传第一个非空 chunk 只是为了将来若该参数被启用时仍有上下文。
+                findings.extend(_audit.scan_identity_swap(
+                    text_chunks[0] if text_chunks else "", model_field, req_model))
             # S4 sse_anomaly（仅 SSE）
             if AUDIT_SIGNALS.get("sse_anomaly") and "event-stream" in ct:
                 findings.extend(_audit.scan_sse_anomaly(events))
@@ -3371,12 +3882,19 @@ def _parse_response_payload(body_text, ct):
     try:
         if is_sse:
             for line in body_text.split("\n"):
-                if not line.startswith("data: "):
+                if not line.startswith("data:"):
                     continue
-                if line.strip() == "data: [DONE]":
+                # SSE 规范里 `data:` 后的空格是**可选**的（`data:foo` 与 `data: foo` 等价）。
+                # 旧实现要求 `data: ` 带空格，且用硬编码偏移 `line[6:]` 取载荷，于是
+                # 不带空格的上游（部分网关的 SSE 实现）在 S2/S4 审计里被整段静默跳过
+                # （审计 L1）。改成按规范剥掉至多一个前导空格。
+                # ⚠️ 只影响审计侧：流式还原走的是另一套解析，本来就不带空格。
+                payload = line[5:].lstrip(" ")
+                payload = payload.rstrip("\r")
+                if payload.strip() == "[DONE]":
                     continue
                 try:
-                    data = json.loads(line[6:].rstrip("\r"))
+                    data = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
                 etype = data.get("type")
@@ -3385,6 +3903,14 @@ def _parse_response_payload(body_text, ct):
                 if etype == "message_start" and model_field is None:
                     msg = data.get("message") or {}
                     model_field = msg.get("model") or data.get("model")
+                # OpenAI 兼容流式：**每个 chunk 顶层都带 model**，而且没有 `type` 键
+                # （OpenAI 格式靠 choices 判别，不写事件名）。只看 message_start 会让
+                # model_field 恒为 None → S2 换芯检测在所有 OpenAI 兼容中转上完全失效
+                # （gpt-* / deepseek / 各类聚合网关，恰恰是换芯最高发的路径）。
+                if model_field is None and isinstance(data, dict):
+                    mf = data.get("model")
+                    if isinstance(mf, str) and mf.strip():
+                        model_field = mf
                 # text chunks: Claude content_block_delta
                 if etype == "content_block_delta":
                     txt = data.get("delta", {}).get("text", "")
@@ -3742,9 +4268,11 @@ def request(flow: http.HTTPFlow):
             {"content-type": "application/json"},
         )
         return
-    try:
-        body = json.loads(raw_content)
-    except Exception:
+    # 重复键（{"a":"13800138000","a":"safe"}）：json.loads 取后者覆盖前者，树里
+    # 已经丢了被覆盖的值，扫不到 → 零改写分支会放行原始字节（审计 B2 实测）。
+    # 检出后强制走重序列化，并禁用 splice（见下方回写分支）。
+    body, has_dup_keys = _load_json_pairs(raw_content)
+    if body is None:
         # 声明了 JSON 却解析不了：无法确认里面没有原文。fail_closed 下必须拦。
         if FAIL_CLOSED:
             _emit("BLOCK", host=host, method=method, path=path.split("?")[0], reason="invalid_json", upstream=up_name, **source)
@@ -3756,6 +4284,13 @@ def request(flow: http.HTTPFlow):
             return
         _emit_skip(host, method, path, "invalid_json", ct, source=source, upstream=up_name)
         return
+    if has_dup_keys and not _DUP_KEY_WARNED[0]:
+        _DUP_KEY_WARNED[0] = True
+        try:
+            _log("[mask] 请求体存在重复键：该请求已改为整棵重序列化，"
+                 "被覆盖的字段值不会明文上行（首次告警，后续静默）")
+        except Exception:
+            pass
     # 顶层不是对象（JSON 数组/字符串/数字）。没有任何主流 LLM API 用这种形态，
     # 但它完全可能载有原文——["手机号 13800138000"] 就是一次完整的泄漏。
     # 曾在这里直接 _emit_skip 放行，与相邻两个分支（non_json_body / invalid_json
@@ -3861,10 +4396,37 @@ def request(flow: http.HTTPFlow):
         # 非字符串/列表/字典（数字/bool/null）_mask_tree 原样返回，无副作用。
         # body_changed 是单元素 list（可变），由 _mask_hit 在真的替换过时置 True。
         body_changed = [False]
+        # 顶层**键名**也要过一遍（审计 B2 的「敏感值作键名」）。
+        #
+        # 为什么之前漏了：这里按顶层 key 逐个取值送进 `_mask_tree`，于是键名本身
+        # 一次都没经过 `mask()`。而扩展链路的 `mask_body` 是把整个 body 交给
+        # `_mask_tree`（其 dict 分支会脱敏键名）——**同一个 body 走两条链路结果不同**，
+        # `{"13800138000": "safe"}` 在扩展链路已打码、在代理链路仍原样上行。
+        #
+        # 判据与 `_mask_tree` 的 dict 分支**完全一致**（同一个白名单、同一个 `mask()`），
+        # 不另立一套，否则两边迟早再漂一次。
+        # ⚠️ `_ROOT_WRAP_KEY` 必须原样保留：非对象根（列表根）会被包成
+        # `{__shield_root__: [...]}`，键名一旦被改写，下面 `body[_ROOT_WRAP_KEY]`
+        # 直接 KeyError → 整个脱敏管线抛异常 → fail-closed 503，所有列表根请求全挂。
+        renamed = {}
         for key in list(body.keys()):
-            body[key] = _mask_tree(body[key], sid, key, flag=body_changed)
+            new_key = key
+            if (isinstance(key, str) and key != _ROOT_WRAP_KEY
+                    and key not in _MASK_PROTECTED_KEY_NAMES):
+                masked_key = mask(key, sid)
+                if masked_key != key:
+                    new_key = masked_key
+                    body_changed[0] = True
+            # 传进去的仍是**原键**：`_leaf_exempt` 的协议位置判定必须看客户端真实的键名
+            # （同 `_mask_tree` dict 分支的注释）。
+            renamed[new_key] = _mask_tree(body[key], sid, key, flag=body_changed)
+        # 就地替换内容而非给 body 重新绑定：body 是调用方持有的对象，
+        # 下面 enum 清洗 / splice / `masked_root` 都还在用它，且要保持键的插入顺序。
+        body.clear()
+        body.update(renamed)
 
-        if body_changed[0] or enum_changed:
+        # has_dup_keys 必须一起算进脏标记：树里丢了被覆盖的值，判定「没改过」是假的。
+        if body_changed[0] or enum_changed or has_dup_keys:
             # 只有真的改过才回写请求体。回写方式分三级，目标都是别把「前缀」整体挪位 ——
             # 上游按前缀做 Prompt Cache，前缀字节一变就整段 miss：
             #   1) 首选**字节级文本替换**（`_splice_mask`）：直接在客户端原始 JSON 文本上
@@ -3883,7 +4445,10 @@ def request(flow: http.HTTPFlow):
             # 三级回写的都是**同一棵已经脱敏的树**，所以不存在放行原文的路径。
             masked_root = body if root_is_object else body[_ROOT_WRAP_KEY]
             masked_raw = None
-            if BYTE_SPLICE and not enum_changed:
+            # has_dup_keys 时禁用 splice：丢掉的重复键不在替换表里，而等价校验
+            # （json.loads(spliced) == masked_root）会因为「解析回来仍是那棵折叠后的树」
+            # 而误判通过，于是原文里的敏感值被原样带出去。直接重序列化脱敏树。
+            if BYTE_SPLICE and not enum_changed and not has_dup_keys:
                 try:
                     spliced = _splice_mask(
                         raw_content, masked_root,
@@ -4177,6 +4742,8 @@ def _scan_response(flow, sid, host, method, path, source, streamed_text=None):
                     continue
                 if label == "IBAN" and not _iban_ok(orig):
                     continue
+                if label == "JWT" and not _jwt_ok(orig):
+                    continue
                 if label == "IP_PUBLIC" and not _ip_public_ok(orig):
                     continue
                 if label == "IPV6_PRIVATE" and not _ipv6_private_ok(orig):
@@ -4442,6 +5009,23 @@ def _build_flush_event(tmpl_json, channel, leftover):
     return prefix + "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
 
 
+def _wrap_bare_flush(text, framing):
+    """无模板可克隆时的**最小合法外壳**（兜底，只为不丢字）。
+
+    SSE：每行都要带 `data: ` 前缀，内部的换行必须拆成多条 data 行——直接拼裸文本
+    会被符合规范的解析器丢掉。NDJSON：必须是一行合法 JSON，用 {"content": ...} 承接。
+    两种外壳都不引入新语义，客户端读不到就忽略，但不会让补发的字连同整行一起消失。
+    """
+    if not text:
+        return ""
+    try:
+        if framing == "ndjson":
+            return json.dumps({"content": text}, ensure_ascii=False) + "\n"
+        return "\n".join("data: " + ln for ln in str(text).split("\n")) + "\n\n"
+    except Exception:
+        return ""
+
+
 def _flush_pending(sid, channel_prefixes=None, framing="sse"):
     """把各通道滞留的半截占位符补发出去，返回待追加的流文本。
 
@@ -4476,8 +5060,10 @@ def _flush_pending(sid, channel_prefixes=None, framing="sse"):
         if evt:
             out.append(evt)
         elif restored:
-            # 没有可用模板（非流式回退路径等）：退化为裸文本，至少不丢字
-            out.append(restored)
+            # 没有可用模板时**不能裸拼文本**：SSE 里裸文本没有 `data:` 前缀，严格解析器
+            # 整行忽略；NDJSON 里裸文本不是合法 JSON，整行同样被丢弃。两条路径都会把
+            # 补发内容吃掉（channel="raw" 的非 JSON 载荷走的正是这条无模板路径）。
+            out.append(_wrap_bare_flush(restored, framing))
     return "".join(out)
 
 
@@ -4554,9 +5140,17 @@ def _is_ndjson_ct(content_type):
 def _handle_ndjson(flow, sid):
     """整包 NDJSON 还原（流式接管关闭或未触发时的回退路径）。"""
     raw = flow.response.content.decode("utf-8", errors="replace")
+    lines = raw.split("\n")
+    last = len(lines) - 1
     out = []
-    for line in raw.split("\n"):
-        out.append(_restore_ndjson_line(line, sid))
+    for i, line in enumerate(lines):
+        out.append(_restore_ndjson_line(line, sid, final=(i == last)))
+    # 与 _handle_sse 对齐补收尾：最后一行以半截占位符结尾（模型被 max_tokens 截断在
+    # 占位符中间）时，通道缓冲里的碎片不补发就被静默丢弃——回复少几个字，
+    # 而 RESTORE 事件显示一切正常。
+    tail = _flush_pending(sid, framing="ndjson")
+    if tail:
+        out.append(tail.rstrip("\n"))
     flow.response.content = "\n".join(out).encode("utf-8")
 
 
@@ -4611,10 +5205,23 @@ def _restore_sse_event(block, sid, final=False):
 
 
 def _restore_ext_sse_event(block, sid, stream_id, final=False):
-    """扩展链路专属 SSE 事件还原。优先解耦处理豆包等私有信封，其余走标准 SSE 管线。"""
-    # 尝试解析豆包式私有信封（不污染代理链路公共核心）
+    """扩展链路专属 SSE 事件还原。优先解耦处理豆包等私有信封，其余走标准 SSE 管线。
+
+    块内**逐行独立判定**：SSE 规范允许一个事件块里有多条 data: 行，而豆包信封与
+    标准 OpenAI 行完全可能同块并存。旧实现一见豆包行就整块 early return，同块其余
+    的 data: 行既不还原、也不再交给 `_restore_sse_event` —— 占位符原样漏到页面上，
+    这是浏览器链路唯一的泄漏形态且极难复现（要上游正好把两种行合进同一个事件块）。
+    未命中豆包信封的行按**连续段**交回标准管线，保住多行事件的原有语义。
+    """
     out_lines = []
-    handled_doubao = False
+    rest = []          # 连续的非豆包行，攒成一段后整体走标准管线
+
+    def flush_rest():
+        if not rest:
+            return
+        out_lines.extend(_restore_sse_event("\n".join(rest), sid, final=final).split("\n"))
+        rest.clear()
+
     for line in block.split("\n"):
         stripped = line.rstrip("\r")
         if stripped.startswith("data:"):
@@ -4622,36 +5229,37 @@ def _restore_ext_sse_event(block, sid, stream_id, final=False):
             if payload.strip() and payload.strip() != "[DONE]":
                 try:
                     data = json.loads(payload)
-                    if isinstance(data, dict) and "choices" not in data and "response" not in data:
-                        cnt = data.get("content")
-                        channel = f"ext:{stream_id}:db"
-                        if isinstance(cnt, str) and cnt.startswith("{") and "text" in cnt:
-                            inner = json.loads(cnt)
-                            if isinstance(inner, dict) and isinstance(inner.get("text"), str):
-                                inner["text"] = restore(inner["text"], sid, channel=channel, escape=False, final=final)
-                                data["content"] = json.dumps(inner, ensure_ascii=False)
-                                out_lines.append("data: " + json.dumps(data, ensure_ascii=False))
-                                handled_doubao = True
-                                s = sessions.get(sid) or {}
-                                pend = s.get("pending") or {}
-                                if pend.get(channel):
-                                    s.setdefault("flush_tmpl", {})[channel] = json.dumps(data, ensure_ascii=False)
-                                continue
-                        elif isinstance(cnt, dict) and isinstance(cnt.get("text"), str):
-                            cnt["text"] = restore(cnt["text"], sid, channel=channel, escape=False, final=final)
-                            out_lines.append("data: " + json.dumps(data, ensure_ascii=False))
-                            handled_doubao = True
-                            s = sessions.get(sid) or {}
-                            pend = s.get("pending") or {}
-                            if pend.get(channel):
-                                s.setdefault("flush_tmpl", {})[channel] = json.dumps(data, ensure_ascii=False)
-                            continue
                 except Exception:
-                    pass
-        out_lines.append(line)
-    if handled_doubao:
-        return "\n".join(out_lines)
-    return _restore_sse_event(block, sid, final=final)
+                    data = None
+                if isinstance(data, dict) and "choices" not in data and "response" not in data:
+                    cnt = data.get("content")
+                    channel = f"ext:{stream_id}:db"
+                    replaced = None
+                    if isinstance(cnt, str) and cnt.startswith("{") and "text" in cnt:
+                        try:
+                            inner = json.loads(cnt)
+                        except Exception:
+                            inner = None
+                        if isinstance(inner, dict) and isinstance(inner.get("text"), str):
+                            inner["text"] = restore(inner["text"], sid, channel=channel,
+                                                    escape=False, final=final)
+                            data["content"] = json.dumps(inner, ensure_ascii=False)
+                            replaced = data
+                    elif isinstance(cnt, dict) and isinstance(cnt.get("text"), str):
+                        cnt["text"] = restore(cnt["text"], sid, channel=channel,
+                                              escape=False, final=final)
+                        replaced = data
+                    if replaced is not None:
+                        flush_rest()
+                        out_lines.append("data: " + json.dumps(replaced, ensure_ascii=False))
+                        s_ = sessions.get(sid) or {}
+                        pend = s_.get("pending") or {}
+                        if pend.get(channel):
+                            s_.setdefault("flush_tmpl", {})[channel] = json.dumps(replaced, ensure_ascii=False)
+                        continue
+        rest.append(line)
+    flush_rest()
+    return "\n".join(out_lines)
 
 
 def restore_stream_chunk(text, sid, stream_id, content_type="", escape=False, final=False):
@@ -4691,6 +5299,10 @@ def restore_stream_chunk(text, sid, stream_id, content_type="", escape=False, fi
     frames = s.get("ext_frames")
     if not isinstance(frames, dict):
         frames = s["ext_frames"] = {}
+    elif stream_id not in frames and len(frames) >= _EXT_FRAMES_MAX:
+        # stream_id 由页面可控（审计 M2）：不设上限就能在会话 TTL 内把引擎内存撑大。
+        # dict 保持插入序，淘汰最老的一条即可。
+        frames.pop(next(iter(frames)), None)
 
     ct = (content_type or "").lower()
     if _is_ndjson_ct(ct):
@@ -5382,6 +5994,7 @@ def _read_settings():
             k: bool(audit_signals_cfg.get(k, dflt))
             for k, dflt in DEFAULT_AUDIT_SIGNALS.items()
         },
+        "ner_enabled": bool(cfg.get("ner_enabled", False)),
         # 整词匹配词表：UI「整词匹配」开关写入 config.sensitive_word_whole。
         # 曾漏返回该键，_maybe_reload 读到 None 后回落空集，开关全程无效。
         "sensitive_word_whole": {
@@ -5418,8 +6031,6 @@ def _maybe_reload(force=False):
     DIAGNOSTIC_UNMATCHED = s["diagnostic_unmatched"]
     CUSTOM_WORDS.clear()
     CUSTOM_WORDS.update(s["words"])
-    _refresh_custom_words_sorted()
-    _CUSTOM_WORD_RX_CACHE.clear()  # 词表变更后清编译缓存
     # 配置变更后允许对注入请求头的占位符/空值重新告警一次（用户改了配置就该重新提醒）
     _EXTRA_HEADER_SKIP_WARNED.clear()
     SENSITIVE_DISABLED = set(s.get("sensitive_disabled") or set())
@@ -5427,6 +6038,11 @@ def _maybe_reload(force=False):
         k: set(v) for k, v in (s.get("sensitive_word_disabled") or {}).items()
     }
     SENSITIVE_WORD_WHOLE = set(s.get("sensitive_word_whole") or set())
+    # 永久映射的重建必须排在禁用集赋值**之后**：_sync_custom_word_mappings 用
+    # SENSITIVE_DISABLED / SENSITIVE_WORD_DISABLED 判断哪些词仍启用，放在前面会
+    # 永远按上一代配置计算（禁用词要等第二次改配置才被清掉）。
+    _refresh_custom_words_sorted()
+    _CUSTOM_WORD_RX_CACHE.clear()  # 词表变更后清编译缓存
     BUILTIN_RULES = dict(DEFAULT_BUILTIN_RULES)
     raw_br = s.get("builtin_rules") or {}
     # 旧配置 IP 键迁移（与 panel.normalize_config 一致）：IP 拆 IP_PRIVATE/IP_INTERNAL
@@ -5442,6 +6058,8 @@ def _maybe_reload(force=False):
     global AUDIT_FAIL_CLOSED
     AUDIT_FAIL_CLOSED = bool(s.get("audit_fail_closed", False))
     AUDIT_SIGNALS = s["audit_signals"]
+    global NER_ENABLED
+    NER_ENABLED = bool(s.get("ner_enabled", False))
     UPSTREAMS = s["upstreams"]
     EGRESS_PROXY = s.get("egress_proxy")
     CAPTURE_MODE = s["capture_mode"]

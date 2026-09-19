@@ -26,6 +26,7 @@ import {
   Languages,
   AlertTriangle,
   X,
+  Globe,
 } from 'lucide-react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getStatus, startProxy, stopProxy } from '@/api/proxy'
@@ -56,8 +57,9 @@ const NAV_ITEMS = [
   { to: '/', key: 'dashboard', icon: LayoutDashboard },
   { to: '/logs', key: 'logs', icon: FileText },
   { to: '/stats', key: 'stats', icon: BarChart3 },
-  { to: '/words', key: 'words', icon: ScanSearch },
   { to: '/clients', key: 'clients', icon: Network },
+  { to: '/extension', key: 'extension', icon: Globe },
+  { to: '/words', key: 'words', icon: ScanSearch },
   { to: '/audit', key: 'audit', icon: ShieldCheck },
   { to: '/settings', key: 'settings', icon: Settings },
 ]
@@ -252,6 +254,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
     if (p === '/stats') return t('nav.stats')
     if (p === '/words') return t('nav.words')
     if (p === '/clients') return t('nav.clients')
+    if (p === '/extension') return t('nav.extension')
     if (p === '/audit') return t('nav.audit')
     if (p === '/settings') return t('nav.settings')
     return t('layout.appName')
@@ -284,6 +287,10 @@ export function AppLayout({ children }: { children: ReactNode }) {
       setProxyBusy(false)
     }
   }
+
+  // 真正引擎异常判定：若代理正在运行（isRunning 为 true）或状态接口能正常返回，
+  // 说明引擎与代理真实存活可用，此时启动初期的瞬态 last_error 不应误报「引擎异常」红灯。
+  const showEngineError = Boolean(engineError && !isRunning && !status?.proxy_running)
 
   return (
     <div
@@ -396,7 +403,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
               <span
                 className={cn(
                   'relative inline-flex h-2.5 w-2.5 rounded-full',
-                  engineError
+                  showEngineError
                     ? 'bg-red-500 shadow-[0_0_8px_hsl(0_72%_51%/0.6)] animate-pulse'
                     : isStarting || isStopping
                       ? 'bg-amber-400 shadow-[0_0_8px_hsl(38_92%_50%/0.5)] animate-pulse'
@@ -407,7 +414,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
               />
             </span>
             <span className="text-[13px] font-medium text-foreground">
-              {engineError
+              {showEngineError
                 ? t('layout.engineErr')
                 : isStarting
                   ? t('layout.startingProxy')

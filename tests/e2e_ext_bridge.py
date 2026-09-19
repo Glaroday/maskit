@@ -681,7 +681,11 @@ class ExtBridgeE2E(unittest.TestCase):
                 f"每 chunk 一行会把 800 行环形缓冲冲干净（SPEC §5.4 的诊断能力归零）",
             )
             # ② 反向断言：拒绝**必须仍然被记录**。把日志关掉/不再记录不是修复，是丢证据。
-            self.assertGreater(new_rejects, 0,
+            # ② 反向断言：拒绝**必须仍然被记录**。把日志关掉/不再记录不是修复，是丢证据。
+            #    这里看**总数**而不是本次增量：前一条用例（07b）已经用错 token 打过一次
+            #    403，进入退避后探测频率被压到 5s 一次，紧接着跑的本用例完全可能一行都不
+            #    新增（实测：单独跑绿、整套跑红 —— 写成增量就是次序相关断言）。
+            self.assertGreater(self._count_reject_lines("invalid_token"), 0,
                                "退避把拒绝日志一起吞了 —— 用户将无从归因（不能静默）")
             # ③ 状态语义：红标「token 失效」而不是黄标「引擎未运行」
             st = self._sw_status()
@@ -774,7 +778,20 @@ class ExtBridgeE2E(unittest.TestCase):
         rec = self._last("/v1/chat/completions")
         self.assertIn("multipart/form-data", rec["ct"], "Content-Type 变了")
         self.assertIn("boundary=", rec["ct"], "boundary 丢了")
-        self.assertIn("13812345678", rec["body"], "multipart 被误打码（会破坏附件上传）")
+        # 契约已随实现变更（见 `extension/bridge-main.js` 的 maskMultipart）：
+        # 文本字段要打码、文件字段走 /api/ext/mask-file，**不再**整体原样放行。
+        # 原断言「body 里必须有原文」与实现相反，于是长期红着——它真正要守的是
+        # 「multipart 结构不能被破坏」：体仍是合法 multipart、boundary 与头一致、
+        # 无敏感内容的附件字节原样、文本字段已打码。
+        boundary = rec["ct"].split("boundary=", 1)[1].split(";")[0].strip().strip('"')
+        body = rec["body"] or ""
+        self.assertTrue(body.startswith("--" + boundary), "multipart 起始边界不合法")
+        self.assertTrue(body.rstrip().endswith("--" + boundary + "--"),
+                        "multipart 结束边界丢了（上游会 400）")
+        self.assertIn('filename="a.txt"', body, "附件头被破坏")
+        self.assertIn("x" * 200, body, "无敏感内容的附件不得被改写/截断")
+        self.assertNotIn(PHONE, body, "multipart 里的文本字段必须已打码")
+        self.assertRegex(body, r"\{\{PHONE_")
 
     # ══ 12 ═════════════════════════════════════════════════════════════════
     def test_12_extension_storage_holds_no_plaintext(self):

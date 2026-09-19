@@ -147,6 +147,26 @@
   }
 
   /**
+   * 引擎地址的**唯一合法形态**：`http(s)://127.0.0.1[:port]` 或 `http(s)://localhost[:port]`。
+   *
+   * 【为什么这条正则必须唯一】它原先只存在于 `options.js` 的「保存设置」按钮里，
+   * 而**真正持有令牌**的 SW（`background.js` 的 `callPanel`）不校验任何东西，
+   * 同一个地址框旁边的「测试连接」按钮也不校验 —— 于是往地址框里填个外域点一下测试，
+   * 令牌就被持久化，之后每次 mask/restore 都带着它发出去（审计 M3）。
+   * 修复的第一层是把校验下沉到 SW；第二层就是**别再把这条正则抄成三份**：
+   * 本文件存在的理由正是上一次「matchPattern 的 IP/localhost 分支漂移」出过的缺陷。
+   *
+   * 故意**不接受** `0.0.0.0` / `[::1]` / 带路径或 query 的 URL：
+   * 用户没有理由填这些，而放行等于把「合法形态」的定义交给输入方。
+   */
+  const PANEL_URL_RE = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i;
+
+  /** panelUrl 是否指向本机（唯一判据见 PANEL_URL_RE）。 */
+  function isLocalPanelUrl(url) {
+    return PANEL_URL_RE.test(String(url || ''));
+  }
+
+  /**
    * 该域名（或它所属的已启用站点）是否有「路径未实测」标注；无则返回 ''。
    *
    * 除精确命中外还认**子域**：`UNSUPPORTED_REASON` 只列顶域（推荐站点也只写顶域），
@@ -168,5 +188,6 @@
   root.MASKIT_SHARED = {
     STATIC_SITES, PRESET_SITES, UNSUPPORTED_REASON,
     siteMatchPattern, normalizeDomain, siteCovers, unsupportedReason,
+    PANEL_URL_RE, isLocalPanelUrl,
   };
 })(typeof self !== 'undefined' ? self : this);

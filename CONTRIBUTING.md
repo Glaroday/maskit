@@ -20,7 +20,7 @@
 # 0. Python 3.13 + pip install -r requirements.txt（其它版本未验证）
 python -V   # 3.13.x
 
-# 1. 全量门禁（python / frontend / rust / version 四组共 14 项）
+# 1. 全量门禁（python / frontend / rust / version 四组共 15 项）
 python scripts/verify-all.py
 
 # 只想跑某几组 / 看清单

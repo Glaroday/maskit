@@ -154,7 +154,7 @@ print(response.choices[0].message.content)
 
 网页版 AI 没有 Base URL 可配，所以走扩展：`extension/` 把页面发出的 LLM 请求送进本地引擎打码，回包按占位符流式还原。
 
-1. Chrome / Edge 打开 `chrome://extensions` → 打开「开发者模式」→「加载已解压的扩展程序」→ 选仓库里的 `extension/` 目录；
+1. 拿扩展：源码用户直接选仓库里的 `extension/` 目录；装桌面版的用户从 [Releases](https://github.com/xiaYuTian11/maskit/releases/latest) 下载 `Maskit_<版本>_extension.zip` 并解压，选里面的 `maskit-extension` 目录 —— 扩展不在桌面安装包里，而网页版 AI 只能靠它；接着打开 `chrome://extensions` → 打开「开发者模式」→「加载已解压的扩展程序」→ 选该目录；
 2. 面板「设置 → 浏览器扩展」打开**启用浏览器扩展链路**，复制生成的**访问令牌**；
 3. 打开扩展的「设置」页，填引擎地址（默认 `http://127.0.0.1:5801`）与令牌，并把 `chatgpt.com` / `claude.ai` 勾上（自定义站点可在同一页添加）。
 
@@ -279,7 +279,7 @@ cd frontend && npm run dev
 
 **端到端冒烟（可选，推荐改扩展/桥接代码后必跑）**
 
-`tests/e2e_ext_bridge.py` 用**真 Chrome + 真扩展 + 本地 mock 站点 + 真引擎**跑 12 条链路断言（打码出网、SSE 劈 chunk 还原、multipart 守卫、默认桶直通、SW 回收后签发表存活等）。**不进 CI**（需要真浏览器）。
+`tests/e2e_ext_bridge.py` 用**真 Chrome + 真扩展 + 本地 mock 站点 + 真引擎**跑 14 条链路断言（打码出网、SSE 劈 chunk 还原、multipart 守卫、默认桶直通、SW 回收后签发表存活等）。**不进 CI**（需要真浏览器）。
 
 前提：`pip install playwright && playwright install chromium`（用装了引擎依赖的那个解释器），以及**图形会话**——扩展只能在有头 Chromium 里加载，`headless=True` 走的是 headless_shell，不支持扩展。
 

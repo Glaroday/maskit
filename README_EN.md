@@ -153,7 +153,7 @@ print(response.choices[0].message.content)
 
 The web apps have no Base URL to point at, so the extension under `extension/` routes the page's LLM requests through the local engine and restores placeholders as the response streams.
 
-1. In Chrome / Edge open `chrome://extensions`, enable **Developer mode**, then **Load unpacked** and pick the repo's `extension/` folder;
+1. Get the extension: source users pick the repo's `extension/` folder; desktop-app users download `Maskit_<version>_extension.zip` from [Releases](https://github.com/xiaYuTian11/maskit/releases/latest), unzip it and pick the `maskit-extension` folder inside — the extension is not part of the desktop installer, and the web apps can only be covered through it. Then in Chrome / Edge open `chrome://extensions`, enable **Developer mode**, click **Load unpacked** and pick that folder;
 2. In the panel go to **Settings → Browser extension**, turn on **Enable the browser-extension bridge**, and copy the generated **access token**;
 3. Open the extension's options page, fill in the engine URL (default `http://127.0.0.1:5801`) and the token, and tick `chatgpt.com` / `claude.ai` (add custom sites on the same page).
 
@@ -277,7 +277,7 @@ cd frontend && npm run dev
 
 **End-to-end smoke (optional; run it after touching the extension / bridge code)**
 
-`tests/e2e_ext_bridge.py` drives **real Chrome + the real extension + a local mock site + the real engine** through 12 link-level assertions (masked outbound body, cross-chunk SSE restoration, multipart guard, default-bucket passthrough, sid table surviving SW recycle, …). It is **not part of CI** (it needs a real browser).
+`tests/e2e_ext_bridge.py` drives **real Chrome + the real extension + a local mock site + the real engine** through 14 link-level assertions (masked outbound body, cross-chunk SSE restoration, multipart guard, default-bucket passthrough, sid table surviving SW recycle, …). It is **not part of CI** (it needs a real browser).
 
 Prerequisites: `pip install playwright && playwright install chromium` (using the interpreter that has the engine deps) and a **graphical session** — extensions only load in headed Chromium; Playwright's `headless=True` uses headless_shell, which does not support extensions.
 

@@ -22,6 +22,10 @@ import copy
 import hashlib
 import logging
 import math
+import io
+import zipfile
+import base64
+import xml.etree.ElementTree as ET
 import os
 import platform
 import re
@@ -171,6 +175,7 @@ from event_store import (
     stats_range,
     set_record_plaintext_words,
     fetch_restore_items,
+    fetch_sibling_event,
     db_max_event_id,
     _ensure_db,
 )
@@ -223,7 +228,7 @@ _origin_check_enabled = True
 # ext_token 是 config.json 里第一个**长期**密钥（不随重启轮换），只对下面三个
 # 精确白名单端点有效；API_TOKEN 对全部 /api/* 有效（二选一）。
 # **精确白名单不用前缀**：否则扩展 token 能打到 /api/config、/api/ext/rotate-token。
-_EXT_ENDPOINTS = frozenset({"/api/ext/ping", "/api/ext/mask", "/api/ext/restore"})
+_EXT_ENDPOINTS = frozenset({"/api/ext/ping", "/api/ext/mask", "/api/ext/restore", "/api/ext/mask-file"})
 # 扩展上下文能出现的 Origin scheme。**扩展 ID 无法枚举**（解压加载/商店/profile 各异），
 # 所以只能按 scheme 放行；详见 _origin_ok() 里的实测说明与安全影响。
 _EXT_ORIGIN_SCHEMES = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
@@ -1459,6 +1464,7 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 # 几十~几百字节永远攒不满 64KB → 客户端等整个生成结束才见首字节
                 # （实测 read=2.0s 一次性返回 vs read1=0s 逐块返回）。
                 sent = 0
+                chunks_read = 0
                 usage_stream = (SSEUsageAccumulator()
                                 if "text/event-stream" in ct_lower
                                 else None)
@@ -1467,6 +1473,7 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                 raw_deflate_tried = False  # deflate 有 zlib 包装/raw 两种流（HTTP 歧义）
                 while True:
                     chunk = resp.read1(65536)
+                    chunks_read += 1
                     if not chunk:
                         break
                     if _first_byte_ms is None:
@@ -1484,6 +1491,15 @@ def _make_passthrough_handler(target, proxy_url=None, upstream_name=None):
                                 raw_deflate_tried = True
                                 gzip_decomp = zlib.decompressobj(-zlib.MAX_WBITS)
                                 chunk = gzip_decomp.decompress(raw_chunk)
+                            elif chunks_read == 1:
+                                # 首块就解压失败 → 上游/反代谎报 Content-Encoding（正文其实是明文）：
+                                # 响应头此刻已经发出、Content-Encoding 也已被剥，抛异常只会让客户端拿到
+                                # 「200 + 静默截断的 body」。改为放弃解压与还原、把字节原样透传 —— 谎报
+                                # 场景下正文本就是明文，原样下发正是客户端要的东西。非首块失败不在此列：
+                                # 那是真压缩流中途损坏，只能按原逻辑断流。
+                                gzip_decomp = None
+                                pt_state = None
+                                chunk = raw_chunk
                             else:
                                 raise
                         if not chunk:
@@ -3004,6 +3020,10 @@ def _free_upstream_ports():
     占用 187xx 段的无关第三方进程（数据丢失风险）；也曾在面板 503 占位占端口时
     杀不掉导致自动重启失败——只杀可识别为 Shield 相关、且确在监听上游端口的进程。
     """
+    # 隔离防护：若本实例不是主面板 5801（如副端口 5901 测试运行），且主面板正在运行，
+    # 绝不能越界强杀主面板正在服务的 18701..18720 端口，防止意外打断正常用户的生产客户端。
+    if PANEL_PORT != 5801 and _port_listen(5801):
+        return []
     ports = set()
     try:
         ports.add(int(PROXY_PORT))
@@ -3372,10 +3392,17 @@ def default_config():
         # 新结构：sensitive 仍用 {label: [words]} 兼容；组禁用/词禁用独立字段
         "sensitive_disabled": [],
         "sensitive_word_disabled": {},
+        # 整词匹配清单：命中这些词的打码要求两侧是词边界（避免「王」打中「王国」）。
+        # 走 /api/config/patch 的 list_add/list_remove 维护（前端 Settings 在用）。
+        "sensitive_word_whole": [],
         "builtin_rules": dict(DEFAULT_BUILTIN_RULES),
         "secret_prefixes": list(DEFAULT_SECRET_PREFIXES),
         "debug": False,
         "diagnostic_unmatched": False,
+        # AI 命名实体识别（本地 ONNX 模型，需 engine/models/ner_mini_zh/ 三件套
+        # 且装了 onnxruntime+tokenizers）。默认关：缺模型/缺依赖时是纯负收益，
+        # 且概率模型只应作为规则打码的补充。开源包不含模型（见 .gitignore）。
+        "ner_enabled": False,
         "session_ttl": DEFAULT_TTL,
         "http2": False,
         "upstreams": list(DEFAULT_UPSTREAMS),
@@ -3419,6 +3446,13 @@ def default_config():
         "autostart": False,
         "start_minimized": False,
         "auto_start_proxy": True,
+        # 向导完成标记与引擎自用的迁移标记袋（poison_scan_default_on 等）。
+        # 两者都由 normalize_config 产出，必须在这里也列出来——本函数是「合法键」
+        # 的唯一真相来源，_config_patch_node/_apply_config_patch 用 `key not in cfg`
+        # 拒绝未知键，而 config.json 损坏时 _load_config_locked 会直接返回未归一化的
+        # default_config()，缺键的字段在那条路径上会变成 400。
+        "wizard_done": False,
+        "meta": {},
         "audit": {
             "enabled": True,
             "passive": True,
@@ -3760,9 +3794,9 @@ def normalize_config(raw, warnings=None):
     # egress 状态提示与动作型 warning 分流（2026-09-15 用户反馈「随便干什么都弹」）：
     # 「启用了但没人勾」「勾了但全局没启用」是配置的**持续状态**，每次保存任意
     # 配置都会重复生成，前端 toast 弹一遍就烦一遍。这类状态改由 /api/status 的
-    # egress_proxy + egress_proxy_users 驱动页面内联提示（Settings egress 卡 /
-    # Dashboard 横幅已有），不再进 warnings。动作型 warning（地址被丢弃、被
-    # 连带停用）保留——那才是「本次保存改写了什么」的一次性告知。
+    # egress_proxy + egress_proxy_users 驱动页面内联提示（Settings 页只做单客户端
+    # 维度提示，「全局已启用但没人勾」的横幅在 Dashboard），不再进 warnings。动作型
+    # warning（地址被丢弃、被连带停用）保留——那才是「本次保存改写了什么」的一次性告知。
     proxy_ups = [u.get("name") for u in ups if u.get("use_proxy")]
     if proxy_ups and not egress_enabled:
         warn.append(f"客户端「{', '.join(proxy_ups)}」勾选了「走代理」，但全局出口代理尚未启用或未填地址，将以直连方式转发")
@@ -3805,6 +3839,7 @@ def normalize_config(raw, warnings=None):
         "ext_token": ext_token,
         "ext_block_when_engine_down": bool(raw.get("ext_block_when_engine_down", False)),
         "ext_record_events": bool(raw.get("ext_record_events", True)),
+        "ner_enabled": bool(raw.get("ner_enabled", False)),
         "stream_response": bool(raw.get("stream_response", True)),
         "stream_exclude_hosts": _normalize_host_list(raw.get("stream_exclude_hosts")),
         "stop_mode": stop_mode,
@@ -4674,6 +4709,8 @@ def api_status():
         "start_minimized": bool(cfg.get("start_minimized", False)),
         "auto_start_proxy": bool(cfg.get("auto_start_proxy", True)),
         "audit": cfg.get("audit", {}),
+        # NER 开关 + 可用性：开启但模型/依赖缺失时必须让前端能提示，否则表现为"开了没效果"
+        "ner": _ner_status_payload(cfg),
         "needs_ca": capture_mode != "reverse",
         # 首次运行向导：upstreams 恒被回填默认值，用不上它判断，改用显式标记
         "wizard_recommended": not bool(cfg.get("wizard_done")),
@@ -5205,6 +5242,11 @@ def api_health():
         result["writer_stats"] = writer_stats()
     except Exception:
         pass
+    try:
+        # NER 不可用（模型/依赖缺失）必须在健康检查里可见，不能只留在一条日志里
+        result["ner"] = _ner_status_payload(load_config())
+    except Exception:
+        pass
     return jsonify(result)
 
 
@@ -5282,6 +5324,18 @@ def api_logs():
                 ]
             slim_ev.append(d)
         ev = slim_ev
+    else:
+        # 非 slim：整条 payload（含 dialog / *_preview / items[].original）直接下发，
+        # 读侧必须兜一道凭据清洗（审计 B1）。三个理由：
+        #   1) 扩展链路此前**写侧漏了清洗**，库里有凭据原文（现已修，但存量还在）；
+        #   2) 升级用户的历史库里本来就有 CONNSTR / PRIVATE_KEY 等遗留明文；
+        #   3) /api/logs 是按行原样回源的，不清洗等于把 API Key 渲染给任何持令牌的调用方。
+        # 与 /api/logs/detail 同源（同一函数），口径一致。
+        # **只清凭据**：普通 PII 的 original 照常下发 —— 详情弹窗的
+        # 「脱敏 ↔ 原文」对照靠它，这条能力不能动。
+        # 开销实测 0.27ms/条（dialog 约 2KB），1000 条约 0.3s，可接受；
+        # 前端列表走 slim，这条路径只在直接调接口 / 老前端时命中。
+        ev = [_scrub_legacy_event(e) for e in ev]
     # 附加估算费用（model × usage，价格来自在线同步目录 + 用户自配），
     # 供日志列表展示「本次请求费用」。纯数字字段，无敏感信息。
     try:
@@ -5349,7 +5403,27 @@ def api_log_detail():
         return jsonify({"ok": False, "error": "事件不存在或已过保留期"}), 404
     # 读侧凭据清洗：升级用户的历史库里仍有写侧修复之前落下的凭据明文，
     # 按 id 原样回源会把它们直接渲染进详情弹窗（见 _scrub_legacy_event）。
-    return jsonify({"ok": True, "event": _scrub_legacy_event(row)})
+    scrubbed = _scrub_legacy_event(row)
+    # 若本事件属于成对往返链路（带 sid），自动从同会话的配对事件补充缺失明细
+    # （例如 RESTORE 补充 MASK 的 items 与 prompt，或 MASK 补充 RESTORE 的还原数与回答）
+    sid = scrubbed.get("sid")
+    if sid:
+        sibling = fetch_sibling_event(sid, exclude_id=seq)
+        if sibling:
+            sib_scrubbed = _scrub_legacy_event(sibling)
+            if not scrubbed.get("items") and sib_scrubbed.get("items"):
+                scrubbed["items"] = sib_scrubbed["items"]
+            if not scrubbed.get("dialog_req") and sib_scrubbed.get("dialog_req"):
+                scrubbed["dialog_req"] = sib_scrubbed["dialog_req"]
+            if not scrubbed.get("dialog") and sib_scrubbed.get("dialog"):
+                scrubbed["dialog"] = sib_scrubbed["dialog"]
+            if not scrubbed.get("req_preview") and sib_scrubbed.get("req_preview"):
+                scrubbed["req_preview"] = sib_scrubbed["req_preview"]
+            if not scrubbed.get("resp_preview") and sib_scrubbed.get("resp_preview"):
+                scrubbed["resp_preview"] = sib_scrubbed["resp_preview"]
+            if scrubbed.get("restored") is None and sib_scrubbed.get("restored") is not None:
+                scrubbed["restored"] = sib_scrubbed["restored"]
+    return jsonify({"ok": True, "event": scrubbed})
 
 
 @app.get("/api/stats/today")
@@ -5561,6 +5635,42 @@ _EXT_SWEEP_INTERVAL = 10.0
 # import transparent 取决于跑在哪个解释器（见下面 mask 端点的失败路径注释），
 # 把「闸门」这种必须无条件生效的判断绑到一个可能 import 失败的模块上不可接受。
 _EXT_MAX_BODY = 32 * 1024 * 1024
+# 文档脱敏的 NER 总预算（秒）：逐 run 调用 mask()，单条短文本实测约 10ms，一份
+# 几千 run 的文档会线性堆到分钟级，而扩展侧 HTTP 超时更短——超预算后只停用语义
+# 识别，确定性规则照常生效（见 transparent._ner_doc_budget）。
+_EXT_FILE_NER_BUDGET_S = 8.0
+
+
+def _ner_status_payload(cfg):
+    """语义实体识别（NER）的开关与可用性（面板/健康检查用）。
+
+    只看文件与**已记录的错误**，不主动加载模型（98MB，不能挂在状态轮询里）。
+    开启但不可用时必须给出原因：否则用户只看到「开了没效果」，无从归因。
+    """
+    enabled = bool((cfg or {}).get("ner_enabled", False))
+    info = {"enabled": enabled, "available": False, "initialized": False, "reason": "",
+            "skips": {}}
+    try:
+        import ner_engine
+        st = ner_engine.status()
+        info["available"] = bool(st.get("available"))
+        info["initialized"] = bool(st.get("initialized"))
+        # 跳过计数必须透出（审计 M7）：`too_long` / `budget_exhausted` /
+        # `inference_failed` 这些「开了 NER 但这段没做识别」的原因此前只写进程日志，
+        # 界面上完全看不出——用户看到的是「开了 NER，长文本全跳过」却无从归因。
+        # 计数是纯整数，不含任何原文，可以安全下发。
+        skips = st.get("skips")
+        if isinstance(skips, dict):
+            info["skips"] = {str(k): int(v) for k, v in skips.items()}
+        if enabled:
+            if not info["available"]:
+                info["reason"] = "模型文件缺失（engine/models/ner_mini_zh/model_quantized.onnx）"
+            elif st.get("last_error"):
+                info["reason"] = str(st.get("last_error"))
+    except Exception as e:
+        if enabled:
+            info["reason"] = f"NER 模块不可用：{type(e).__name__}"
+    return info
 
 
 def _sweep_throttled(tr):
@@ -5629,11 +5739,22 @@ def api_ext_mask():
             items = tr._mask_event_items(sid)
             s["inflight"] = True
             _EXT_STATS["mask"] += 1              # += 是读改写三步，必须在锁内
-        if _ext_cfg().get("ext_record_events", True):
+        hit_count = len(s.get("last_hits") or set())
+        # 仅当真实命中敏感词并发生打码时才产生 MASK 事件，彻底消除大量 0 命中的空白噪声日志
+        if _ext_cfg().get("ext_record_events", True) and hit_count > 0:
+            # dialog / req_preview 落库前必须过凭据清洗（审计 B1）。
+            # 这两个字段是**客户端原始请求体**，`items` 里凭据类只有 digest+preview，
+            # 但同一行 payload 的 dialog 会把 API Key 原文一起写进 SQLite ——
+            # 违反 AGENTS 约束 6「凭据类永远无法从 SQLite 回溯」。
+            # 代理链路在 transparent.py 的 _emit 前一直有这道清洗，扩展链路漏了。
+            # 清洗只针对**凭据形态**：普通 PII（手机号/身份证/姓名）的原文照旧保留，
+            # 详情弹窗的「脱敏 ↔ 原文」对照能力不受影响。
             tr._emit("MASK", ingress="ext", sid=sid,
-                     count=len(s.get("last_hits") or set()),
+                     count=hit_count,
                      new_count=len(s.get("new_orig") or set()),
                      items=items, host=str(data.get("host") or ""), path="/ext/mask",
+                     dialog=tr._redact_credentials(text[:4000]),
+                     req_preview=tr._redact_credentials(text[:800]),
                      mask_ms=round((time.perf_counter() - t0) * 1000, 1))
         return jsonify({"ok": True, "masked_text": masked, "sid": sid})
     except Exception as e:
@@ -5651,6 +5772,146 @@ def api_ext_mask():
         return jsonify({"ok": False, "error": "engine_error", "blocking": True}), 503
 
 
+def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
+    """处理 Office 文档（.docx / .xlsx / .pptx）内部文本脱敏。
+
+    采用 Python 原生 zipfile 与 xml.etree.ElementTree，零外部依赖，毫秒级解包替换并重新封包。
+    返回: (masked_bytes, total_hits)
+    """
+    ext = (filename.lower().split(".")[-1] if "." in filename else "").strip()
+    if ext not in ("docx", "xlsx", "pptx", "wps", "et", "dps"):
+        return raw_bytes, 0
+
+    in_buf = io.BytesIO(raw_bytes)
+    if not zipfile.is_zipfile(in_buf):
+        return raw_bytes, 0
+
+    out_buf = io.BytesIO()
+    total_hits = 0
+    in_buf.seek(0)
+
+    with (
+        tr._ner_doc_budget(_EXT_FILE_NER_BUDGET_S),
+        zipfile.ZipFile(in_buf, "r") as zin,
+        zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout,
+    ):
+        for item in zin.infolist():
+            content = zin.read(item.filename)
+            fn = item.filename.lower()
+            should_mask = False
+
+            # Word (.docx / .wps)
+            if ext in ("docx", "wps") and ((fn.startswith("word/") and fn.endswith(".xml")) or fn == "docprops/core.xml"):
+                should_mask = True
+            # Excel (.xlsx / .et)
+            elif ext in ("xlsx", "et") and ((fn.startswith("xl/") and fn.endswith(".xml")) or fn == "docprops/core.xml"):
+                should_mask = True
+            # PowerPoint (.pptx / .dps)
+            elif ext in ("pptx", "dps") and ((fn.startswith("ppt/") and fn.endswith(".xml")) or fn == "docprops/core.xml"):
+                should_mask = True
+
+            if should_mask:
+                try:
+                    for event, (prefix, uri) in ET.iterparse(io.BytesIO(content), events=("start-ns",)):
+                        ET.register_namespace(prefix, uri)
+                    tree = ET.fromstring(content)
+                    modified = False
+
+                    if ext == "docx" and fn.startswith("word/"):
+                        # Word 段落遍历：处理 run 切分
+                        for p in tree.iter():
+                            if p.tag.split("}")[-1] == "p":
+                                t_nodes = [n for n in p.iter() if n.tag.split("}")[-1] == "t"]
+                                if not t_nodes:
+                                    continue
+                                # 第一阶段：单个 run 独立脱敏（保全格式独立性）
+                                touched_runs = False
+                                for n in t_nodes:
+                                    if n.text:
+                                        m = tr.mask_body(n.text, sid)
+                                        if m != n.text:
+                                            n.text = m
+                                            touched_runs = True
+                                            modified = True
+                                            total_hits += 1
+                                # 第二阶段：若单个 run 未命中，但整段拼接命中，说明敏感词跨 run 切分
+                                if not touched_runs and len(t_nodes) > 1:
+                                    full_text = "".join(n.text or "" for n in t_nodes)
+                                    m_full = tr.mask_body(full_text, sid)
+                                    if m_full != full_text:
+                                        t_nodes[0].text = m_full
+                                        for n in t_nodes[1:]:
+                                            n.text = ""
+                                        modified = True
+                                        total_hits += 1
+                    else:
+                        for n in tree.iter():
+                            tag = n.tag.split("}")[-1]
+                            if (tag in ("t", "creator", "lastModifiedBy", "v") or tag.endswith("Text")) and n.text:
+                                m = tr.mask_body(n.text, sid)
+                                if m != n.text:
+                                    n.text = m
+                                    modified = True
+                                    total_hits += 1
+
+                    if modified:
+                        content = ET.tostring(tree, encoding="utf-8", xml_declaration=True)
+                except Exception:
+                    pass
+            zout.writestr(item, content)
+
+    return out_buf.getvalue(), total_hits
+
+
+@app.post("/api/ext/mask-file")
+def api_ext_mask_file():
+    """扩展文档文件（docx / xlsx / pptx）打码。sid 由服务端签发或复用。"""
+    if (request.content_length or 0) > _EXT_MAX_BODY or request.headers.get("Transfer-Encoding"):
+        return jsonify({"ok": False, "error": "payload_too_large", "blocking": True}), 413
+    data = request.get_json(force=True, silent=True) or {}
+    filename = str(data.get("filename") or "").strip()
+    b64_content = data.get("base64")
+    sid = str(data.get("sid") or "").strip()
+    if not isinstance(b64_content, str) or not b64_content or not filename:
+        return jsonify({"ok": False, "error": "bad_request", "blocking": True}), 400
+
+    if not sid or not sid.startswith("ext:"):
+        sid = "ext:" + secrets.token_hex(8)
+
+    t0 = time.perf_counter()
+    try:
+        raw_bytes = base64.b64decode(b64_content)
+        import transparent as tr
+        with _EXT_LOCK:
+            tr._maybe_reload(force=True)
+            _sweep_throttled(tr)
+            tr._touch(sid)
+            tr._new_session(sid)
+            masked_bytes, hit_count = mask_ooxml_bytes(raw_bytes, filename, sid, tr)
+            s = tr.sessions[sid]
+            items = tr._mask_event_items(sid)
+            s["inflight"] = True
+            _EXT_STATS["mask"] += 1
+
+        if _ext_cfg().get("ext_record_events", True) and hit_count > 0:
+            tr._emit("MASK", ingress="ext", sid=sid,
+                     count=hit_count,
+                     new_count=len(s.get("new_orig") or set()),
+                     items=items, host=str(data.get("host") or ""), path="/ext/mask-file",
+                     dialog=f"[文件脱敏: {filename}]",
+                     req_preview=f"Uploaded document: {filename} ({len(raw_bytes)} bytes)",
+                     mask_ms=round((time.perf_counter() - t0) * 1000, 1))
+
+        masked_b64 = base64.b64encode(masked_bytes).decode("ascii")
+        return jsonify({"ok": True, "base64": masked_b64, "sid": sid, "hit_count": hit_count})
+    except Exception as e:
+        try:
+            _emit_log(f"[panel] ext mask-file 失败: {type(e).__name__}")
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "engine_error", "blocking": True}), 503
+
+
 @app.post("/api/ext/restore")
 def api_ext_restore():
     """扩展响应流还原。**还原方向恒透传**：失败也把原文交回客户端（红线 3）。
@@ -5663,6 +5924,16 @@ def api_ext_restore():
     为什么要区分两条路径见 `restore_stream_chunk` 的文档：整段文本还原无法拼接被
     SSE 事件边界切开的占位符，页面上会留下裸 `{{EMAIL_xxxxxx}}`。
     """
+    # 体积闸门必须**先于**任何读体动作（审计 M2）：`get_json` 会把整个流读进内存，
+    # 而本端点此前既没有 `_EXT_MAX_BODY` 也没有 chunked 判据（mask / mask-file 都有），
+    # 于是任意脚本都能用它把引擎内存顶上去。
+    #
+    # ⚠️ 这里**不能**像 mask 那样回 413 + `blocking:true`：扩展侧把 blocking 当 (A)
+    # 无条件阻断，而还原方向的红线是「恒透传」（红线 3）——阻断只会让用户看到半截响应。
+    # 回一个不带 blocking 的 ok:false，扩展按 (B) 默认桶处理 → `handleRestore` 把
+    # **原文**交回页面。超大 chunk 本来也还原不了（占位符必然被切断），透传是唯一安全行为。
+    if (request.content_length or 0) > _EXT_MAX_BODY or request.headers.get("Transfer-Encoding"):
+        return jsonify({"ok": False, "error": "payload_too_large"})
     data = request.get_json(force=True, silent=True) or {}
     text = data.get("text")
     sid = str(data.get("sid") or "").strip()        # 扩展回传 mask 签发的 sid
@@ -5687,6 +5958,7 @@ def api_ext_restore():
                 out = tr.restore(text, sid, channel=f"ext:{stream_id}",
                                  escape=escape, final=final)
         if final:
+            items = []
             with _EXT_LOCK:
                 s = tr.sessions.get(sid) or {}
                 if s:
@@ -5702,15 +5974,51 @@ def api_ext_restore():
                 # 正是因为看得见才没有踩这个坑）。这里补齐，两个字段都不进任何聚合。
                 unresolved = int(s.get("unresolved") or 0)
                 degraded = int(s.get("degraded") or 0)
-            if _ext_cfg().get("ext_record_events", True):
-                # ⚠️ **不要**"顺手"补 status / restore_status / model / usage：
-                # SPEC §5.2(3) 明确要求扩展 RESTORE 不带它们，判据在 `_update_stats`——
-                # `status` 一进就会写 `daily_status`、`model`/`usage` 会写
-                # `daily_tokens`/`daily_models`，等于让浏览器流量污染这三张按「代理口径」
-                # 阅读的统计表。缺 status 的代价只是日志页那一列显示 `—`，是可接受的；
-                # 补上它则是统计口径出错，且出错无声。
+                try:
+                    restored_tokens = s.get("restored_tokens") or set()
+                    for orig, tok in list(s.get("fwd", {}).items())[:30]:
+                        m = tr._PLACEHOLDER_PARTS_RX.match(tok)
+                        lbl = s.get("labels", {}).get(orig, "")
+                        is_cred = lbl in CREDENTIAL_LABELS
+                        item = {
+                            "tok": tok,
+                            "label": lbl,
+                            "hash": m.group(2) if m else "",
+                            "length": len(orig),
+                            "preview": tr._preview(orig, lbl),
+                            "restored": tok in restored_tokens,
+                        }
+                        if is_cred:
+                            item["cred"] = True
+                            item["digest"] = tr._cred_digest(orig)
+                        else:
+                            item["original"] = orig
+                        items.append(item)
+                except Exception:
+                    items = []
+            # 仅在有还原成功、有异常未还原，或会话发生过敏感词打码时才记录 RESTORE，杜绝空事件刷屏
+            should_emit = (
+                _ext_cfg().get("ext_record_events", True)
+                and (restored > 0 or unresolved > 0 or degraded > 0 or len(items) > 0)
+            )
+            if should_emit:
+                # 还原后的正文里可能**裸复述**了模型见过的凭据原文，落库前必须清洗
+                # （审计 B1）。两道互补，与代理链路的 `_emit_restore_summary` 同源：
+                #   1) `_redact_session_credentials`：拿本会话已知的凭据原文做精确串替换。
+                #      形态正则拦不住「模型只复述了值本身」——CONNSTR 要求完整
+                #      scheme://user:pass@host、PRIVATE_KEY 要求 PEM 头，裸值都不命中。
+                #   2) `_redact_credentials`：按凭据形态跑正则，拦「用户自己贴的、
+                #      本会话没脱敏过的」那种。
+                # 顺序与代理链路一致（先会话精确串、后形态正则）。
+                # 只清凭据：普通 PII 的原文照旧保留，详情弹窗对照能力不变。
+                _out_text = out if isinstance(out, str) else ""
+                _out_text = tr._redact_credentials(
+                    tr._redact_session_credentials(_out_text, s))
                 tr._emit("RESTORE", ingress="ext", sid=sid,
                          restored=restored, unresolved=unresolved, degraded=degraded,
+                         items=items,
+                         resp_preview=_out_text[:800],
+                         dialog=_out_text[:4000],
                          host=str(data.get("host") or ""), path="/ext/restore")
         return jsonify({"ok": True, "text": out})
     except Exception as e:
@@ -6122,12 +6430,18 @@ def api_cert():
     return jsonify({"ok": rc == 0, "scope": scope, "output": safe_out, "installed": rc == 0})
 
 
-def _find_web_dist():
+def _find_web_dist() -> Path:
     """按优先级寻找 Web 控制台静态资源目录：环境变量 → 打包内置 web_dist → 源码构建 frontend/dist。"""
     env_dist = os.environ.get("MASKIT_WEB_DIST")
     if env_dist and Path(env_dist).exists():
         return Path(env_dist)
-    for cand in (_BUNDLE_ROOT / "web_dist", ROOT / "frontend" / "dist", ROOT / "web_dist"):
+    for cand in (
+        _BUNDLE_ROOT / "web_dist",
+        _BUNDLE_ROOT.parent / "frontend" / "dist",
+        _BUNDLE_ROOT.parent / "web_dist",
+        ROOT / "frontend" / "dist",
+        ROOT / "web_dist",
+    ):
         if cand.exists() and (cand / "index.html").exists():
             return cand
     return _BUNDLE_ROOT / "web_dist"
@@ -6136,22 +6450,30 @@ def _find_web_dist():
 WEB_DIST_DIR = _find_web_dist()
 
 
+def _get_web_dist_dir() -> Path:
+    global WEB_DIST_DIR
+    if not WEB_DIST_DIR.exists():
+        WEB_DIST_DIR = _find_web_dist()
+    return WEB_DIST_DIR
+
+
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_spa(path):
     """静态文件托管（Docker 与 WebUI 模式支持）。"""
     if path.startswith("api/"):
         return jsonify({"ok": False, "error": "not_found"}), 404
-    if WEB_DIST_DIR.exists():
-        target = WEB_DIST_DIR / path
+    web_dir = _get_web_dist_dir()
+    if web_dir.exists():
+        target = web_dir / path
         # Werkzeug 已规范化 ..，这里再显式钉死在 web_dist 内，不依赖上游行为
         try:
-            inside = target.resolve().is_relative_to(WEB_DIST_DIR.resolve())
+            inside = target.resolve().is_relative_to(web_dir.resolve())
         except Exception:
             inside = False
         if path and inside and target.exists() and target.is_file():
             return send_file(str(target))
-        index_file = WEB_DIST_DIR / "index.html"
+        index_file = web_dir / "index.html"
         if index_file.exists():
             return send_file(str(index_file))
     return jsonify({"ok": True, "service": "Data Maskit API", "version": __version__})
@@ -6282,8 +6604,13 @@ def shutdown():
         if shutdown_done:
             return
         shutdown_done = True
-    stop_proxy()
-    restore_client_env()
+    # 仅在本面板确曾拉起代理，或当前仍持有子进程句柄时才执行 stop_proxy()，
+    # 杜绝未启动代理的从属/测试面板退出时越界释放系统端口
+    if state.get("proxy_running") or proc.get("p") is not None:
+        stop_proxy()
+    # 仅当存在环境备份时才恢复，禁止无备份时越界清空用户的系统代理环境变量
+    if ENV_BACKUP_PATH.exists():
+        restore_client_env()
 
 
 def _handle_signal(signum, frame):

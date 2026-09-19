@@ -78,8 +78,16 @@ if (manifest) {
     fail('manifest.json 声明了 default_locale 但没有 _locales/ 目录 —— 扩展会加载失败')
   }
   const referenced = new Set()
-  const sw = ((manifest.background || {}).service_worker || '').trim()
+  const bgCfg = manifest.background || {}
+  const sw = String(bgCfg.service_worker || '').trim()
   if (sw) referenced.add(sw)
+  // 跨浏览器双键：Chromium 走 service_worker，Firefox MV3 走 event page（scripts）。
+  // Firefox 不支持 service_worker；只写单键在 Firefox 下 background 完全缺失 → 扩展死。
+  if (!sw) fail('manifest.json background 缺少 service_worker（Chromium MV3 必需）')
+  if (!Array.isArray(bgCfg.scripts) || !bgCfg.scripts.length) {
+    fail('manifest.json background 缺少 scripts 数组（Firefox MV3 是 event page，只写 service_worker 时背景完全缺失）')
+  }
+  for (const s of bgCfg.scripts || []) referenced.add(s)
   for (const cs of manifest.content_scripts || []) {
     for (const f of cs.js || []) referenced.add(f)
   }
@@ -348,12 +356,23 @@ if (/registerContentScripts/.test(bg)) {
 if (!/importScripts\(\s*['"]shared\.js['"]\s*\)/.test(bg)) {
   fail("background.js 缺少 importScripts('shared.js') —— MASKIT_SHARED 未定义，扩展加载即死")
 }
+// importScripts 只存在于 Worker 环境（Chromium SW）；Firefox MV3 的 event page 没有
+// 这个全局，无条件调用会 ReferenceError 让背景直接死。必须由 manifest 的
+// background.scripts 先加载 shared.js，并用 typeof 守卫住这条分支。
+const importScriptsAt = bg.indexOf("importScripts('shared.js')")
+if (importScriptsAt >= 0) {
+  const guard = bg.slice(Math.max(0, importScriptsAt - 200), importScriptsAt)
+  if (!/typeof\s+importScripts\s*===?\s*['"]function['"]/.test(guard)) {
+    fail('background.js 的 importScripts 必须用 `typeof importScripts === \'function\'` 守卫 —— '
+      + 'Firefox MV3 背景是 event page，没有 importScripts 全局，无条件调用直接 ReferenceError')
+  }
+}
 // onMessage 必须按 `sender.url` 的 scheme 判定「扩展自己的页面」，不能用 `!sender.tab`。
 // 选项页是**真标签页**，sender.tab 有值（2026-09-16 实测）；用 !sender.tab 判会让 admin
 // 分支永远进不去、函数末尾返回 undefined → 端口立刻关闭 → 页面侧恒报
 // "The message port closed before a response was received"（选项页测试连接/占用/重注册
 // 三处同时失灵，而 SW 侧一切正常，极难定位）。
-if (/onMessage/.test(bg) && !/sender\.url[\s\S]{0,120}chrome-extension:/.test(bg)) {
+if (/onMessage/.test(bg) && !/sender\.url[\s\S]{0,120}(?:chrome-extension:|moz-extension:)/.test(bg)) {
   fail('background.js 的 onMessage 没有按 sender.url 判定扩展页面 —— ' +
     '以标签页打开的选项页其 sender.tab 有值，用 !sender.tab 判会让 admin 消息全部超时')
 }

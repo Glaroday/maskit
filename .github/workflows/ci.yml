@@ -173,3 +173,8 @@ jobs:
       # CI 不 lint workflow，YAML 或 run 块写坏只在推送后（最坏是发版时）才炸
       - name: Workflow YAML and shell syntax must be valid
         run: python scripts/check-workflows.py
+
+      # 扩展 zip 是 Release 上唯一的「网页版 AI」入口（ChatGPT / Claude 没有 Base URL 可配），
+      # 打包脚本坏掉＝用户下载不到扩展。这里只验证能打出来，产物由 release.yml 上传。
+      - name: Browser extension package builds
+        run: python scripts/pack-extension.py --check

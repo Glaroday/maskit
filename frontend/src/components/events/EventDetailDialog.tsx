@@ -439,6 +439,28 @@ export function EventDetailDialog({
                 </pre>
               </div>
             )}
+
+            {/* 正文预览兜底（当无全量 dialog 时展示截断预览） */}
+            {!event.dialog_req && !event.dialog && Boolean(event.req_preview || (event as { resp_preview?: string }).resp_preview) && (
+              <div className="space-y-3">
+                {event.req_preview && (
+                  <div>
+                    <h3 className="mb-2 text-[13px] font-semibold">{t('detail.reqOriginal')}</h3>
+                    <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 font-mono text-xs leading-relaxed">
+                      {event.req_preview}
+                    </pre>
+                  </div>
+                )}
+                {(event as { resp_preview?: string }).resp_preview && (
+                  <div>
+                    <h3 className="mb-2 text-[13px] font-semibold">{t('detail.assistantMsg')}</h3>
+                    <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 font-mono text-xs leading-relaxed">
+                      {(event as { resp_preview?: string }).resp_preview}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </DialogContent>

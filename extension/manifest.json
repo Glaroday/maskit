@@ -5,10 +5,19 @@
   "description": "把网页版 AI（ChatGPT / Claude）发出的请求送进本地 Maskit 引擎打码，回包流式无感还原。100% 本地运算，零外传。",
   "homepage_url": "https://github.com/xiaYuTian11/maskit",
   "minimum_chrome_version": "111",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "maskit-bridge@maskit.local",
+      "strict_min_version": "128.0"
+    }
+  },
   "permissions": ["storage", "scripting", "tabs"],
   "optional_host_permissions": ["*://*/*"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
-  "background": { "service_worker": "background.js" },
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["shared.js", "background.js"]
+  },
   "options_page": "options.html",
   "action": { "default_popup": "popup.html", "default_title": "Data Maskit Browser Bridge" },
   "content_scripts": [

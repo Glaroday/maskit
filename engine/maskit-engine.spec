@@ -35,6 +35,9 @@ hiddenimports = (
         'credential_labels',
         'audit_signals',
         'audit_engine',
+        'ner_engine',
+        'onnxruntime',
+        'tokenizers',
         # mitmdump 命令行入口：安装包不含 mitmdump.exe，引擎要自己当 mitmdump 跑
         # （engine_entry._run_as_mitmdump）。漏了它 = 干净机器上代理永远起不来。
         'mitmproxy.tools.main',
@@ -65,7 +68,16 @@ datas = (
        , (str(ENGINE_DIR / 'event_store.py'), '.')
        , (str(ENGINE_DIR / 'audit_signals.py'), '.')
        , (str(ENGINE_DIR / 'audit_engine.py'), '.')
+       , (str(ENGINE_DIR / 'ner_engine.py'), '.')
        , (str(ENGINE_DIR / 'config.example.json'), '.')]
+    # 本地 NER 模型（可选）：只在构建机确实有模型时才随包分发。
+    # 该目录被 .gitignore 排除（98MB 二进制不入库），CI/干净克隆上根本不存在——
+    # 无条件写进 datas 会让 PyInstaller 直接 SystemExit，把整个发版构建搞挂。
+    # 缺模型时引擎照常工作，只是语义实体识别不可用（UI 与 /api/health 会明确报出）。
+    + ([(str(ENGINE_DIR / 'models' / 'ner_mini_zh'), 'models/ner_mini_zh')]
+       if (ENGINE_DIR / 'models' / 'ner_mini_zh' / 'model_quantized.onnx').exists() else [])
+    # 打包前端静态构建产物（若存在），支持在浏览器直接访问引擎端口展现 WebUI/登录页
+    + ([(str(ROOT_DIR / 'frontend' / 'dist'), 'web_dist')] if (ROOT_DIR / 'frontend' / 'dist').exists() else [])
 )
 
 a = Analysis(
@@ -84,10 +96,14 @@ a = Analysis(
               # 实测 0.1.5 正式包里 IPython 90K、numpy 6.9M、numpy.libs 21M 全都在，
               # 45MB 安装包里有 28MB 是产品一行都不调用的科学计算库
               #（构建环境装了 langchain/transformers/numba 那一堆，它们把 numpy 拖了进来）。
-              # 引擎只用 mitmproxy + flask + stdlib，这些一个都不需要。
+              # 引擎只用 mitmproxy + flask + stdlib。
+              # ⚠️ 例外：numpy / tokenizers **不能排除**——本地 NER 引擎依赖
+              # onnxruntime（自身强依赖 numpy）与 tokenizers。PyInstaller 的 excludes
+              # 优先于 hiddenimports，两者同时存在时正式包会缺依赖，
+              # 表现为「装了包、开了 NER，却什么都没识别到」。
               'IPython', 'ipython', 'jedi', 'parso', 'PIL.ImageQt',
-              'numpy', 'numpy.libs', 'pandas', 'scipy', 'numba', 'llvmlite',
-              'transformers', 'torch', 'huggingface_hub', 'tokenizers',
+              'pandas', 'scipy', 'numba', 'llvmlite',
+              'transformers', 'torch', 'huggingface_hub',
               'sklearn', 'sympy', 'notebook', 'jupyter_core', 'zmq'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

@@ -42,6 +42,31 @@ def _reset_db(tmp_path):
     return old
 
 
+def _isolate_event_db(case):
+    """把本用例的事件落库重定向到独立临时库，用例结束自动还原。
+
+    门禁会真实跑 mask/restore/透传链路，这些路径上的 enqueue_event 是**异步写**：
+    不隔离就会把假 MASK/BLOCK/PASS/RESTORE 写进开发者本机的真实事件库
+    （污染 /api/stats 与每日用量，实测跑一次全量门禁 +5 行）。
+    """
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    case.addCleanup(tmp.cleanup)
+    old = event_store.DB_PATH
+    event_store.DB_PATH = Path(tmp.name) / "shield-events.sqlite3"
+    event_store._reset_writer()
+
+    def _restore():
+        # 先把队列排空再换回路径：写线程是异步的，残留事件会在还原之后
+        # 落到真实库上（正是本隔离要消灭的东西）。等待有上限，绝不挂死。
+        deadline = time.time() + 2
+        while not event_store._event_queue.empty() and time.time() < deadline:
+            time.sleep(0.05)
+        event_store._reset_writer()
+        event_store.DB_PATH = old
+
+    case.addCleanup(_restore)
+
+
 class MaskPathAwarenessTests(unittest.TestCase):
     """P0-1：脱敏跳过必须按 JSON 路径判定，业务字段不豁免。"""
 
@@ -430,6 +455,231 @@ class MaskPathAwarenessTests(unittest.TestCase):
         self._with_no_reload(run)
 
 
+class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
+    """审计 B2：数值型 / 键名 / 重复键三条漏检路径。
+
+    【为什么单独立类】这三条的共同点是 **fail-closed 兜不住**：
+    `_mask_tree` 对 int/float/bool 直接 `return obj`、键名不脱敏、重复键被
+    `json.loads` 后者覆盖 —— 三条都**不抛异常**，于是 `changed[0]` 假、
+    「零改写透传」分支把原始字节原样放行。判据是脏标记，不是异常，
+    所以「有 503 熔断」这种论证在这里完全不成立。
+
+    断言一律落在**最终发给上游的字节**（`flow.request.content`）上，
+    而不是中间对象 —— 漏检的后果是明文出网，不是对象长得不好看。
+    """
+
+    def _sent(self, body):
+        """跑一次请求，返回 (发给上游的文本, 脱敏后的 JSON 对象)。"""
+        holder = {}
+
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", body,
+                              listen_port=18701)
+            tr.request(flow)
+            holder["text"] = flow.request.content.decode("utf-8")
+            holder["obj"] = json.loads(flow.request.content)
+
+        self._with_no_reload(run)
+        return holder["text"], holder["obj"]
+
+    def test_numeric_phone_in_pii_field_is_masked(self):
+        """数值型手机号：`{"phone": 13812345678}` 的 int 分支此前直接原样返回。"""
+        sent, obj = self._sent({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "phone": 13812345678,
+        })
+        self.assertNotIn("13812345678", sent, "数值型手机号必须脱敏（B2）")
+        self.assertIsInstance(obj.get("phone"), str, "脱敏后应变成占位符字符串")
+
+    def test_numeric_id_card_with_valid_checksum_is_masked(self):
+        """数值型身份证：必须用**校验位合法**的号，否则会被当成误报而放过。
+
+        ⚠️ 审计报告里给的样例号 `110101199001011234` 校验位不合法，
+        `_idcard_ok` 会判它非身份证 → 字符串形态**有意**不脱敏（防误报）。
+        拿那个号做用例会得出「数值型也没脱敏」的错误结论，实际是「这个号本来就不该脱敏」。
+        """
+        sent, _obj = self._sent({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "id_card": 110101199003077213,
+        })
+        self.assertNotIn("110101199003077213", sent, "数值型身份证必须脱敏（B2）")
+
+    def test_numeric_float_phone_is_masked(self):
+        """float 形态（`13812345678.0`）走同一分支，别只测 int。"""
+        sent, _obj = self._sent({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "contact": 13812345678.0,
+        })
+        self.assertNotIn("13812345678", sent, "float 形态的手机号必须脱敏（B2）")
+
+    def test_pii_used_as_key_name_is_masked(self):
+        """键名脱敏：`{"13812345678": "x"}` 此前键名整条不扫。"""
+        sent, obj = self._sent({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "13812345678": "备注",
+        })
+        self.assertNotIn("13812345678", sent, "作为键名的手机号必须脱敏（B2）")
+        self.assertTrue(any("{{PHONE_" in k for k in obj.keys()),
+                        f"键名应被替换成占位符，实际 keys={list(obj.keys())}")
+
+    def test_duplicate_key_hides_later_plaintext_no_longer(self):
+        """重复键：`json.loads` 取后者覆盖前者 → 树里看不到被覆盖的那个值。
+
+        这里被覆盖的是**后一个**（解析后保留的就是它，能看到、能脱敏）；
+        真正危险的是反序（被覆盖的值带明文）。两个方向都测。
+        """
+        # 方向一：明文在前、被覆盖
+        raw1 = ('{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],'
+                '"note":"13812345678","note":"safe"}')
+        holder = {}
+
+        def run1():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", {},
+                              listen_port=18701)
+            flow.request.content = raw1.encode("utf-8")
+            tr.request(flow)
+            holder["text"] = flow.request.content.decode("utf-8")
+
+        self._with_no_reload(run1)
+        self.assertNotIn("13812345678", holder["text"],
+                         "重复键被覆盖的值带明文时，必须整份强制重写（B2）")
+
+        # 方向二：明文在后（解析后可见）—— 常规脱敏路径
+        raw2 = ('{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],'
+                '"note":"safe","note":"13812345678"}')
+        holder2 = {}
+
+        def run2():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", {},
+                              listen_port=18701)
+            flow.request.content = raw2.encode("utf-8")
+            tr.request(flow)
+            holder2["text"] = flow.request.content.decode("utf-8")
+
+        self._with_no_reload(run2)
+        self.assertNotIn("13812345678", holder2["text"], "重复键的后者同样必须脱敏")
+
+    def test_duplicate_key_forces_rewrite_even_when_value_is_clean(self):
+        """重复键即使**不含**敏感值也要强制重写。
+
+        原因见 `_load_json_pairs` 的注释：`json.loads` 的结果无法代表原文，
+        走 `_splice_mask` 时丢掉的键不在替换表里，而等价校验又可能误判通过。
+        """
+        raw = ('{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],'
+               '"note":"a","note":"b"}')
+        holder = {}
+
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", {},
+                              listen_port=18701)
+            flow.request.content = raw.encode("utf-8")
+            tr.request(flow)
+            holder["text"] = flow.request.content.decode("utf-8")
+
+        self._with_no_reload(run)
+        self.assertNotIn("13812345678", holder["text"])
+        # 内容可以不同（被重序列化），但语义必须等价于「后者覆盖前者」
+        self.assertEqual(json.loads(holder["text"])["note"], "b")
+
+    # 真实世界各家的协议顶层键（含中英混排的国内中转渠道）。
+    # 这份清单是**广谱护栏**：键名脱敏一旦误伤其中任何一个，上游会直接 400，
+    # 而那是「网页 AI 全站不可用」级别的故障 —— 所以宁可清单长一点。
+    PROTOCOL_TOP_KEYS = (
+        "model", "messages", "system", "prompt", "input", "instructions",
+        "tools", "tool_choice", "tool_config", "functions", "function_call",
+        "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens",
+        "max_output_tokens", "stream", "stream_options", "stop", "n", "seed",
+        "logprobs", "top_logprobs", "logit_bias", "presence_penalty",
+        "frequency_penalty", "user", "metadata", "response_format",
+        "modalities", "audio", "prediction", "store", "service_tier",
+        "reasoning", "reasoning_effort", "thinking", "thinking_budget",
+        "cache_control", "betas", "anthropic_version", "anthropic_beta",
+        "context_management", "mcp_servers", "container", "parallel_tool_calls",
+        "contents", "generation_config", "safety_settings", "candidate_count",
+        "safetySettings", "generationConfig", "systemInstruction",
+        "session_id", "request_id", "keep_alive", "options", "format",
+        "api_key", "x_api_key", "authorization",
+    )
+
+    def test_protocol_skeleton_survives_numeric_and_key_scan(self):
+        """反向锁：数值/键名两条新路径**不许**碰协议骨架。
+
+        新增扫描最容易伤到的就是 `max_tokens` / `temperature` / `seed` 这类数值协议字段
+        （它们也是 int），以及 `role` / `type` / `content` 这类键名。
+        这里用 `PROTOCOL_TOP_KEYS` 做广谱覆盖：**每一个键名和值都必须逐字节不变**。
+        """
+        body = {
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "n": 1,
+            "seed": 42,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        _sent, obj = self._sent(body)
+        for k, v in body.items():
+            self.assertEqual(obj.get(k), v, f"协议字段 {k} 被改动了：{obj.get(k)!r} != {v!r}")
+
+    def test_all_protocol_top_keys_pass_the_key_scanner(self):
+        """键名扫描的**广谱**反向锁：`PROTOCOL_TOP_KEYS` 里一个都不许被改名。
+
+        默认词表下这些键名现在都不命中（实测 105 个全过），但**白名单没覆盖其中 61 个**
+        （`temperature` / `max_tokens` / `api_key` / `authorization` …）—— 也就是说
+        只要用户的自定义词表里出现同名或同形词，它们就会被写成占位符、上游直接 400。
+        这条用例的作用是把「默认词表恰好不命中」这个巧合变成**被监控的**性质：
+        一旦有人往默认规则里加词命中这些键名，这里立刻红，而不是等用户报「网页 AI 全挂」。
+        """
+        for k in self.PROTOCOL_TOP_KEYS:
+            _sent, obj = self._sent({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                k: "probe-value",
+            })
+            self.assertIn(k, obj,
+                          f"协议顶层键 {k!r} 被改名成了 {[x for x in obj if x != 'model' and x != 'messages']}")
+
+    def test_list_root_wrapper_key_is_never_renamed(self):
+        """非对象根会被包成 `{__shield_root__: [...]}`，包装键**绝不能**被脱敏。
+
+        一旦被改写，下面 `body[_ROOT_WRAP_KEY]` 直接 KeyError → 脱敏管线抛异常 →
+        fail-closed 503，所有「列表根」请求全挂（这是新增键名扫描最危险的连带伤害）。
+        """
+        raw = '[{"role":"user","content":"hi","13812345678":"备注"}]'
+        holder = {}
+
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", {},
+                              listen_port=18701)
+            flow.request.content = raw.encode("utf-8")
+            tr.request(flow)
+            holder["status"] = getattr(flow.response, "status_code", None)
+            holder["text"] = flow.request.content.decode("utf-8")
+
+        self._with_no_reload(run)
+        self.assertNotIn("13812345678", holder["text"], "列表根里的 PII 键名仍必须脱敏")
+        self.assertNotIn("__shield_root__", holder["text"],
+                         "包装键是内部实现细节，绝不能被写进发给上游的 body")
+
+    def test_numeric_business_value_is_still_scanned(self):
+        """反向锁的另一面：数值豁免只覆盖**协议字段**，业务区里的数值照常扫。
+
+        `input` / `arguments` 是业务区（工具参数），那里的数值可能是工号、
+        内网 IP 的十进制写法、订单号 —— 一律跳过等于新增漏检面。
+        """
+        sent, _obj = self._sent({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "input": {"employee_phone": 13812345678},
+        })
+        self.assertNotIn("13812345678", sent, "业务区里的数值型敏感值必须脱敏")
+
+
 class Ipv6AndUsccRuleTests(unittest.TestCase):
     """IPv6 私网脱敏与 USCC 校验位（GB 32100-2015 MOD31）——审计 P3 落地。"""
 
@@ -448,6 +698,18 @@ class Ipv6AndUsccRuleTests(unittest.TestCase):
         self.assertNotIn("fd00", out)
         self.assertNotIn("fe80", out)
         self.assertIn("{{IPV6PRIVATE_", out)
+
+    def test_ipv6_private_mixed_case_masked(self):
+        """混合大小写（Fe80::1 / FD00::9）也必须命中。
+
+        预检 marker 只列小写形态：比对前不降大小写的话，混合大小写文本会在
+        _rule_may_hit 处被判「不命中」，整条 IPV6_PRIVATE 规则被静默跳过。
+        """
+        self.assertTrue(tr._rule_may_hit("Fe80::1", "IPV6_PRIVATE"),
+                        "预检对混合大小写必须命中，否则整条规则被跳过")
+        out = tr.mask("link Fe80::1 and FD00:1234::9 here", "v6-d")
+        self.assertNotIn("Fe80::1", out)
+        self.assertNotIn("FD00:1234::9", out)
 
     def test_ipv6_public_and_doc_ranges_kept(self):
         """公网与文档段（2001:db8::/32）必须放行。
@@ -707,6 +969,9 @@ class CredentialRedactionTests(unittest.TestCase):
     """P0-2：凭据永不明文落库。"""
 
     def setUp(self):
+        # 事件库隔离：本类用例走真实 tr.request/response 链路，链路上的
+        # enqueue_event 是异步写，不隔离就会把假事件写进真实事件库。
+        _isolate_event_db(self)
         tr.sessions.clear()
         tr._RECENT_FWD.clear()
         tr._RECENT_REV.clear()
@@ -863,7 +1128,12 @@ class CredentialRedactionTests(unittest.TestCase):
 
 
 class ExportRedactionTests(unittest.TestCase):
-    """P0-3：日志导出恒脱敏。"""
+    """日志**下发**恒脱敏：导出（/api/logs/export）与列表（/api/logs，非 slim）。
+
+    两条路径的共同点：都会把事件的完整 payload 交出去。区别是导出走白名单剔除，
+    列表走 `_scrub_legacy_event` 只清凭据（普通 PII 的原文必须保留，
+    详情弹窗的「脱敏 ↔ 原文」对照靠它）。
+    """
 
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp())
@@ -901,6 +1171,44 @@ class ExportRedactionTests(unittest.TestCase):
         self.assertNotIn("13812345678", blob, "导出不得包含任何原文")
         # 凭据项的打码 preview 与摘要保留（可对照同一性，无明文）
         self.assertIn('"digest": "aaaaaaaaaaaaaaaa"', blob)
+
+
+    def test_logs_list_read_side_scrubs_credentials_keeps_pii(self):
+        """审计 B1：`/api/logs`（**非 slim**）读侧必须兜一道凭据清洗。
+
+        为什么这条必须存在：扩展链路的 `_emit` 此前漏了 `_redact_credentials`，
+        凭据原文直接落进了 `dialog` / `req_preview` / `resp_preview` 字段
+        （`items[]` 本身一直合规，所以只断言 items 的用例全绿放过了它）。
+        写侧已修，但**存量库还在**，而 `/api/logs` 是按行原样回源的 ——
+        不清洗等于把 API Key 渲染给任何持令牌的调用方。
+
+        反向锁同样重要：普通 PII 的 `original` 必须留下，
+        详情弹窗的「脱敏 ↔ 原文」对照靠它（用户明确要求的能力）。
+        """
+        event_store.append_event({
+            "ts": time.time(), "type": "MASK", "count": 2, "host": "chatgpt.com",
+            "path": "/ext/mask",
+            "items": [
+                {"label": "API_KEY", "original": "sk-abcdefghijklmnopqrstuvwxyz012345",
+                 "preview": "sk-a…2345", "length": 38},
+                {"label": "PHONE", "original": "13812345678", "preview": "138****5678", "length": 11},
+            ],
+            # 存量库里 dialog 就是原文切片（写侧修复前的行为）
+            "dialog": "联系人 13812345678，key 是 sk-abcdefghijklmnopqrstuvwxyz012345",
+            "req_preview": "key 是 sk-abcdefghijklmnopqrstuvwxyz012345",
+        })
+        event_store.flush_event_queue()
+        with panel.app.test_client() as client:
+            resp = client.get("/api/logs?limit=50", headers={"X-Shield-Token": panel.API_TOKEN})
+        self.assertEqual(resp.status_code, 200)
+        ev = [e for e in resp.get_json()["events"] if e.get("host") == "chatgpt.com"]
+        self.assertTrue(ev, "列表必须能取到该事件（否则本用例什么都没测到）")
+        blob = json.dumps(ev[0], ensure_ascii=False)
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz012345", blob,
+                         "读侧没兜住凭据清洗：存量库里的 API Key 原文被下发（B1 复发）")
+        # 普通 PII 原文必须保留 —— 详情弹窗的对照能力不能被打掉
+        self.assertIn("13812345678", blob,
+                      "普通 PII 原文被过度清洗，详情弹窗的「脱敏 ↔ 原文」对照会失效")
 
 
 class WriterResilienceTests(unittest.TestCase):
@@ -1346,6 +1654,262 @@ class ResponseScanWithoutMasksTests(unittest.TestCase):
             tr._emit = old_emit
 
 
+class AuditResponseHardeningTests(unittest.TestCase):
+    """审计 2026-09-19 修复项：B4（换芯检测门控）/ M1（PEM 回溯 + 扫描截断）/ L1（SSE `data:` 无空格）。"""
+
+    # ⚠️ 伪造的 PEM 头必须**运行时拼接**，不能写成完整字面量：
+    # `scripts/audit-public-release.py` 会拦下仓库里出现的完整私钥块形态
+    # （GitHub Secret Scanning 会因此对公开仓库报警），直接写常量会让
+    # version 组的「Public release audit」门禁失败 —— 实测踩过。
+    PEM_HEAD = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    PEM_TAIL = "-----END " + "RSA PRIVATE KEY-----"
+
+    @staticmethod
+    def _pem_re():
+        """从 `SECRET_REGEX_PATTERNS` 里取 PEM 那条正则。
+
+        它**不在**模块级单变量里，而是列表里的 `(regex, label)` 元组 ——
+        `dict(SECRET_REGEX_PATTERNS)["pem_private_key"]` 会把**正则**当键、直接 KeyError
+        （踩过）。必须自己翻转成 `{label: regex}`。
+        """
+        return {lab: rx for rx, lab in audit_signals.SECRET_REGEX_PATTERNS}["pem_private_key"]
+
+    # ── B4 ───────────────────────────────────────────────────────────────
+
+    def _audit_response(self, req_body, resp_body, ct="application/json", status=200):
+        """跑一次 `_audit_response`，返回落库的审计事件列表。"""
+        captured = []
+        sid = "audit-hardening"
+        tr._new_session(sid)
+        flow = SimpleNamespace(
+            request=SimpleNamespace(
+                host="api.openai.com", method="POST", path="/v1/chat/completions",
+                content=json.dumps(req_body).encode("utf-8"),
+            ),
+            response=SimpleNamespace(
+                status_code=status,
+                headers={"content-type": ct},
+                content=json.dumps(resp_body).encode("utf-8"),
+            ),
+            metadata={"session_id": sid},
+        )
+        with mock.patch.object(tr, "AUDIT_ENABLED", True), \
+             mock.patch.object(tr, "enqueue_audit_event",
+                               lambda ev: captured.append(ev)), \
+             mock.patch.dict(tr.AUDIT_SIGNALS, {"identity_swap": True}):
+            tr._audit_response(flow, sid, "api.openai.com", "POST",
+                               "/v1/chat/completions", {})
+        return captured
+
+    REQ_GPT4O = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_identity_swap_detected_on_textless_response(self):
+        """B4：`text_chunks` 为空的响应也必须做换芯检测。
+
+        修复前是 `for chunk in text_chunks: scan_identity_swap(chunk, ...)` ——
+        文本块为空就整段跳过。而 `scan_identity_swap` 的第三个参数（文本）
+        **完全不参与判定**，判定只看 `model_field` + `req_model`。
+        于是 tool_use-only / reasoning-only / 空文本这些**编程助手最主流**的响应形态上，
+        换芯检测静默失效 —— 恶意 relay 只要回一个空 content 就能绕过。
+        """
+        cases = {
+            "Anthropic 非流式 tool_use-only":
+                {"model": "claude-3-5-sonnet", "role": "assistant",
+                 "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]},
+            "OpenAI content:null 拒答":
+                {"model": "claude-3-5-sonnet",
+                 "choices": [{"message": {"content": None}}]},
+        }
+        for name, resp in cases.items():
+            with self.subTest(case=name):
+                evs = self._audit_response(self.REQ_GPT4O, resp)
+                signals = {e.get("signal_type") for e in evs}
+                self.assertIn(
+                    "identity_swap", signals,
+                    f"{name}：换芯检测被 text_chunks 门控掉了（B4 复发），events={evs}",
+                )
+
+    def test_identity_swap_detected_on_sse_tool_use_only_stream(self):
+        """同上，但走 **SSE 分帧**形态：`delta.partial_json` 里才是工具参数，没有 `delta.text`。
+
+        这条单独写是因为 body 必须是真正的 SSE（带 `data: ` 前缀），
+        塞一个裸 JSON 对象进去会被解析成「无 data 行」→ model_field 取不到 →
+        用例会因为**别的原因**变绿/变红，测不到 B4 的门控。
+        """
+        raw = ("data: " + json.dumps({
+            "model": "claude-3-5-sonnet", "type": "content_block_delta",
+            "delta": {"type": "input_json_delta", "partial_json": "{}"},
+        }) + "\n\n")
+        captured = []
+        sid = "audit-sse-b4"
+        tr._new_session(sid)
+        flow = SimpleNamespace(
+            request=SimpleNamespace(
+                host="api.openai.com", method="POST", path="/v1/chat/completions",
+                content=json.dumps(self.REQ_GPT4O).encode("utf-8"),
+            ),
+            response=SimpleNamespace(
+                status_code=200,
+                headers={"content-type": "text/event-stream"},
+                content=raw.encode("utf-8"),
+            ),
+            metadata={"session_id": sid},
+        )
+        with mock.patch.object(tr, "AUDIT_ENABLED", True), \
+             mock.patch.object(tr, "enqueue_audit_event",
+                               lambda ev: captured.append(ev)), \
+             mock.patch.dict(tr.AUDIT_SIGNALS, {"identity_swap": True}):
+            tr._audit_response(flow, sid, "api.openai.com", "POST",
+                               "/v1/chat/completions", {})
+        self.assertIn("identity_swap", {e.get("signal_type") for e in captured},
+                      f"SSE tool_use-only 流的换芯检测失效（B4 复发），events={captured}")
+
+    def test_identity_swap_not_reported_when_model_matches(self):
+        """反向锁：模型一致时不许报（否则是纯噪声，用户会把整个审计页忽略掉）。"""
+        evs = self._audit_response(
+            self.REQ_GPT4O,
+            {"model": "gpt-4o", "choices": [{"message": {"content": "hi"}}]},
+        )
+        self.assertNotIn("identity_swap", {e.get("signal_type") for e in evs})
+
+    # ── M1 ───────────────────────────────────────────────────────────────
+
+    def test_pem_scan_is_linear_in_body_size(self):
+        """M1：PEM 正则不许跨 body 回溯。
+
+        修复前形态是 `-----BEGIN[A-Z \\-]*PRIVATE KEY-----` + `[\\s\\S]*?` +
+        `-----END...`：在「只有 BEGIN 没有 END」的文本上，每个 BEGIN 起点都要把
+        剩余全文试一遍 → O(n²)。实测 1.5/3.0/6.1/12.1KB → 4.4/43.5/372.6/**2844.9** ms
+        （每翻倍 ×10）。`_audit_response` 是**同步**跑在 mitmproxy 事件循环上的，
+        上游回一个畸形 400 就能把本地代理的 CPU 打满，所以必须有自动化护栏。
+        """
+        rx = self._pem_re()
+
+        def elapsed(n):
+            text = (self.PEM_HEAD + "\n") * n
+            t0 = time.perf_counter()
+            rx.findall(text)
+            return time.perf_counter() - t0
+
+        small = elapsed(50)        # 1.5 KB
+        large = elapsed(400)       # 12.1 KB（8 倍体量）
+        # **主判据是倍率**，不是绝对耗时：绝对耗时随机器差一个数量级
+        # （本机实测旧正则 12.1KB 只要 54.8ms，审计报告那台是 2844.9ms），
+        # 卡绝对时间要么在快机器上失去鉴别力、要么在慢 CI 上假红。
+        # 倍率与机器无关：线性≈8、二次≈64。取 25 做分界，两侧都不贴边。
+        ratio = large / max(small, 1e-4)
+        self.assertLess(ratio, 25,
+                        f"耗时倍率 {ratio:.1f}（线性≈8、二次≈64）→ 不是线性"
+                        f"（1.5KB={small * 1000:.2f}ms, 12.1KB={large * 1000:.2f}ms）")
+        # 绝对上限只作兜底（防「两边都慢所以倍率好看」的退化），给得很宽
+        self.assertLess(large, 1.0,
+                        f"12.1KB 无 END 文本耗时 {large * 1000:.1f}ms —— 量级不对")
+
+    def test_pem_detection_still_works(self):
+        """M1 的反向锁：改成线性**不能**把检测能力一起丢掉。"""
+        rx = self._pem_re()
+        for text, expect in (
+            (self.PEM_HEAD + "\nabc\n" + self.PEM_TAIL, True),
+            ("-----BEGIN " + "OPENSSH PRIVATE KEY-----\nabc", True),
+            ("-----BEGIN " + "PRIVATE KEY-----\nabc", True),
+            ("-----BEGIN CERTIFICATE-----\nabc", False),
+            ("普通文本没有密钥", False),
+        ):
+            with self.subTest(text=text[:40]):
+                self.assertEqual(bool(rx.search(text)), expect,
+                                 f"{text[:40]!r} 判定不符（漏检或误报）")
+
+    def test_audit_response_truncates_scan_input_but_not_parse_input(self):
+        """M1 后半段：送给扫描器的文本要截断，但结构化解析必须吃**全量**。
+
+        两件事必须同时成立，缺一不可：
+        - 截断：上游回一个几百 KB 的畸形 body 时，扫描（PEM 等正则）不能全量跑；
+        - 不截断解析：`_parse_response_payload` 要吃完整 body，否则 `model_field`
+          落在截断点之后就取不到 → 换芯检测静默失效（等于把 M1 修成 B4）。
+        """
+        cap = 200
+        pad = "x" * (cap + 500)
+        resp = {"model": "claude-3-5-sonnet",
+                "choices": [{"message": {"content": pad}}]}
+        sid = "m1-trunc"
+        tr._new_session(sid)
+        flow = SimpleNamespace(
+            request=SimpleNamespace(
+                host="api.openai.com", method="POST", path="/v1/chat/completions",
+                content=json.dumps(self.REQ_GPT4O).encode("utf-8"),
+            ),
+            response=SimpleNamespace(
+                status_code=200, headers={"content-type": "application/json"},
+                content=json.dumps(resp).encode("utf-8"),
+            ),
+            metadata={"session_id": sid},
+        )
+        seen = {}
+        orig_parse = tr._parse_response_payload
+
+        def spy_parse(text, ct):
+            seen["parse_len"] = len(text)
+            return orig_parse(text, ct)
+
+        def spy_poison(text, request_text=None):
+            seen["poison_len"] = len(text)
+            return []
+
+        def spy_danger(text, request_text=None):
+            seen["danger_len"] = len(text)
+            return []
+
+        # ⚠️ 探针**必须显式 `return []`**。写成 `seen.setdefault(...) or []` 会返回
+        # 记下的 int，`findings.extend(int)` 抛 TypeError，而 `_audit_response` 外层
+        # 是「异常静默」——于是用例会因为函数中途夭折而给出误导性的 None（踩过）。
+        with mock.patch.object(tr, "_SCAN_BODY_MAX", cap), \
+             mock.patch.object(tr, "_parse_response_payload", spy_parse), \
+             mock.patch.object(tr._audit, "scan_response_poison", spy_poison), \
+             mock.patch.object(tr._audit, "scan_dangerous_action", spy_danger), \
+             mock.patch.object(tr, "enqueue_audit_event", lambda ev: None), \
+             mock.patch.dict(tr.AUDIT_SIGNALS, {"response_poison": True,
+                                                "dangerous_action": True,
+                                                "identity_swap": True}):
+            tr._audit_response(flow, sid, "api.openai.com", "POST",
+                               "/v1/chat/completions", {})
+        self.assertEqual(seen.get("poison_len"), cap,
+                         "送给扫描器的文本必须截断到 _SCAN_BODY_MAX")
+        self.assertEqual(seen.get("danger_len"), cap)
+        self.assertGreater(seen.get("parse_len", 0), cap,
+                           "结构化解析必须吃全量 body（截断只作用于扫描器那份副本）")
+
+    # ── L1 ───────────────────────────────────────────────────────────────
+
+    def test_sse_data_line_without_space_is_parsed(self):
+        """L1：SSE 的 `data:` 后空格**是可选的**，解析不能要求它。
+
+        规范里 `data:payload` 与 `data: payload` 等价（冒号后的单个空格会被剥离）。
+        审计侧原先写的是 `line.startswith("data: ")`，于是发无空格形态的上游
+        （实测存在）会让 S2 换芯 / S4 流异常的审计**静默失效** ——
+        而还原路径用的是不带空格的写法，所以脱敏还原照常、只有审计瞎了，
+        用户完全看不出来。这里直接锁解析结果。
+        """
+        for raw in (
+            'data:{"model":"gpt-4o","choices":[{"delta":{"content":"hi"}}]}\n\n',
+            'data: {"model":"gpt-4o","choices":[{"delta":{"content":"hi"}}]}\n\n',
+        ):
+            with self.subTest(raw=raw[:20]):
+                chunks, model_field, _events = tr._parse_response_payload(
+                    raw, "text/event-stream")
+                self.assertEqual(model_field, "gpt-4o",
+                                 f"未解析出 model（L1 复发）：{raw[:40]!r}")
+                self.assertIn("hi", "".join(chunks))
+
+    def test_sse_done_sentinel_is_skipped(self):
+        """`[DONE]` 是终止哨兵不是 JSON，解析它不能抛也不能产出伪事件。"""
+        raw = ('data: {"model":"gpt-4o","choices":[{"delta":{"content":"hi"}}]}\n\n'
+               'data: [DONE]\n\n')
+        chunks, model_field, events = tr._parse_response_payload(raw, "text/event-stream")
+        self.assertEqual(model_field, "gpt-4o")
+        self.assertEqual("".join(chunks), "hi")
+        self.assertTrue(all(isinstance(e, dict) for e in events))
+
+
 class ConfigAndApiTests(unittest.TestCase):
     def test_stop_mode_normalization(self):
         """stop_mode 三态：passthrough（默认）/ error / block。
@@ -1678,6 +2242,11 @@ class SseStreamTerminatorTests(unittest.TestCase):
     请求2 复用连接报 BadStatusLine: 0；修复臂：234B 含 [DONE]，请求2 HTTP 200）。
     """
 
+    def setUp(self):
+        # 本类用例真跑 _stream，_finish 会 enqueue RESTORE：不隔离的话异步写
+        # 会落进开发者本机真实事件库。
+        _isolate_event_db(self)
+
     def tearDown(self):
         # 流完成时 _finish → _emit_restore_summary 会 enqueue RESTORE 事件（异步写线程）。
         # 不 flush 会残留队列，污染后续 WriterAccountingTests 的 dead_letters 计数
@@ -1820,6 +2389,11 @@ class ConfigConcurrencyTests(unittest.TestCase):
 
 class WriterAccountingTests(unittest.TestCase):
     """写线程的失败计数必须反映真实丢失量，摘要失败必须留痕。"""
+
+    def setUp(self):
+        # 用例把 DB 打成不可写来统计死信，但入队与 _ensure_writer 仍会摸真实库
+        # （路径缺失时会顺手在真实数据目录建表）：先隔离再折腾。
+        _isolate_event_db(self)
 
     def test_dead_letters_counts_events_not_batches(self):
         """一批 N 条全失败要计 N，不是 1。
@@ -2331,6 +2905,10 @@ class StabilityFixTests(unittest.TestCase):
         """
         import http.client
         import socket
+
+        # 503 占位监听会真实 enqueue BLOCK 事件（panel._start_fallback）：
+        # 不隔离就把假拒绝事件写进开发者本机的真实事件库。
+        _isolate_event_db(self)
 
         # 取一个空闲端口
         s = socket.socket()
@@ -4455,8 +5033,11 @@ class ObjectKeyMaskingBoundaryTests(unittest.TestCase):
 
     def test_pii_as_object_key_is_a_known_boundary(self):
         out = tr._mask_tree({"metadata": {"13800138000": "x"}}, "key-boundary-sid", None, None, (), 0)
-        # 现状：键名原样透传（若将来收紧这条边界，此断言会红，提醒同步更新文档与还原侧）
-        self.assertEqual(list(out["metadata"].keys()), ["13800138000"])
+        # 键名脱敏（审计 B2 收紧边界）：非保护键名的 PII-as-key 也会被脱敏为占位符
+        keys = list(out["metadata"].keys())
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0].startswith("{{PHONE_"))
+        self.assertNotEqual(keys[0], "13800138000")
 
     def test_protocol_keys_are_never_rewritten(self):
         """协议骨架必须逐字保留——这是「不脱敏键名」换来的核心保证。"""
@@ -6055,3 +6636,449 @@ class EscapedAndRewrittenPlaceholderTests(_RuleTestBase):
         tr._prune_recent()
         self.assertNotIn(suffix, tr._RECENT_SUFFIX)
         self.assertNotIn(tok, tr._RECENT_REV)
+
+
+class PersistentCustomWordsAndFaultTolerantRestoreTests(unittest.TestCase):
+    """自定义敏感词全局持久映射与变异占位符容错还原测试（对应 Issue #30 及长任务 Agent 工具调用优化）。"""
+
+    def setUp(self):
+        self.orig_words = dict(tr.CUSTOM_WORDS)
+        self.orig_fwd = dict(tr._CUSTOM_WORD_FWD)
+        self.orig_rev = dict(tr._CUSTOM_WORD_REV)
+        self.orig_recent_fwd = dict(tr._RECENT_FWD)
+        self.orig_recent_rev = dict(tr._RECENT_REV)
+        self.orig_recent_suffix = dict(tr._RECENT_SUFFIX)
+        self.orig_ttl = tr.SESSION_TTL
+
+    def tearDown(self):
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update(self.orig_words)
+        tr._refresh_custom_words_sorted()
+        tr._CUSTOM_WORD_FWD.clear()
+        tr._CUSTOM_WORD_FWD.update(self.orig_fwd)
+        tr._CUSTOM_WORD_REV.clear()
+        tr._CUSTOM_WORD_REV.update(self.orig_rev)
+        tr._RECENT_FWD.clear()
+        tr._RECENT_FWD.update(self.orig_recent_fwd)
+        tr._RECENT_REV.clear()
+        tr._RECENT_REV.update(self.orig_recent_rev)
+        # 后缀索引必须还原：_refresh_custom_words_sorted / _recall_token 都会往里写，
+        # 残留会改变后续用例的容错还原结果（顺序相关的假红/假绿）
+        tr._RECENT_SUFFIX.clear()
+        tr._RECENT_SUFFIX.update(self.orig_recent_suffix)
+        tr.SESSION_TTL = self.orig_ttl
+
+    def test_custom_word_deterministic_suffix_across_reloads(self):
+        """自定义敏感词派生的 6 位纯辅音占位符必须跨重载、跨多次计算稳定确定。"""
+        secret = "my_custom_token_abcdef123456"
+        s1 = tr._deterministic_suffix(secret)
+        s2 = tr._deterministic_suffix(secret)
+        self.assertEqual(s1, s2, "确定性派生后缀必须完全一致")
+        self.assertEqual(len(s1), 6)
+        self.assertTrue(all(c in tr._TOKEN_ALPHABET for c in s1), "后缀必须为纯辅音")
+
+        tr.CUSTOM_WORDS = {secret: "TOKEN"}
+        tr._refresh_custom_words_sorted()
+        tok1 = tr._CUSTOM_WORD_FWD.get(secret)
+        self.assertIsNotNone(tok1)
+        self.assertTrue(tok1.startswith("{{TOKEN_"))
+        self.assertTrue(tok1.endswith(s1 + "}}"))
+
+        # 模拟重载刷新，再次比对
+        tr._refresh_custom_words_sorted()
+        tok2 = tr._CUSTOM_WORD_FWD.get(secret)
+        self.assertEqual(tok1, tok2, "重载后占位符必须保持确定性不变")
+
+    def test_custom_word_survives_recent_ttl_expiration(self):
+        """普通 PII 超过 TTL 被淘汰，自定义敏感词永不淘汰且持续可还原。"""
+        tr.SESSION_TTL = 600
+        secret = "my_custom_secret_key_999"
+        tr.CUSTOM_WORDS = {secret: "SECRET"}
+        tr._refresh_custom_words_sorted()
+
+        # 普通 IP 与自定义敏感词
+        sid = "test-perm-ttl"
+        tr._new_session(sid)
+        normal_ip = "192.168.100.200"
+        tok_ip = tr._recall_token(normal_ip, "IP_PRIVATE")
+        tok_secret = tr._recall_token(secret, "SECRET")
+
+        # 模拟经过 25 小时（超过 24h 默认 TTL）
+        old_time = time.time() - 25 * 3600
+        tr._RECENT_FWD[normal_ip][2] = old_time
+        tr._RECENT_FWD[secret][2] = old_time
+        tr._prune_recent()
+
+        # 普通 IP 应当被清理
+        self.assertNotIn(normal_ip, tr._RECENT_FWD)
+        self.assertNotIn(tok_ip, tr._RECENT_REV)
+
+        # 自定义敏感词必须永久保留
+        self.assertIn(secret, tr._RECENT_FWD)
+        self.assertIn(tok_secret, tr._RECENT_REV)
+
+        # 在全新会话中执行还原
+        fresh_sid = "fresh-session-after-ttl"
+        tr._new_session(fresh_sid)
+        out = tr.restore_final(f"curl -u user:{tok_secret} http://api", fresh_sid)
+        self.assertEqual(out, f"curl -u user:{secret} http://api", "自定义敏感词应当成功还原")
+
+    def test_custom_word_survives_lru_capacity_overflow(self):
+        """当复用表容量超过 _RECENT_MAX 时，自定义敏感词不参与 LRU 淘汰。"""
+        secret = "my_custom_perm_token_888"
+        tr.CUSTOM_WORDS = {secret: "TOKEN"}
+        tr._refresh_custom_words_sorted()
+        tok_secret = tr._CUSTOM_WORD_FWD[secret]
+
+        # 造大量普通 IP 塞满复用表（超过 _RECENT_MAX 2000）
+        now = time.time()
+        for i in range(2100):
+            fake_ip = f"10.200.{i // 256}.{i % 256}"
+            fake_tok = f"{{{{IPPRIVATE_f{i:05d}}}}}"
+            tr._RECENT_FWD[fake_ip] = [fake_tok, "IP_PRIVATE", now - (2100 - i)]
+            tr._RECENT_REV[fake_tok] = [fake_ip, "IP_PRIVATE", now - (2100 - i)]
+
+        tr._prune_recent(now)
+
+        # 复用表被截断至 _RECENT_MAX，但自定义词必须存活
+        self.assertIn(secret, tr._RECENT_FWD)
+        self.assertIn(tok_secret, tr._RECENT_REV)
+        self.assertEqual(tr._lookup(tok_secret, "test-overflow"), secret)
+
+    def test_custom_word_fallback_lookup_when_recent_rev_cleared(self):
+        """即便极端情况下复用表被清空，_CUSTOM_WORD_REV 也能兜底完成还原。"""
+        secret = "internal_db_pass_xyz123"
+        tr.CUSTOM_WORDS = {secret: "SECRET"}
+        tr._refresh_custom_words_sorted()
+        tok_secret = tr._CUSTOM_WORD_FWD[secret]
+
+        # 模拟清空通用复用表
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+
+        sid = "test-fallback-lookup"
+        tr._new_session(sid)
+        self.assertEqual(tr._lookup(tok_secret, sid), secret, "_CUSTOM_WORD_REV 应当兜底命中")
+        out = tr.restore_final(f"mysql -p{tok_secret}", sid)
+        self.assertEqual(out, f"mysql -p{secret}")
+
+    def test_restore_spaces_inside_braces_leaves_no_residue(self):
+        """大模型在工具参数中带内部空格（Jinja 风格）必须完整还原，绝不留 {{ 或 }} 残渣。"""
+        secret = "my_custom_auth_token_777"
+        tr.CUSTOM_WORDS = {secret: "TOKEN"}
+        tr._refresh_custom_words_sorted()
+        tok = tr._CUSTOM_WORD_FWD[secret]
+        # 提取 label 与 suffix
+        m = tr._PLACEHOLDER_PARTS_RX.match(tok)
+        self.assertIsNotNone(m)
+        label, suffix = m.group(1), m.group(2)
+
+        sid = "test-spaces-restore"
+        tr._new_session(sid)
+
+        # 各种内部空格变体
+        variants = [
+            f"{{{{ {label}_{suffix} }}}}",
+            f"{{{{  {label}_{suffix}  }}}}",
+            f"{{{{ {label}_{suffix}}}}}",
+            f"{{{{{label}_{suffix} }}}}",
+        ]
+        for var in variants:
+            with self.subTest(variant=var):
+                cmd = f"curl -H 'Authorization: Bearer {var}' https://api.github.com"
+                out = tr.restore_final(cmd, sid)
+                self.assertEqual(out, f"curl -H 'Authorization: Bearer {secret}' https://api.github.com")
+                self.assertNotIn("{{", out, f"不得残留左双花括号: {out}")
+                self.assertNotIn("}}", out, f"不得残留右双花括号: {out}")
+
+    def test_restore_escaped_with_spaces(self):
+        """大模型在 JSON 工具参数中输出带转义符且含空格的形态能够干净还原。"""
+        secret = "my_custom_api_key_666"
+        tr.CUSTOM_WORDS = {secret: "API_KEY"}
+        tr._refresh_custom_words_sorted()
+        tok = tr._CUSTOM_WORD_FWD[secret]
+        m = tr._PLACEHOLDER_PARTS_RX.match(tok)
+        label, suffix = m.group(1), m.group(2)
+
+        sid = "test-escaped-spaces"
+        tr._new_session(sid)
+
+        # 转义加空格形态
+        cases = [
+            rf"\{{\{{ {label}_{suffix} \}}\}}",
+            rf"\\{{\\{{ {label}_{suffix} \\}}\\}}",
+        ]
+        for c in cases:
+            with self.subTest(case=c):
+                out = tr.restore_final(f"arg: {c}", sid)
+                self.assertEqual(out, f"arg: {secret}")
+                self.assertNotIn(r"\{", out)
+                self.assertNotIn(r"\}", out)
+
+    def test_restore_loose_single_brace_and_bare_token_spacing(self):
+        """单花括号带空格干净还原，裸 token 前导空格严格保留。"""
+        secret = "my_hunter2_secret"
+        tr.CUSTOM_WORDS = {secret: "SECRET"}
+        tr._refresh_custom_words_sorted()
+        tok = tr._CUSTOM_WORD_FWD[secret]
+        m = tr._PLACEHOLDER_PARTS_RX.match(tok)
+        label, suffix = m.group(1), m.group(2)
+
+        sid = "test-loose-spacing"
+        tr._new_session(sid)
+
+        # 单花括号加空格：消灭单花括号与内部空格
+        single_brace = f"{{ {label}_{suffix} }}"
+        out1 = tr.restore_final(f"val: {single_brace}", sid)
+        self.assertEqual(out1, f"val: {secret}")
+
+        # 裸 token：前导空格严格保留
+        bare = f"{label}_{suffix}"
+        out2 = tr.restore_final(f"token: {bare}", sid)
+        self.assertEqual(out2, f"token: {secret}")
+
+    def test_disabled_custom_word_is_cleared_and_evictable(self):
+        """禁用自定义词：同一次重载就要清掉永久映射，此后回归 TTL 回收管辖。
+
+        此前两处叠加会让禁用词的明文长期驻留：_maybe_reload 在禁用集赋值**之前**
+        就重建映射（差一代，要改两次配置才生效），且 _is_custom_word_orig 只看
+        「在不在 CUSTOM_WORDS」，禁用词在复用表里继续永久豁免 TTL 与 LRU。
+        """
+        secret = "my_disabled_secret_456"
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "config.json").write_text(json.dumps({
+                "custom_words": {secret: "SECRET"},
+                "sensitive_word_disabled": {"SECRET": [secret]},
+            }), encoding="utf-8")
+            saved = {k: getattr(tr, k) for k in (
+                "TARGET_DOMAINS", "API_PATHS", "SECRET_PREFIXES", "SESSION_TTL", "DEBUG",
+                "DIAGNOSTIC_UNMATCHED", "DOMAINS_DISABLED", "UPSTREAMS", "CAPTURE_MODE",
+                "FILTER_ENABLED", "SENSITIVE_DISABLED", "SENSITIVE_WORD_DISABLED",
+                "SENSITIVE_WORD_WHOLE", "BUILTIN_RULES", "EGRESS_PROXY",
+            )}
+            self.addCleanup(lambda: [setattr(tr, k, v) for k, v in saved.items()])
+            with mock.patch.object(tr, "_DATA_ROOT", Path(d)):
+                tr._maybe_reload(force=True)
+
+        self.assertNotIn(secret, tr._CUSTOM_WORD_FWD, "禁用词必须在同一次重载里被清掉")
+        self.assertTrue(all(v[0] != secret for v in tr._CUSTOM_WORD_REV.values()))
+        self.assertFalse(tr._is_custom_word_orig(secret), "禁用词不得再享永久豁免")
+
+        # 回到 TTL 管辖：时间戳推老后必须被 _prune_recent 清掉
+        tr.SESSION_TTL = 600
+        stale = time.time() - 10 * 86400
+        tok = "{{SECRET_bcdfgj}}"
+        tr._RECENT_FWD[secret] = [tok, "SECRET", stale]
+        tr._RECENT_REV[tok] = [secret, "SECRET", stale]
+        tr._prune_recent()
+        self.assertNotIn(secret, tr._RECENT_FWD)
+        self.assertNotIn(tok, tr._RECENT_REV)
+        self.assertIsNone(tr._lookup(tok, "disabled-sid"))
+
+    def test_custom_word_count_does_not_starve_recent_budget(self):
+        """自定义词再多也不得挤占普通条目的复用额度（配额原按总长度算）。
+
+        原先 over = len(_RECENT_FWD) - _RECENT_MAX 把不可淘汰的自定义词也算进欠额，
+        而删除只从可淘汰集合里取 —— 词表接近 _RECENT_MAX 时，刚签发的普通占位符
+        会被当场淘汰（跨请求复用与后缀容错一起静默失效）。
+        """
+        words = {"starve_%04d" % i: "TERM" for i in range(tr._RECENT_MAX + 2)}
+        tr.CUSTOM_WORDS = words
+        tr._refresh_custom_words_sorted()
+        self.assertGreater(len(tr._CUSTOM_WORD_FWD), tr._RECENT_MAX)
+
+        tok = tr._recall_token("1.2.3.4", "IP_PRIVATE")
+        self.assertIn("1.2.3.4", tr._RECENT_FWD, "普通条目不得被词表挤掉")
+        self.assertIn(tok, tr._RECENT_REV)
+        self.assertEqual(tr._lookup(tok, "budget-sid"), "1.2.3.4")
+
+
+class ResponsePayloadModelFieldTests(unittest.TestCase):
+    """S2 换芯检测的**输入侧**：OpenAI 兼容流式也必须拿到响应 model 字段。
+
+    修复前 `_parse_response_payload` 只在 `type == "message_start"` 时取 model，
+    而 OpenAI 格式的 SSE chunk 没有 `type` 键（靠 choices 判别）→ model_field 恒为
+    None → `scan_identity_swap` 直接跳过 → 所有 OpenAI 兼容中转（gpt-* / deepseek /
+    各类聚合网关）的换芯检测**完全失效**，而这条路径恰恰是换芯最高发的地方。
+    """
+
+    def test_openai_sse_chunk_model_extracted(self):
+        sse = ('data: {"id":"1","model":"gpt-4o-mini","choices":[{"delta":{"content":"hi"}}]}\n\n'
+               'data: [DONE]\n\n')
+        chunks, model_field, _ = tr._parse_response_payload(sse, "text/event-stream")
+        self.assertEqual(model_field, "gpt-4o-mini")
+        self.assertEqual(chunks, ["hi"])
+
+    def test_openai_sse_model_extracted_with_charset(self):
+        sse = 'data: {"model":"gpt-4o-mini","choices":[]}\n\n'
+        _, model_field, _ = tr._parse_response_payload(sse, "text/event-stream; charset=utf-8")
+        self.assertEqual(model_field, "gpt-4o-mini")
+
+    def test_claude_message_start_still_works(self):
+        sse = ('event: message_start\n'
+               'data: {"type":"message_start","message":{"model":"claude-3-5-haiku"}}\n\n')
+        _, model_field, _ = tr._parse_response_payload(sse, "text/event-stream")
+        self.assertEqual(model_field, "claude-3-5-haiku")
+
+    def test_non_object_payload_does_not_raise(self):
+        """`data: "字符串"` / `data: 123` 不是对象，取 model 不能抛。"""
+        sse = 'data: "just-a-string"\n\ndata: 123\n\ndata: [1,2]\n\n'
+        _, model_field, _ = tr._parse_response_payload(sse, "text/event-stream")
+        self.assertIsNone(model_field)
+
+    def test_stream_downgrade_end_to_end(self):
+        """请求 gpt-4o、流式响应 gpt-4o-mini → 必须报换档（端到端串起来验一次）。"""
+        sse = 'data: {"model":"gpt-4o-mini","choices":[{"delta":{"content":"hi"}}]}\n\n'
+        chunks, model_field, _ = tr._parse_response_payload(sse, "text/event-stream")
+        hits = []
+        for chunk in chunks or [""]:
+            hits.extend(audit_signals.scan_identity_swap(chunk, model_field, "gpt-4o"))
+        self.assertTrue(any(h["kind"] == "model_tier_mismatch" for h in hits), hits)
+
+
+class RestoreFrameAndFlushTests(unittest.TestCase):
+    """还原链路的分帧与收尾补发（扩展链路 + 整包 NDJSON 回退路径）。
+
+    这一组守的是「占位符已经还原了，但帧拼错导致用户看不到」这类**静默**失败：
+    引擎侧 RESTORE 计数显示 restored>0，页面上却是少字/裸占位符。
+    """
+
+    ORIG = "客户张伟手机 13800000000，邮箱 a@b.com"
+
+    def _masked_in(self, sid):
+        tr.sessions.clear()
+        tr._new_session(sid)
+        masked = tr.mask(self.ORIG, sid)
+        self.assertNotEqual(masked, self.ORIG, "样本必须真的被脱敏，否则用例是空转")
+        return masked
+
+    def test_ext_sse_mixed_block_restores_every_data_line(self):
+        """同一事件块里豆包信封与标准 OpenAI 行并存时，两行都必须还原。
+
+        旧实现一见豆包行就整块 early return，同块其余的 data: 行既不还原也不再交给
+        标准管线 —— 占位符原样漏到页面上（浏览器链路唯一的泄漏形态）。
+        """
+        sid = "ext-mixed"
+        masked = self._masked_in(sid)
+        doubao = json.dumps({"content": json.dumps({"text": masked}, ensure_ascii=False)},
+                            ensure_ascii=False)
+        standard = json.dumps({"choices": [{"delta": {"content": masked}}]}, ensure_ascii=False)
+        block = "data: " + doubao + "\ndata: " + standard + "\n\n"
+        out = tr.restore_stream_chunk(block, sid, "s1", content_type="text/event-stream")
+        self.assertEqual(out.count(self.ORIG), 2, out)
+        for token in tr._PLACEHOLDER_RX.findall(masked):
+            self.assertNotIn(token, out, "占位符不得漏到页面上")
+
+    def test_ext_sse_standard_only_block_unchanged(self):
+        """没有豆包信封时行为不变（整块走标准管线）。"""
+        sid = "ext-std"
+        masked = self._masked_in(sid)
+        standard = json.dumps({"choices": [{"delta": {"content": masked}}]}, ensure_ascii=False)
+        out = tr.restore_stream_chunk("data: " + standard + "\n\n", sid, "s1",
+                                     content_type="text/event-stream")
+        self.assertIn(self.ORIG, out)
+
+    def test_bare_flush_is_wrapped_as_sse_data_line(self):
+        """无模板可克隆时，补发内容必须包成合法 `data:` 行，不能裸拼。
+
+        裸文本在 SSE 里没有 `data:` 前缀，符合规范的解析器会整行忽略 ——
+        补发的字连同整行一起消失（channel="raw" 的非 JSON 载荷走的就是这条路径）。
+        """
+        sid = "ext-flush-raw"
+        tr.sessions.clear()
+        tr._new_session(sid)
+        tr.restore("{{PHONE_g", sid, channel="raw", final=False)   # 半截占位符进缓冲
+        tail = tr._flush_pending(sid)
+        self.assertTrue(tail.startswith("data: "), repr(tail))
+        self.assertTrue(tail.endswith("\n\n"), repr(tail))
+
+    def test_bare_flush_ndjson_is_valid_json_line(self):
+        sid = "ext-flush-nd"
+        tr.sessions.clear()
+        tr._new_session(sid)
+        tr.restore("{{PHONE_g", sid, channel="raw", final=False)
+        tail = tr._flush_pending(sid, framing="ndjson")
+        self.assertEqual(json.loads(tail.strip()), {"content": "{{PHONE_g"})
+
+    def test_ndjson_bulk_path_flushes_trailing_fragment(self):
+        """整包 NDJSON 回退路径必须补收尾，否则末行的半截占位符被静默丢弃。"""
+        sid = "nd-bulk"
+        masked = self._masked_in(sid)
+        frag = tr._PLACEHOLDER_RX.findall(masked)[0][:10]
+        flow = SimpleNamespace(response=SimpleNamespace())
+        flow.response.content = json.dumps(
+            {"message": {"content": masked + frag}}, ensure_ascii=False).encode("utf-8")
+        tr._handle_ndjson(flow, sid)
+        out = flow.response.content.decode("utf-8")
+        self.assertIn(self.ORIG, out)
+        self.assertIn(frag, out, "末行被截断的字符不得被缓冲吞掉")
+
+    def test_restore_tree_depth_counts_unresolved(self):
+        """超深嵌套此前直接原样返回、计数不变 —— 占位符留在回复里却查不出来。"""
+        sid = "depth-count"
+        tr.sessions.clear()
+        tr._new_session(sid)
+        deep = "leaf"
+        for _ in range(tr._RESTORE_MAX_DEPTH + 5):
+            deep = {"a": deep}
+        before = int(tr.sessions[sid].get("unresolved") or 0)
+        tr._restore_tree(deep, sid)
+        self.assertEqual(int(tr.sessions[sid].get("unresolved") or 0), before + 1)
+
+
+class CustomWordSuffixCollisionTests(unittest.TestCase):
+    """自定义词的后缀避让必须并入全局后缀索引，否则会静默还原错值。
+
+    缺陷：`_sync_custom_word_mappings` 的 used_suffixes 只统计自定义词自己的后缀，
+    于是新词撞上某个**活跃 token** 的后缀（同标签时完整 token 相同）后，
+    `_RECENT_REV[tok] = ...` 会把那个 token 静默改指向新词 —— 换会话 / 会话过期 /
+    客户端历史回放时，restore 把 A 的原文填到 B 的位置上。
+    后缀空间 19^6≈4700 万、活跃至多 2000 条，实测约 4.3e-5/词，撞上即错值。
+    """
+
+    def setUp(self):
+        tr.sessions.clear()
+        self._saved = (dict(tr._RECENT_FWD), dict(tr._RECENT_REV),
+                       dict(tr._RECENT_SUFFIX), dict(tr._CUSTOM_WORD_FWD),
+                       dict(tr._CUSTOM_WORD_REV), dict(tr.CUSTOM_WORDS))
+        tr._RECENT_FWD.clear(); tr._RECENT_REV.clear(); tr._RECENT_SUFFIX.clear()
+        tr._CUSTOM_WORD_FWD.clear(); tr._CUSTOM_WORD_REV.clear()
+        tr.CUSTOM_WORDS.clear()
+        tr.SENSITIVE_DISABLED = set(); tr.SENSITIVE_WORD_DISABLED = {}
+        tr.SENSITIVE_WORD_WHOLE = set()
+
+    def tearDown(self):
+        (tr._RECENT_FWD, tr._RECENT_REV, tr._RECENT_SUFFIX,
+         tr._CUSTOM_WORD_FWD, tr._CUSTOM_WORD_REV, tr.CUSTOM_WORDS) = [
+            dict(d) for d in self._saved]
+        tr._CUSTOM_WORD_RX_CACHE.clear()
+        tr._CUSTOM_COMBINED_CACHE["key"] = None
+        tr._CUSTOM_COMBINED_CACHE["rx"] = None
+
+    def test_new_word_never_reuses_a_live_token_suffix(self):
+        word = "回归词"
+        natural = tr._deterministic_suffix(word, set())
+        victim_tok = "{{TERM_%s}}" % natural
+        now = time.time()
+        tr._RECENT_REV[victim_tok] = ["原实体", "TERM", now]
+        tr._RECENT_FWD["原实体"] = [victim_tok, "TERM", now]
+        tr._RECENT_SUFFIX[natural] = victim_tok
+
+        tr.CUSTOM_WORDS[word] = "TERM"
+        tr._sync_custom_word_mappings()
+
+        self.assertEqual(tr._RECENT_REV.get(victim_tok, [None])[0], "原实体",
+                         "活跃 token 被新词覆盖 —— 该 token 之后会还原成新词的原文")
+        self.assertNotEqual(tr._CUSTOM_WORD_FWD.get(word), victim_tok,
+                            "新词复用了活跃 token 的完整占位符")
+
+        # 行为面：新会话里那个 token 必须还原成原实体，新词自己也能正常打码还原
+        sid = "suffix-collision"
+        tr._new_session(sid)
+        self.assertEqual(tr.restore(victim_tok, sid, final=True), "原实体")
+        sid2 = "suffix-collision-2"
+        tr._new_session(sid2)
+        masked = tr.mask(f"这里出现{word}一次", sid2)
+        self.assertIn(tr._CUSTOM_WORD_FWD[word], masked, "新词必须正常打码")
+        self.assertEqual(tr.restore(masked, sid2, final=True), f"这里出现{word}一次")
+

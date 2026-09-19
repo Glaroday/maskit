@@ -259,7 +259,16 @@ $py313 = $pyTest
 & $py313 -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) { Restore-Version; Write-Error "打包解释器缺少 PyInstaller: $py313（pip install -r requirements-dev.txt）"; exit 1 }
 # 打包前清掉 engine/ 下的运行时产物：事件库/配置/token 是开发者本机数据，绝不能随 sidecar 分发
-Get-ChildItem -Path "engine" -Include "*.sqlite3*", "*.jsonl", "config.json", "config.json.bak-*", "proxy_token", "*.log", "shield.pid", "shield-env-backup.json", "model_prices_cache.json", "diagnostics-*.json" -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force
+# ⚠️ 必须排除 engine/models 子树：-Include 通配里的 "config.json" 会连
+# models/ner_mini_zh/config.json 一起删掉，而该目录被 .gitignore 排除、git 里没有
+# 副本——删掉就是不可恢复（模型直接报废）。清理的意图只是本机运行时数据。
+Get-ChildItem -Path "engine" -Include "*.sqlite3*", "*.jsonl", "config.json", "config.json.bak-*", "proxy_token", "*.log", "shield.pid", "shield-env-backup.json", "model_prices_cache.json", "diagnostics-*.json" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "*\engine\models\*" } | Remove-Item -Force
+# 打包前自检：模型三件套缺失时 NER 在正式包里不可用，而源码态仍然正常——
+# 这是最难排查的一类「打包态漂移」。只告警不终止：不带模型打包是合法选项。
+$nerMissing = @("model_quantized.onnx", "tokenizer.json", "config.json") | Where-Object { -not (Test-Path (Join-Path "engine\models\ner_mini_zh" $_)) }
+if ($nerMissing.Count -gt 0) {
+    Write-Host ("警告：NER 模型不完整（缺 " + ($nerMissing -join "、") + "），本次打包不含语义实体识别") -ForegroundColor Yellow
+}
 if (Test-Path "dist_engine") { Remove-Item -Recurse -Force "dist_engine" }
 if (Test-Path "build_engine") { Remove-Item -Recurse -Force "build_engine" }
 # PyInstaller 的进度与告警同样走 stderr（同上）
@@ -506,6 +515,13 @@ if ($ReleaseOnly) {
         & $py313 scripts\generate-latest-json.py (Split-Path -Parent $bundle) --tag "v$newVer"
         Write-Host "已自动组装更新元数据: $latestJsonPath" -ForegroundColor Green
     }
+
+    # 扩展 zip：桌面安装包不含扩展（bundle.resources 只有 resources/engine/），而网页版 AI
+    # （ChatGPT / Claude）没有 Base URL 可配，只能靠扩展把页面请求送进引擎。CI 发版时由
+    # release.yml 的 extension job 产出同一个包，这里本地也出一份，方便不发版就先真机试装。
+    & $py313 scripts\pack-extension.py
+    if ($LASTEXITCODE -ne 0) { Restore-Version; Write-Error "扩展打包失败（scripts/pack-extension.py）"; exit 1 }
+    Write-Host "扩展包: dist_extension\Maskit_${newVer}_extension.zip" -ForegroundColor Cyan
 
     Write-Host "下一步: git tag v$newVer && git push --tags（CI 自动编译多架构 Docker 镜像并建 Release）→ 发布" -ForegroundColor Yellow
     exit 0

@@ -46,6 +46,7 @@ const I18N = {
     // 附件提示（不静默放行图片/文件）
     attachText: '本页上传了 {n} 个文件。文件内容不会脱敏，只有文字字段会被打码。',
     attachTextImg: '本页上传了 {n} 个文件（含图片）。图片与附件里的内容不会脱敏，只有文字字段会被打码。',
+    attachTextMasked: '本页上传了 {n} 个文本文件，文件内敏感信息已自动完成打码脱敏。',
     refreshBtn: '刷新',
     optionsBtn: '设置',
     colTime: '时间',
@@ -88,6 +89,7 @@ const I18N = {
     // Attachment notice (never silently pass images/files)
     attachText: 'This page uploaded {n} file(s). File contents are NOT masked — only text fields are.',
     attachTextImg: 'This page uploaded {n} file(s), including images. Image and attachment contents are NOT masked — only text fields are.',
+    attachTextMasked: 'This page uploaded {n} text file(s); sensitive data inside has been masked.',
     refreshBtn: 'Refresh',
     optionsBtn: 'Settings',
     colTime: 'Time',
@@ -308,7 +310,13 @@ function renderAttach(snap) {
   const box = $('attachBox');
   box.hidden = !rec;
   if (!rec) return;
-  $('attachText').textContent = t(rec.image ? 'attachTextImg' : 'attachText', { n: rec.count || 1 });
+  if (rec.count > 0) {
+    $('attachText').textContent = t(rec.image ? 'attachTextImg' : 'attachText', { n: rec.count });
+  } else if (rec.maskedCount > 0) {
+    $('attachText').textContent = t('attachTextMasked', { n: rec.maskedCount });
+  } else {
+    box.hidden = true;
+  }
 }
 
 function render(snap) {

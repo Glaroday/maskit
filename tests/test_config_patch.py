@@ -232,5 +232,25 @@ class ConfigPatchEndpointTests(unittest.TestCase):
         )
 
 
+class DefaultConfigKeyParityTests(unittest.TestCase):
+    """default_config() 是「合法配置键」的唯一真相来源，必须与归一化输出对齐。
+
+    两个方向都会出问题，所以这里是等号而不是包含：
+    - normalize_config 产出但 default_config 没有 → config.json 损坏时
+      _load_config_locked 直接返回未归一化的 default_config()，
+      这条路径上该键经 /api/config/patch 会被判「未知配置项」而 400；
+    - default_config 有但 normalize_config 不产出 → 每次 load 都被静默丢弃，
+      该开关在用户眼里永远存不住（历史 NER_AI 死键就是这一类）。
+    """
+
+    def test_default_config_matches_normalized_key_set(self):
+        defaults = set(panel.default_config())
+        normalized = set(panel.normalize_config({}))
+        self.assertEqual(sorted(normalized - defaults), [],
+                         "归一化会产出、但 default_config() 未声明的键")
+        self.assertEqual(sorted(defaults - normalized), [],
+                         "default_config() 声明、但归一化会丢弃的键（永远存不住）")
+
+
 if __name__ == "__main__":
     unittest.main()

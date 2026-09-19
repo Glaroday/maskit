@@ -31,6 +31,17 @@ class _DummyUpstream(http.server.BaseHTTPRequestHandler):
         pass
 
     def _echo(self):
+        if self.path.startswith("/lie-gz"):
+            # 谎报编码：响应头写 gzip、正文却是明文（上游/反代配置错误的真实形态）
+            payload = b'{"ok": true, "data": "plain-under-gzip-header"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+            return
         if self.path.startswith("/gz"):
             # gzip 端点：验证 PT 解压链路（还原为空映射时也应正确转发明文）
             import gzip as _gzip
@@ -123,6 +134,12 @@ class PassthroughForwardTests(unittest.TestCase):
         """
         patcher = mock.patch.object(panel, "_pt_restore_map", return_value={})
         patcher.start()
+        # 事件落库同样要拦掉：panel 导入时已把 DATA_ROOT 定死为源码目录，
+        # PT 每成功转发一次就 enqueue 一条 PASS —— 不拦就等于把假事件写进
+        # 开发者本机的真实事件库（实测：跑一次门禁即污染日志与统计）。
+        enqueue_patcher = mock.patch.object(panel, "enqueue_event", lambda *a, **k: None)
+        enqueue_patcher.start()
+        self.addCleanup(enqueue_patcher.stop)
         self.addCleanup(patcher.stop)
 
     def test_get_forwards_and_echoes(self):
@@ -172,6 +189,26 @@ class PassthroughForwardTests(unittest.TestCase):
         echoed = json.loads(raw.split(b"\r\n\r\n", 1)[1])
         self.assertEqual(echoed["accept_encoding"], "gzip, deflate",
                          "accept-encoding 必须原样透传（不再强制全站非压缩）")
+
+    def test_lying_gzip_header_passes_body_through(self):
+        """上游谎报 Content-Encoding: gzip（正文是明文）时必须整段原样透传。
+
+        还原映射非空时 PT 会建解压器；首块解压失败的旧行为是抛异常断流，客户端
+        只拿到「200 + 静默截断的 body」（响应头已发出、Content-Encoding 已被剥）。
+        现在首块失败即放弃解压与还原，字节原样下发。
+        """
+        with mock.patch.object(panel, "_pt_restore_map",
+                               return_value={"{{TERM_bcdfgj}}": "x"}):
+            raw = _http_request(self.pt_port, "GET", "/lie-gz",
+                                {"Accept-Encoding": "gzip"})
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertIn(b"200", head.split(b"\r\n", 1)[0])
+        # 自证：解压链路必须真的被启用过（Content-Encoding 被剥），否则本用例
+        # 根本没覆盖「谎报」分支，会变成永远通过的假绿
+        self.assertNotIn(b"content-encoding", head.lower())
+        self.assertEqual(body, b'{"ok": true, "data": "plain-under-gzip-header"}',
+                         "谎报编码时正文必须原样透传，不得截断")
+
 
     def test_gzip_passthrough_when_no_restore_map(self):
         """还原映射为空（透传期无占位符）时：gzip 响应原样透传——Content-Encoding

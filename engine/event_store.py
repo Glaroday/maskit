@@ -945,14 +945,24 @@ def _audit_visibility_filter():
     return clauses, params
 
 
-def fetch_audit_events(since=0, limit=500, severity_floor=None, signal_filter=None):
-    """读取审计事件。since=id（返回 id>since 的）。severity_floor=LOW/MEDIUM/HIGH/CRITICAL。"""
+def fetch_audit_events(since=0, limit=500, severity_floor=None, signal_filter=None,
+                       include_deprecated=False):
+    """读取审计事件。since=id（返回 id>since 的）。severity_floor=LOW/MEDIUM/HIGH/CRITICAL。
+
+    include_deprecated=False（默认）按 `_audit_visibility_filter` 隐藏已撤销的判定，
+    这只适用于**给人看的列表**。安全检测的读路径（audit_engine 的探针结果聚合）
+    必须传 True：过滤加在检测路径上等于「某个信号被降噪隐藏后，风险矩阵永远看不到
+    它」，而矩阵仍会渲染成绿色——这是个假阴性。
+    """
     _ensure_db()
     since = int(since or 0)
     limit = max(1, min(int(limit or 500), 1000))
-    visibility_clauses, visibility_params = _audit_visibility_filter()
-    where = ["id > ?", *visibility_clauses]
-    params = [since, *visibility_params]
+    where = ["id > ?"]
+    params = [since]
+    if not include_deprecated:
+        visibility_clauses, visibility_params = _audit_visibility_filter()
+        where.extend(visibility_clauses)
+        params.extend(visibility_params)
     # 仅过滤 UI/API 读侧，不删除历史行：用户清空审计日志前数据库内容保持不变。
     if severity_floor:
         # CASE 计算严重度秩，避免加列
@@ -1301,6 +1311,26 @@ def fetch_event_by_id(event_id):
         row = conn.execute(
             "SELECT id, payload FROM events WHERE id = ?", (eid,)
         ).fetchone()
+    return _row_to_event(row) if row else None
+
+
+def fetch_sibling_event(sid, exclude_id=None):
+    """根据 sid 取同一会话下的配对事件（例如 RESTORE 查同 sid 的 MASK，或 MASK 查 RESTORE）。"""
+    if not sid or not isinstance(sid, str):
+        return None
+    _ensure_db()
+    with closing(_connect()) as conn:
+        conn.row_factory = sqlite3.Row
+        sql = "SELECT id, payload FROM events WHERE sid = ?"
+        params = [sid]
+        if exclude_id is not None:
+            try:
+                params.append(int(exclude_id))
+                sql += " AND id != ?"
+            except (ValueError, TypeError):
+                pass
+        sql += " ORDER BY id DESC LIMIT 1"
+        row = conn.execute(sql, params).fetchone()
     return _row_to_event(row) if row else None
 
 
@@ -1683,6 +1713,27 @@ def _word_groups(rows):
     return by_label, by_label_words, top_list, by_ingress
 
 
+def _audit_high_count(since_ts):
+    """区间内 HIGH/CRITICAL 审计信号条数（首页/统计页「告警」口径的一部分）。
+
+    换芯、投毒、凭据外发这类发现原本只落在审计页：用户不主动翻页就永远发现不了，
+    等于白检测（2026-09-19）。这里与列表读侧用同一套降噪过滤，保证「计数里算进去的，
+    点开审计页一定看得到」——只计数不展示会让人找不到来源。
+    """
+    try:
+        _ensure_db()
+        clauses, params = _audit_visibility_filter()
+        where = " AND ".join(["ts >= ?", "severity IN ('HIGH', 'CRITICAL')", *clauses])
+        with closing(_connect()) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE " + where,
+                (float(since_ts), *params),
+            ).fetchone()
+        return int((row or [0])[0] or 0)
+    except Exception:
+        return 0
+
+
 def today_stats(now=None):
     """按本地自然日聚合今日拦截统计（仪表盘数据源）。
 
@@ -1736,6 +1787,9 @@ def today_stats(now=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(day_start)
+    alerts += audit_high
     restore_by_status = dict(status_map)
     by_label, by_label_words, top_list, words_by_ingress = _word_groups(word_rows)
     return {
@@ -1748,6 +1802,7 @@ def today_stats(now=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "tokens": tokens,
         "prefix": _prefix_payload(*(prefix_row or (0, 0, 0, 0, 0))),
         "by_type": by_type,
@@ -1820,6 +1875,9 @@ def stats_range(days=1, now=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(now - days * 86400)
+    alerts += audit_high
     restore_by_status = dict(status_map)
     by_label, by_label_words, top_list, words_by_ingress = _word_groups(word_rows)
     return {
@@ -1833,6 +1891,7 @@ def stats_range(days=1, now=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "blocked": _ev("BLOCK"),
         "errs": _ev("ERR"),
         "scan_warns": _ev("SCAN_WARN"),
@@ -1908,9 +1967,11 @@ def stats_history(days=30, granularity="day"):
                    FROM events WHERE ts >= ? GROUP BY hour_bucket, type""",
                 (since,),
             ).fetchall()
-            # 审计信号事件按小时聚合
+            # 审计信号事件按小时聚合（含 HIGH/CRITICAL 计数，供告警口径与审计高危曲线）
             audit_hours = conn.execute(
-                "SELECT CAST(ts / 3600 AS INTEGER) * 3600, COUNT(*) FROM audit_events WHERE ts >= ?"
+                "SELECT CAST(ts / 3600 AS INTEGER) * 3600, COUNT(*), "
+                "SUM(CASE WHEN severity IN ('HIGH', 'CRITICAL') THEN 1 ELSE 0 END) "
+                "FROM audit_events WHERE ts >= ?"
                 + audit_visibility_sql + " GROUP BY 1",
                 (since, *audit_visibility_params),
             ).fetchall()
@@ -1928,9 +1989,13 @@ def stats_history(days=30, granularity="day"):
                 b["restored"] += cnt
             if typ in ("BLOCK", "ERR", "SCAN_WARN"):
                 b["alerts"] += cnt
-        audit_hour_map = {hb: n for hb, n in audit_hours}
+        audit_hour_map = {hb: (int(n or 0), int(hi or 0)) for hb, n, hi in audit_hours}
         for hb in sorted(buckets.keys()):
             b = buckets[hb]
+            audit_n, audit_hi = audit_hour_map.get(hb, (0, 0))
+            # 审计高危并入「告警」：与 today_stats/stats_range 同口径，
+            # 否则同一天的曲线点数与首页卡片对不上。
+            b["alerts"] += audit_hi
             result.append({
                 "ts": hb,
                 "label": time.strftime("%m-%d %H:00", time.localtime(hb)),
@@ -1938,8 +2003,8 @@ def stats_history(days=30, granularity="day"):
                 **b,
                 "tokens_prompt": 0,  # 小时粒度无 token 摘要
                 "tokens_completion": 0,
-                "audit_signals": int(audit_hour_map.get(hb, 0)),
-                "audit_high": 0,
+                "audit_signals": audit_n,
+                "audit_high": audit_hi,
             })
     else:
         # 按天聚合（优先读 daily_stats 摘要表）
@@ -1992,6 +2057,8 @@ def stats_history(days=30, granularity="day"):
             b = day_buckets.get(d, {"requests": 0, "mask_events": 0, "restored": 0, "alerts": 0})
             tk = token_map.get(d, {"prompt": 0, "completion": 0})
             ab = audit_map.get(d, {"audit_signals": 0, "audit_high": 0})
+            # 与 today_stats/stats_range 同口径：审计高危计入当日「告警」
+            b["alerts"] += ab["audit_high"]
             # 把日期字符串转时间戳（当天 0 点）
             try:
                 t_struct = time.strptime(d, "%Y-%m-%d")
@@ -2042,6 +2109,9 @@ def _today_stats_legacy_range(now=None, since=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(since)
+    alerts += audit_high
     return {
         "ok": True,
         "day_start": since,
@@ -2053,6 +2123,7 @@ def _today_stats_legacy_range(now=None, since=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "blocked": _ev("BLOCK"),
         "errs": _ev("ERR"),
         "scan_warns": _ev("SCAN_WARN"),
@@ -2117,6 +2188,9 @@ def _today_stats_legacy(now=None, day_start=None):
     restore_ok = status_map.get("restored", 0)
     restore_failed = status_map.get("unresolved", 0)
     alerts += restore_failed
+    # 审计高危并入告警口径（口径与审计页一致，见 _audit_high_count）
+    audit_high = _audit_high_count(day_start or _day_start(now))
+    alerts += audit_high
     restore_by_status = dict(status_map)
     # 回退路径也按入口分组：payload 里带 ingress 的新事件同样要走同屏分组，
     # 否则「摘要表没数据」这一天里前端会因为拿不到分组而退回混算口径。
@@ -2174,6 +2248,7 @@ def _today_stats_legacy(now=None, day_start=None):
         "restore_failed": restore_failed,
         "requests": requests,
         "alerts": alerts,
+        "audit_high": audit_high,
         "tokens": tokens,
         # 同 _today_stats_legacy_range：legacy 事件没有前缀诊断字段。
         "prefix": None,

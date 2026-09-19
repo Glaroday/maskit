@@ -34,6 +34,7 @@
     "IP_PRIVATE": true,
     "IP_INTERNAL": false,
     "IP_PUBLIC": false,
+    "IPV6_PRIVATE": false,
     "CARD": true,
     "IBAN": true,
     "USCC": false,
@@ -49,6 +50,7 @@
     "ah-"
   ],
   "debug": false,
+  "ner_enabled": false,
   "diagnostic_unmatched": false,
   "session_ttl": 600,
   "http2": true,

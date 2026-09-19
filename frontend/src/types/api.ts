@@ -66,6 +66,20 @@ export interface ProxyStatus {
   start_minimized: boolean
   auto_start_proxy: boolean
   audit: Record<string, unknown>
+  /**
+   * 语义实体识别（NER）状态：enabled 是开关，available/initialized 是实际可用性。
+   *
+   * `skips` 是「开启了但这段没做识别」的原因计数（`too_long` / `budget_exhausted` /
+   * `infer_failed` / `deadline` / `init_failed` / `model_missing`）。纯整数、不含原文。
+   * 不透出它的话，「开了 NER，长文本全跳过」在界面上完全看不出（审计 M7）。
+   */
+  ner?: {
+    enabled: boolean
+    available: boolean
+    initialized: boolean
+    reason: string
+    skips?: Record<string, number>
+  }
   needs_ca: boolean
   wizard_recommended: boolean
   last_error: string

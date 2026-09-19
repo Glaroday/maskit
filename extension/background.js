@@ -20,8 +20,13 @@
 
 // 扩展内共享常量与纯函数（STATIC_SITES / UNSUPPORTED_REASON / siteMatchPattern…
 // 的唯一来源，见 shared.js 头部说明为何必须收敛成一份）。
-importScripts('shared.js');
-const { STATIC_SITES, siteMatchPattern, siteCovers } = self.MASKIT_SHARED;
+// Chromium MV3 背景是 Service Worker：用 importScripts 同步引入；
+// Firefox MV3 背景是 Event Page（无 importScripts 全局，直接调会 ReferenceError）：
+// 由 manifest 的 background.scripts 数组先加载 shared.js 再执行本文件。
+if (typeof importScripts === 'function') {
+  importScripts('shared.js');
+}
+const { STATIC_SITES, siteMatchPattern, siteCovers, isLocalPanelUrl } = self.MASKIT_SHARED;
 
 const DEFAULTS = {
   token: '',
@@ -92,8 +97,11 @@ const CALL_TIMEOUT_MS = 15000;
  *
  * **为什么不干脆"整段不发请求"**：那会让用户在修复后（改对 token / 打开面板开关）
  * 盲等最多一整段窗口，而等待期内页面流量是**静默未脱敏**的。所以退避期里保留
- * **低速探测**：最多每 `AUTH_PROBE_MS` 发一次真实请求，命中即刻自愈。
- * 上限从"每 chunk 一次"降到"每 5s 一次"，日志不再被冲掉，恢复又几乎是即时的。
+ * **低速探测**：进入退避后的**下一次调用立刻探测一次**（否则用户在面板重新打开开关
+ * 或改对 token 后，第一个请求仍会直通、把明文发出去，最长静默一整个探测间隔 ——
+ * 与本条自述的「命中即刻自愈、恢复几乎是即时的」自相矛盾，真机 e2e 长期红着），
+ * 之后每 `AUTH_PROBE_MS` 一次。
+ * 上限从"每 chunk 一次"降到"每 5s 一次"，日志不再被冲掉，恢复又是即时的。
  */
 const AUTH_HOLD_MS = 60000;
 const AUTH_PROBE_MS = 5000;
@@ -129,7 +137,18 @@ async function getConfig() {
 
 async function getPanelUrl() {
   const cfg = await getConfig();
-  return String(cfg.panelUrl || DEFAULTS.panelUrl).replace(/\/+$/, '');
+  const raw = String(cfg.panelUrl || '').replace(/\/+$/, '');
+  // 令牌**绝不能**发往非本机地址（审计 M3）。
+  //
+  // 为什么 SW 必须自校验、不能只信 options 页：`panelUrl` 存在 `chrome.storage.local`
+  // 里，任何写这个 key 的地方都绕过了保存按钮的校验——实测「测试连接」按钮就贴在地址框
+  // 右侧，填个外域点一下就先 `set({panelUrl})` 再 ping，而 `callPanel` 会给这个地址带上
+  // `X-Shield-Token`。等于「唯一持有令牌的组件（SW）不校验令牌去哪」。
+  //
+  // 非法地址**回落默认值而不是抛错**：抛异常会让 mask 链路整体失败 → 扩展按 (B) 直通，
+  // 反而变成「静默未脱敏」。回落之后正确的失败模式是「打不通引擎 → 直通 + 黄标」，
+  // 而不是「令牌被发到别人的服务器」。
+  return isLocalPanelUrl(raw) ? raw : DEFAULTS.panelUrl;
 }
 
 // ── 状态与元数据缓冲（都只存元数据） ─────────────────────────────────────────
@@ -227,10 +246,11 @@ async function pushAttachment(tabId, payload) {
   try {
     const got = await chrome.storage.session.get(ATTACH_KEY);
     const all = got[ATTACH_KEY] && typeof got[ATTACH_KEY] === 'object' ? got[ATTACH_KEY] : {};
-    const prev = all[tabId] || { image: false, count: 0, at: 0 };
+    const prev = all[tabId] || { image: false, count: 0, maskedCount: 0, at: 0 };
     all[tabId] = {
       image: !!prev.image || !!payload.image,
-      count: Number(payload.count) || prev.count || 0,
+      count: Number(payload.count) || 0,
+      maskedCount: Number(payload.maskedCount) || prev.maskedCount || 0,
       at: Date.now(),
     };
     await chrome.storage.session.set({ [ATTACH_KEY]: all });
@@ -407,6 +427,10 @@ async function refreshPing() {
  * 返回 {ok, body} | {ok:false, blocking:true} | {ok:false, passthrough:true}
  */
 async function safeCall(path, body) {
+  // 本次调用是否已经处在「配置性拒绝」退避期内。必须在任何分支改动 authHoldUntil
+  // 之前取：它决定这次失败是"刚进入退避"（下一次调用立刻探测）还是"探测又失败"
+  // （继续按 AUTH_PROBE_MS 间隔，绝不能重置成当下——那等于取消防洪，每 chunk 一行）。
+  const inAuthHold = Date.now() < authHoldUntil;
   if (Date.now() < downUntil) {
     // detail 用**稳定字符串**而不是「passthrough 45s」：倒计时由 popup 从
     // downRemainingMs 本地走字（`renderStatus` + 逐秒 tick）。把秒数写进 detail 会让
@@ -458,7 +482,11 @@ async function safeCall(path, body) {
     // 所以进退避期；否则 restore 每 chunk 一次会把引擎日志刷爆。
     // 状态分开给：invalid_token 红标「token 失效」，ext_bridge_disabled 红标「扩展已关闭」。
     authHoldUntil = Date.now() + AUTH_HOLD_MS;
-    authProbeAt = Date.now() + AUTH_PROBE_MS;
+    // 首次进入退避：探测点放在**当下**，下一次调用就是一次探测。固定写 `+ AUTH_PROBE_MS`
+    // 会让「面板重新打开开关 / 改对 token」后的第一个请求继续直通（明文出网），
+    // 最长静默 5s（e2e test_07 覆盖的就是这条）。探测再次失败时保持 5s 间隔，
+    // 不会退化成每 chunk 一次（否则面板 800 行环形缓冲会被一条回答冲干净）。
+    authProbeAt = inAuthHold ? Date.now() + AUTH_PROBE_MS : Date.now();
     authHoldErr = err;
     await setStatus(err === 'invalid_token' ? 'invalid_token' : 'disabled', err);
   } else {
@@ -483,6 +511,19 @@ async function handleMask(payload, tabId, host) {
   // 界面显示「已删除」，实际还在打码，这是比"删不掉"更糟的一种撒谎。
   // 不在这里认账，就没有别的地方能拦住了。
   const cfg = await getConfig();
+  // 扩展总开关（审计 B3）：`enabled=false` 必须在这里认账。
+  //
+  // 此前全文件只有 `background.js` 的快照分支读过 `cfg.enabled`，那是**仅供展示**的；
+  // 于是用户在设置页取消勾选并保存后，popup 明确显示「扩展已停用」，
+  // 而内容脚本照常注入、这里照常把原文送出去打码、页面照常被改写——
+  // 界面说一套、字节做一套，与上面站点开关是同一种撒谎（且这次是总开关）。
+  //
+  // 面板侧的 `ext_bridge_enabled` 是**另一本账**（服务端自己的开关），不能替代这里：
+  // 用户关的是扩展，扩展就得自己停下来。直通（而非阻断）与 options 页文案一致：
+  // 「关闭后网页请求原样直连」。
+  if (cfg.enabled === false) {
+    return { ok: false, passthrough: true, error: 'ext_disabled' };
+  }
   if (!siteCovers(host, cfg.enabledSites)) {
     return { ok: false, passthrough: true, error: 'site_disabled' };
   }
@@ -494,6 +535,33 @@ async function handleMask(payload, tabId, host) {
   }
   if (r.blocking) return { ok: false, blocking: true, error: r.error };
   await pushRecent({ host, path: 'mask', action: 'skip', count: 0, status: 'passthrough' });
+  return { ok: false, passthrough: true, error: r.error };
+}
+
+async function handleMaskFile(payload, tabId, host) {
+  const filename = payload && typeof payload.filename === 'string' ? payload.filename : '';
+  const base64 = payload && typeof payload.base64 === 'string' ? payload.base64 : '';
+  const sid = payload && typeof payload.sid === 'string' ? payload.sid : '';
+  if (!filename || !base64) return { ok: false, passthrough: true };
+
+  const cfg = await getConfig();
+  // 总开关同 handleMask（审计 B3）：文档链路也一样，不能只在文本链路生效。
+  if (cfg.enabled === false) {
+    return { ok: false, passthrough: true, error: 'ext_disabled' };
+  }
+  if (!siteCovers(host, cfg.enabledSites)) {
+    return { ok: false, passthrough: true, error: 'site_disabled' };
+  }
+  const r = await safeCall('/api/ext/mask-file', { filename, base64, host, sid });
+  if (r.ok) {
+    if (r.body && r.body.sid) {
+      await rememberSid(r.body.sid, tabId, host);
+    }
+    await pushRecent({ host, path: `mask-file:${filename}`, action: 'mask', count: (r.body && r.body.hit_count) || 0, status: 'ok' });
+    return r.body;
+  }
+  if (r.blocking) return { ok: false, blocking: true, error: r.error };
+  await pushRecent({ host, path: `mask-file:${filename}`, action: 'skip', count: 0, status: 'passthrough' });
   return { ok: false, passthrough: true, error: r.error };
 }
 
@@ -607,7 +675,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 添加站点后拿不到重注册确认（而 SW 侧其实一切正常）——三处症状同一个根因。
   //
   // popup 不受影响（它不是 tab），所以这个 bug 只在选项页出现，很容易被漏掉。
-  const fromExtPage = String((sender && sender.url) || '').startsWith('chrome-extension:');
+  // 支持多浏览器扩展内部协议：Chromium (chrome-extension:)、Firefox (moz-extension:)、Safari (safari-web-extension:)
+  const senderUrl = String((sender && sender.url) || '');
+  const fromExtPage = senderUrl.startsWith('chrome-extension:') ||
+                      senderUrl.startsWith('moz-extension:') ||
+                      senderUrl.startsWith('safari-web-extension:');
   if (fromExtPage) {
     // 扩展自身页面（popup / options）：只能做管理动作，且**不参与**打码链路
     // ——host 必须从真实网页的 tab 推导，所以这里不给 mask/restore。
@@ -625,6 +697,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab.id;
   if (msg.action === 'mask') {
     handleMask(msg.payload, tabId, host).then(sendResponse).catch((e) => sendResponse({ ok: false, passthrough: true, error: String(e) }));
+    return true;
+  }
+  if (msg.action === 'mask_file') {
+    handleMaskFile(msg.payload, tabId, host).then(sendResponse).catch((e) => sendResponse({ ok: false, passthrough: true, error: String(e) }));
     return true;
   }
   if (msg.action === 'restore') {

@@ -11,7 +11,7 @@
 'use strict';
 
 // 共享常量与纯函数（唯一来源，见 shared.js 头部说明）。
-const { STATIC_SITES, PRESET_SITES, siteMatchPattern, normalizeDomain } = self.MASKIT_SHARED;
+const { STATIC_SITES, PRESET_SITES, siteMatchPattern, normalizeDomain, isLocalPanelUrl } = self.MASKIT_SHARED;
 // `reasonFor` 只是 `unsupportedReason(domain)` 的本页别名，保留名字让调用点读起来直白。
 const reasonFor = (domain) => self.MASKIT_SHARED.unsupportedReason(domain);
 
@@ -411,9 +411,23 @@ async function addAllPresets() {
 }
 
 async function testConnection() {
-  const cfg = await loadConfig();
+  // 优先读取当前输入框中用户刚粘贴/输入的 URL 与 Token 并自动同步存盘，
+  // 避免用户未手动滑动到底部点击「保存设置」时被误判为「未填写令牌 (401/403)」。
+  const panelUrl = String($('panelUrl').value || '').trim().replace(/\/+$/, '') || DEFAULTS.panelUrl;
+  const token = String($('token').value || '').trim();
   setMsg($('testMsg'), '…', '');
-  if (!cfg.token) { setMsg($('testMsg'), t('testNoToken'), 'bad'); return; }
+  if (!token) { setMsg($('testMsg'), t('testNoToken'), 'bad'); return; }
+  // 与「保存设置」同一条校验（审计 M3）。这个按钮就贴在地址框右侧，是**最容易被误点**的
+  // 写盘点：它此前无条件 `set({panelUrl})`，于是用户在地址框填个外域点一下测试，
+  // 令牌就被持久化，之后 SW 每次 mask/restore 都把它带过去。
+  // 校验下沉到 SW 之后这里仍是必须的——两层各拦一次，任何一层被改坏都还有另一层。
+  if (!isLocalPanelUrl(panelUrl)) {
+    setMsg($('testMsg'), lang === 'zh'
+      ? '只允许 127.0.0.1 / localhost（扩展绝不向其它主机发请求）。'
+      : 'Only 127.0.0.1 / localhost are allowed (the extension never calls other hosts).', 'bad');
+    return;
+  }
+  await chrome.storage.local.set({ panelUrl, token });
   const res = await sendToSW({ action: 'admin', op: 'ping' });
   const ping = res && res.ping;
   if (ping && ping.alive) {
@@ -431,7 +445,9 @@ async function openPanelSettings() {
   // 原先这里是个"在本机面板旋转"按钮，用 ext_token 去调 —— 它**永远失败**，
   // 用户每次点都只得到一句报错。改成打开面板设置页，是唯一诚实的做法。
   const cfg = await loadConfig();
-  const url = `${String(cfg.panelUrl || DEFAULTS.panelUrl).replace(/\/+$/, '')}/settings`;
+  const base = String(cfg.panelUrl || '').replace(/\/+$/, '');
+  // 同一类校验（审计 M3）：存量配置里可能留着改坏前的地址，不能直接拿去开标签页。
+  const url = `${isLocalPanelUrl(base) ? base : DEFAULTS.panelUrl}/settings`;
   try {
     await chrome.tabs.create({ url });
     setMsg($('tokenMsg'), t('openPanelOk'), 'ok');
@@ -477,7 +493,8 @@ async function init() {
 
   $('saveBtn').addEventListener('click', async () => {
     const panelUrl = String($('panelUrl').value || '').trim().replace(/\/+$/, '') || DEFAULTS.panelUrl;
-    if (!/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(panelUrl)) {
+    // 正则来自 shared.js（唯一来源），别再抄一份——见 PANEL_URL_RE 的注释。
+    if (!isLocalPanelUrl(panelUrl)) {
       setMsg($('saveMsg'), lang === 'zh'
         ? '只允许 127.0.0.1 / localhost（扩展绝不向其它主机发请求）。'
         : 'Only 127.0.0.1 / localhost are allowed (the extension never calls other hosts).', 'bad');

@@ -12,7 +12,31 @@
   window.__MASKIT_BRIDGE__ = true;
 
   const BRIDGE_TIMEOUT_MS = 3000;
-  const MIN_MASKABLE_LEN = 80;      // 短 body（GET 语义的查询等）不值得过一次桥
+  // 文本 body 的**下限**：短于它连一次桥都不值得走（审计 M4）。
+  //
+  // 原值是 80，理由是「滤掉 GET 语义的查询串」。但那个理由早已不成立——
+  // 上面的 fetch hook 现在**先按方法过滤**（只放行 POST/PUT/PATCH），GET 查询串根本到不了这里。
+  // 于是 80 只剩下一个效果：≤80 字符的写请求**不打码、不记录、无提示**，
+  // 与 multipart 分支（无长度阈值）自相矛盾，属「静默未脱敏」。
+  //
+  // 取 8 而不是 0：短于 8 字符的 body（`{}`、`{"a":1}`、abort 请求）不可能承载任何
+  // 现实中的敏感值——最短的现实 PII 是 11 位手机号 / 18 位身份证 / 9 字符邮箱，
+  // 全都在 8 之上。保留这个下限只为省掉这些必然无命中的桥调用，
+  // 而**它不再能掩盖任何有意义的请求**。
+  const MIN_MASKABLE_LEN = 8;
+
+  // 单份 Office 附件的原始字节上限，**必须与引擎侧闸门对齐**（审计 M5）。
+  //
+  // `panel._EXT_MAX_BODY = 32MB` 是请求体（JSON 信封）上限，而整份文件要 base64 后
+  // 塞进去，膨胀 4/3 —— 原值 25MB 恰好卡在边界之上：25MB 原始文件 ≈ 33.3MB 请求体
+  // → 413 + `blocking:true` → 扩展按 (A) 类无条件阻断 → 页面**网络错误**
+  // （不是降级直通）。用户传一个 24–25MB 的 docx 会看到整页请求失败。
+  //
+  // 反推：`4 * ceil(n/3) + 信封 ≈ 32MB` → n 上限约 24.0MB。这里取 23MB，
+  // 留约 1.4MB 余量给文件名/headers 等开销。超限的文件会落到 `kind:'raw'` 分支
+  // **原样透传并由 `attachment` note 诚实上报「未脱敏 N 个」**——
+  // 页面能用，用户也知道它没被保护。这比「硬失败」和「静默放行」都好。
+  const MAX_OOXML_BYTES = 23 * 1024 * 1024;
 
   // ─── postMessage 桥（nonce 校验） ───
   const pending = new Map();
@@ -145,55 +169,233 @@
   const initBodyIsFormData = (init) =>
     !!init && typeof FormData !== 'undefined' && init.body instanceof FormData;
 
+  // ─── 文本类文件扩展名与单文件上限（支持拖拽上传脱敏） ───
+  const TEXT_FILE_EXTS = new Set([
+    'txt', 'text', 'md', 'markdown', 'mdown', 'csv', 'tsv', 'json', 'jsonl', 'ndjson',
+    'xml', 'yaml', 'yml', 'py', 'pyw', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'mts', 'cts', 'tsx',
+    'html', 'htm', 'xhtml', 'css', 'scss', 'sass', 'less', 'sql', 'sh', 'bash', 'zsh',
+    'bat', 'cmd', 'ps1', 'psm1', 'c', 'h', 'cpp', 'hpp', 'cc', 'hh', 'cxx', 'hxx',
+    'cs', 'java', 'kt', 'kts', 'go', 'rs', 'php', 'rb', 'lua', 'r', 'swift', 'm', 'mm',
+    'log', 'env', 'ini', 'conf', 'cfg', 'toml', 'properties', 'diff', 'patch', 'vue', 'svelte'
+  ]);
+  const MAX_TEXT_FILE_SIZE = 8 * 1024 * 1024; // 8MB 单文件上限
+
+  const isMaskableTextAttachment = (v) => {
+    if (!v || typeof v !== 'object') return false;
+    const size = typeof v.size === 'number' ? v.size : 0;
+    if (size <= 0 || size > MAX_TEXT_FILE_SIZE) return false;
+    const name = String(v.name || '').trim();
+    if (name.includes('.')) {
+      const ext = name.split('.').pop().toLowerCase();
+      if (TEXT_FILE_EXTS.has(ext)) return true;
+    }
+    const type = String(v.type || '').toLowerCase();
+    if (type.startsWith('text/')) return true;
+    if (
+      type.includes('json') ||
+      type.includes('xml') ||
+      type.includes('yaml') ||
+      type.includes('javascript') ||
+      type.includes('typescript')
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  /** 附件是否是图片（仅用于「未脱敏文件里有图片」的诚实提示）。 */
+  const isImageItem = (item) => {
+    const v = item && item.value;
+    return !!(v && typeof v.type === 'string' && v.type.startsWith('image/'));
+  };
+
+  // ─── Office OpenXML 格式识别与二进制/Base64 互转 ───
+  const OOXML_FILE_EXTS = new Set(['docx', 'xlsx', 'pptx', 'wps', 'et', 'dps']);
+  const isOOXMLAttachment = (v) => {
+    if (!v || typeof v !== 'object') return false;
+    const size = typeof v.size === 'number' ? v.size : 0;
+    if (size <= 0 || size > MAX_OOXML_BYTES) return false;  // 上限见 MAX_OOXML_BYTES 注释
+    const name = String(v.name || '').trim();
+    if (!name.includes('.')) return false;
+    const ext = name.split('.').pop().toLowerCase();
+    return OOXML_FILE_EXTS.has(ext);
+  };
+
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToUint8Array(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
   /**
-   * multipart 打码：文本字段打码，**文件字段原样透传**。
+   * multipart 打码：文本字段、常见文本附件与 Office 文档（.docx/.xlsx/.pptx）打码，其它二进制/图片原样透传。
    *
    * 为什么可以这么做：`Request.formData()` 会把 multipart 解析成 [name, string|File] 条目，
-   * 我们用打码后的字符串 + 原 File 重新拼一个 FormData，再交给 fetch 自动生成**新的**
+   * 我们用打码后的字符串 + 重新组装的 File 拼一个 FormData，再交给 fetch 自动生成**新的**
    * boundary —— 不存在手写 boundary 写坏的问题。
    *
    * 为什么必须显式删掉 `content-type`：见 `new Request(resource, {body})` 那处注释。
    * 旧头里是**旧 boundary**，留着等于告诉上游按一条已经不存在的分隔线去切分实体 → 400。
    *
-   * 文件（含图片）里的内容**不脱敏**：要处理图片里的文字得引入 OCR，单张几百毫秒到几秒，
-   * 会把它从轻量工具变成重工具。不静默放行——检测到文件就发一条 note，由 popup 明说。
-   *
-   * 所有字符串字段**一次拼好统一打码**，再按同一分隔符拆回：分字段各打一次会让同一
-   * 个手机号在不同字段里拿到不同占位符，且请求数翻倍。
+   * 文本类附件（.txt/.md/.csv/.py/.json 等）：通过 `file.text()` 读取其纯文本并连同
+   * 提示词一起打码，用打码后的文本构造同名 `new File` 替换原文件；
+   * Office 文档（.docx/.xlsx/.pptx）：送引擎原生解包替换内部 XML 文本并封包回写；
+   * 图片与其它格式：保持原样透传，若有未脱敏文件则通过 popup 提醒用户。
    */
-  const FIELD_SEP = '\u0001';
+  const FIELD_SEP = '\u0001\u0002__MASKIT_PART__\u0002\u0001';
   async function maskMultipart(fd) {
     const entries = [...fd.entries()];
+    const items = [];
     const texts = [];
-    let hasFile = false, hasImage = false;
-    let fileCount = 0;
-    for (const [, v] of entries) {
-      if (typeof v === 'string') texts.push(v);
-      else {
-        hasFile = true;
-        fileCount++;
-        if (v && typeof v.type === 'string' && v.type.startsWith('image/')) hasImage = true;
+
+    for (const [k, v] of entries) {
+      if (typeof v === 'string') {
+        items.push({ kind: 'string', key: k, value: v });
+        texts.push(v);
+      } else if (isMaskableTextAttachment(v)) {
+        let content = null;
+        try {
+          content = await v.text();
+        } catch (e) {
+          content = null;
+        }
+        if (typeof content === 'string') {
+          items.push({ kind: 'textFile', key: k, file: v });
+          texts.push(content);
+        } else {
+          items.push({ kind: 'raw', key: k, value: v });
+        }
+      } else if (isOOXMLAttachment(v)) {
+        items.push({ kind: 'ooxmlFile', key: k, file: v });
+      } else {
+        items.push({ kind: 'raw', key: k, value: v });
       }
     }
-    if (!texts.length) {
-      if (hasFile) bridge.notify('note', { kind: 'attachment', image: hasImage, count: fileCount });
-      return null;                                  // 纯文件：没有文本可打码
+
+    const hasOOXML = items.some((item) => item.kind === 'ooxmlFile');
+    if (!texts.length && !hasOOXML) {
+      const raws = items.filter((item) => item.kind === 'raw');
+      if (raws.length) {
+        bridge.notify('note', {
+          kind: 'attachment',
+          image: raws.some(isImageItem),
+          count: raws.length,
+          maskedCount: 0,
+        });
+      }
+      return null;                                  // 没有可打码的文本或文档
     }
-    const joined = texts.join(FIELD_SEP);
-    if (!joined) return null;
-    const r = await bridge.call('mask', { text: joined });
-    if (r && r.blocking) return { blocking: true };  // (A) 无条件阻断，交给调用方抛
-    if (!r || !r.ok) return null;
-    const parts = String(r.masked_text || '').split(FIELD_SEP);
-    if (parts.length !== texts.length) return null;  // 条目数对不上说明有意外，宁可放行
+
+    let sid = null;
+    let parts = [];
+    if (texts.length > 0) {
+      const joined = texts.join(FIELD_SEP);
+      if (joined) {
+        const r = await bridge.call('mask', { text: joined });
+        if (r && r.blocking) return { blocking: true };  // (A) 无条件阻断，交给调用方抛
+        if (r && r.ok) {
+          sid = r.sid;
+          parts = String(r.masked_text || '').split(FIELD_SEP);
+        }
+      }
+    }
+
     const out = new FormData();
-    let i = 0;
-    for (const [k, v] of entries) {
-      if (typeof v === 'string') out.append(k, parts[i++]);
-      else out.append(k, v, v && v.name);
+    let textIdx = 0;
+    for (const item of items) {
+      if (item.kind === 'string') {
+        out.append(item.key, parts.length === texts.length ? parts[textIdx++] : item.value);
+      } else if (item.kind === 'textFile') {
+        const orig = item.file;
+        if (parts.length === texts.length) {
+          const maskedContent = parts[textIdx++];
+          let replacement;
+          if (typeof File !== 'undefined' && orig instanceof File) {
+            replacement = new File([maskedContent], orig.name, {
+              type: orig.type || 'text/plain',
+              lastModified: orig.lastModified || Date.now(),
+            });
+          } else {
+            replacement = new Blob([maskedContent], { type: (orig && orig.type) || 'text/plain' });
+          }
+          out.append(item.key, replacement, (orig && orig.name) || 'attachment.txt');
+          item.masked = true;                     // 只有真的换了内容才算已脱敏
+        } else {
+          out.append(item.key, orig, orig && orig.name);
+        }
+      } else if (item.kind === 'ooxmlFile') {
+        const orig = item.file;
+        let replaced = false;
+        try {
+          const buf = await orig.arrayBuffer();
+          const b64 = arrayBufferToBase64(buf);
+          const r = await bridge.call('mask_file', { filename: orig.name, base64: b64, sid });
+          if (r && r.blocking) return { blocking: true };  // (A) 必须立即阻断，严禁把未脱敏原文件漏传出网
+          if (r && r.ok && r.base64) {
+            sid = sid || r.sid;
+            const bytes = base64ToUint8Array(r.base64);
+            let replacement;
+            if (typeof File !== 'undefined' && orig instanceof File) {
+              replacement = new File([bytes], orig.name, {
+                type: orig.type || 'application/octet-stream',
+                lastModified: orig.lastModified || Date.now(),
+              });
+            } else {
+              replacement = new Blob([bytes], { type: (orig && orig.type) || 'application/octet-stream' });
+            }
+            out.append(item.key, replacement, orig.name);
+            item.masked = true;                   // 解包-替换-封包全部成功才算已脱敏
+            replaced = true;
+          }
+        } catch (e) {
+          replaced = false;
+        }
+        if (!replaced) {
+          out.append(item.key, orig, orig && orig.name);
+        }
+      } else {
+        out.append(item.key, item.value, item.value && item.value.name);
+      }
     }
-    if (hasFile) bridge.notify('note', { kind: 'attachment', image: hasImage, count: fileCount });
-    return { body: out, sid: r.sid };
+
+    // 计数**只认真的替换成功的文件**（标记见上面 append 循环）。此处是「诚实上报」的
+    // 唯一关键点：此前在进入循环前就乐观累加 maskedFileCount，于是引擎超时、文本掩码
+    // 失败、OOXML 解包失败时，文件原样上行、popup 却告诉用户「已脱敏 N 个文件」——
+    // 把最危险的失败模式（以为被保护了，其实没有）包装成成功，比不提示更糟。
+    let maskedCount = 0;
+    let unmaskedCount = 0;
+    let hasUnmaskedImage = false;
+    for (const item of items) {
+      if (item.kind === 'string') continue;
+      if (item.masked) {
+        maskedCount++;
+      } else {
+        unmaskedCount++;
+        if (isImageItem(item)) hasUnmaskedImage = true;
+      }
+    }
+    if (unmaskedCount > 0 || maskedCount > 0) {
+      bridge.notify('note', {
+        kind: 'attachment',
+        image: hasUnmaskedImage,
+        count: unmaskedCount,
+        maskedCount: maskedCount,
+      });
+    }
+    return { body: out, sid: sid };
   }
 
   // ─── escape 由引擎按槽位判定 ───
@@ -226,8 +428,9 @@
     } catch (e) {
       return origFetch.apply(this, args);             // 任何解析意外：原样放行
     }
-    // 只有带 body 的写方法值得过桥；GET 语义的查询串不处理（历史上 MIN_MASKABLE_LEN
-    // 就是为滤掉这类短请求，现在进一步按方法先过滤，省掉绝大部分无谓判定）。
+    // 只有带 body 的写方法值得过桥。**方法过滤是这里的主判据**——GET 语义的查询串
+    // 在进任何长度判断之前就被挡掉了（MIN_MASKABLE_LEN 原先兼着这个职责，现已退回
+    // 它真正的含义：只是一个「短到不可能有 PII」的下限，见其定义处）。
     if (method !== 'POST' && method !== 'PUT' && method !== 'PATCH') {
       return origFetch.apply(this, args);
     }

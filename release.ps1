@@ -144,6 +144,8 @@ if (Test-Path "release.ps1") { git add release.ps1; Assert-LastExit "git add rel
 $newFiles = @(
   "engine\credential_labels.py",
   "frontend\src\lib\credential-labels.ts",
+  "frontend\src\pages\Extension.tsx",
+  "scripts\pack-extension.py",
   "scripts\verify-all.py",
   "tests\test_config_patch.py",
   "tests\test_event_store_selfheal.py"

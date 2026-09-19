@@ -15,6 +15,7 @@ const SettingsPage = lazy(() => import('@/pages/Settings'))
 const AuditPage = lazy(() => import('@/pages/Audit'))
 const WordsPage = lazy(() => import('@/pages/Words'))
 const ClientsPage = lazy(() => import('@/pages/Clients'))
+const ExtensionPage = lazy(() => import('@/pages/Extension'))
 
 function App() {
   const { token, setToken, setEngineReady, setEngineError } = useAuthStore()
@@ -88,9 +89,9 @@ function App() {
         if (cancelled) return
         initEnginePort(s.port)
         setEngineReady(s.ready)
-        // last_error 可被清空（成功就绪时 Rust 置 None），必须同步清掉旧错误，
-        // 否则引擎恢复后顶栏仍挂着过期的「引擎错误」。
-        setEngineError(s.last_error ?? null)
+        // 引擎一旦就绪即视为健康，立即清空过期的瞬时错误；未就绪时才保留 last_error。
+        // 杜绝引擎已就绪但因 Rust 历史残留 last_error 导致顶栏被误定格在红灯的问题。
+        setEngineError(s.ready ? null : (s.last_error ?? null))
         if (s.ready) fast = false
       } catch {
         if (!cancelled) setEngineError(ttf('app.engineError'))
@@ -114,6 +115,7 @@ function App() {
           <Route path="/stats" element={<StatsPage />} />
           <Route path="/words" element={<WordsPage />} />
           <Route path="/clients" element={<ClientsPage />} />
+          <Route path="/extension" element={<ExtensionPage />} />
           <Route path="/audit" element={<AuditPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />

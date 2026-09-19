@@ -31,6 +31,11 @@ import transparent as tr  # noqa: E402
 
 PLACEHOLDER_RX = re.compile(r"\{\{[A-Z0-9]{1,12}_[a-z]{6}\}\}")
 
+# 导入时抓一份 `ext_frames` 上限快照。**不能**在断言里现读 `tr._EXT_FRAMES_MAX`：
+# 负向对照会把它 patch 成 10^9 来模拟「修复被回退」，现读现用的话断言会跟着变宽、
+# 永远绿（第一版就是这么写的，负向对照当场把它揪出来了）。
+_FRAMES_CAP_AT_IMPORT = tr._EXT_FRAMES_MAX
+
 # 一条“标准”的 LLM 请求体：手机号 + 邮箱 + 凭据前缀 key
 FULL_BODY = (
     '{"model":"gpt-4o","messages":[{"role":"user","content":'
@@ -607,6 +612,65 @@ class FailureVisibilityTests(ExtBridgeTestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json()["text"], masked)
         self.assertIn("ext restore 失败(final): RuntimeError", _log_lines())
+
+    def test_mask_file_docx_and_xlsx(self):
+        """测试 Office 文档（.docx / .xlsx）解包打码端点 /api/ext/mask-file。"""
+        import io
+        import zipfile
+        import base64
+
+        # 1. 构造含手机号和邮箱的 docx 结构
+        doc_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:t>联系电话：13812345678</w:t></w:r>
+      <w:r><w:t>，工作邮箱：test@example.com</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"""
+        in_buf = io.BytesIO()
+        with zipfile.ZipFile(in_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("word/document.xml", doc_xml.encode("utf-8"))
+        b64_in = base64.b64encode(in_buf.getvalue()).decode("ascii")
+
+        # 调端点打码
+        r = self._ext("/api/ext/mask-file", {"filename": "test.docx", "base64": b64_in})
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json() or {}
+        self.assertTrue(j.get("ok"))
+        self.assertGreater(j.get("hit_count", 0), 0)
+        sid = j.get("sid")
+        self.assertTrue(sid.startswith("ext:"))
+
+        # 解开打码后的 docx 验证
+        masked_bytes = base64.b64decode(j.get("base64"))
+        with zipfile.ZipFile(io.BytesIO(masked_bytes), "r") as zout:
+            masked_xml = zout.read("word/document.xml").decode("utf-8")
+            self.assertNotIn("13812345678", masked_xml)
+            self.assertNotIn("test@example.com", masked_xml)
+            self.assertIn("{{PHONE_", masked_xml)
+            self.assertIn("{{EMAIL_", masked_xml)
+
+        # 2. 构造含共享字符串的 xlsx 结构
+        sst_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1">
+  <si><t>客户热线：13812345678</t></si>
+</sst>"""
+        wb_buf = io.BytesIO()
+        with zipfile.ZipFile(wb_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("xl/sharedStrings.xml", sst_xml.encode("utf-8"))
+        b64_wb = base64.b64encode(wb_buf.getvalue()).decode("ascii")
+
+        r_wb = self._ext("/api/ext/mask-file", {"filename": "data.xlsx", "base64": b64_wb, "sid": sid})
+        self.assertEqual(r_wb.status_code, 200)
+        j_wb = r_wb.get_json() or {}
+        self.assertTrue(j_wb.get("ok"))
+        masked_wb_bytes = base64.b64decode(j_wb.get("base64"))
+        with zipfile.ZipFile(io.BytesIO(masked_wb_bytes), "r") as zout:
+            masked_sst = zout.read("xl/sharedStrings.xml").decode("utf-8")
+            self.assertNotIn("13812345678", masked_sst)
+            self.assertIn("{{PHONE_", masked_sst)
 
 
 class StatsSwitchTests(ExtBridgeTestCase):
@@ -1216,6 +1280,180 @@ class IngressAllowlistTests(unittest.TestCase):
         for rec_in in ({}, {"ingress": "ext"}, {"ingress": "EXT"}, {"ingress": "bogus"}):
             got = event_store._normalize_ingress(dict(rec_in))["ingress"]
             self.assertIn(got, event_store.INGRESS_VALUES)
+
+
+# ================= 审计 2026-09-19 修复项的钉死用例 =================
+
+class ExtCredentialScrubTests(ExtBridgeTestCase):
+    """审计 B1：扩展链路的事件对象整体都不许带凭据原文。
+
+    ⚠️ 判据是**整个事件对象**，不是 `items[]`。B1 之所以漏，正是因为 `items[]`
+    一直合规（凭据项只有 digest + preview），而同一个 payload 里的
+    `dialog` / `req_preview` / `resp_preview` 是直接写 `text[:N]` 的原文切片。
+    只断言 `items[]` 的用例会全绿放过它 —— 所以下面的断言遍历 payload 的**全部字符串**。
+    """
+
+    # 凭据形态（必须被清洗）+ 普通 PII（必须保留，用户明确要求详情弹窗能看到原文）
+    CRED = "sk-abcdefghijklmnopqrstuvwxyz012345"
+    PHONE = "13812345678"
+    NAME = "张三"
+
+    def _flatten_strings(self, obj, out=None):
+        """把事件对象里所有字符串摊平，供「全字段」级断言使用。"""
+        if out is None:
+            out = []
+        if isinstance(obj, str):
+            out.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                self._flatten_strings(v, out)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                self._flatten_strings(v, out)
+        return out
+
+    def _mask_and_read_event(self):
+        body = json.dumps({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content":
+                          f"联系人{self.NAME}，电话 {self.PHONE}，key 是 {self.CRED}"}],
+        }, ensure_ascii=False)
+        j = self._mask(body).get_json()
+        self.assertTrue(j.get("ok"), f"mask 必须成功，实际 {j}")
+        event_store.flush_event_queue()
+        evs = [e for e in event_store.fetch_events(limit=50)
+               if str(e.get("path") or "") == "/ext/mask"]
+        self.assertTrue(evs, "扩展 mask 事件必须落库（否则本用例什么都没测到）")
+        return body, j, evs[-1]
+
+    def test_credential_plaintext_nowhere_in_event_object(self):
+        _body, j, ev = self._mask_and_read_event()
+        blob = "\n".join(self._flatten_strings(ev))
+        self.assertNotIn(self.CRED, blob,
+                         f"凭据原文出现在事件对象的某个字段里（B1 复发）。payload={ev}")
+        # 顺带钉住「凭据本身确实被脱敏了」——否则上面的断言可能只是因为整条都没落库
+        self.assertNotIn(self.CRED, j["masked_text"])
+        self.assertIn("{{APIKEY_", j["masked_text"])
+
+    def test_non_credential_plaintext_still_visible_in_detail_dialog(self):
+        """反向锁：**不许**把清洗扩大到普通 PII。
+
+        用户明确要求「弹窗查看要能看到脱敏的明文是什么」。详情弹窗的
+        「脱敏 ↔ 原文」对照靠的就是 dialog / items[].original 里的普通 PII 原文；
+        一旦有人把 `_redact_credentials` 换成更激进的清洗，这条会立刻红。
+        """
+        _body, _j, ev = self._mask_and_read_event()
+        blob = "\n".join(self._flatten_strings(ev))
+        self.assertIn(self.PHONE, blob,
+                      "普通 PII（手机号）原文必须留在事件里，详情弹窗要靠它做对照")
+        origs = [it.get("original") for it in (ev.get("items") or [])]
+        self.assertIn(self.PHONE, origs,
+                      "普通 PII 的 items[].original 必须保留（凭据类才是只有 digest+preview）")
+
+    def test_credential_items_carry_no_original(self):
+        _body, _j, ev = self._mask_and_read_event()
+        cred_items = [it for it in (ev.get("items") or [])
+                      if str(it.get("label") or "").upper() in
+                      {"APIKEY", "API_KEY", "TOKEN", "SECRET", "JWT",
+                       "ACCESSKEY", "PRIVATEKEY", "CONNSTR"}]
+        self.assertTrue(cred_items, f"本用例的请求必然产生凭据项，实际 items={ev.get('items')}")
+        for it in cred_items:
+            self.assertNotIn("original", it, f"凭据项不许带 original：{it}")
+
+
+class RestoreSizeGateTests(ExtBridgeTestCase):
+    """审计 M2：`/api/ext/restore` 的体积闸门与 `ext_frames` 条目上限。
+
+    ⚠️ **用例里不许「现读现用」被保护的那个常量**。负向对照会把
+    `panel._EXT_MAX_BODY` / `tr._EXT_FRAMES_MAX` patch 掉来模拟「修复被回退」，
+    如果断言是从同一个属性现读的阈值，patch 之后断言会跟着一起变宽，
+    用例就变成永远绿（实测踩过，第一版就是这么写的）。
+    所以下面两个常量都在**模块导入时**抓快照。
+    """
+
+    def test_oversize_restore_is_passthrough_not_blocking(self):
+        """超限必须回**不带 blocking** 的失败，让扩展按 (B) 桶把原文交回页面。
+
+        这里刻意与 `/api/ext/mask` 的 413+blocking 相反：mask 方向阻断是安全的
+        （明文不出网），restore 方向阻断只会让用户看到半截响应（红线 3 恒透传）。
+
+        做法是把闸门**调小**到 256 字节再发 1KB 的 body —— 不必真造 32MB 请求体，
+        而且断言的是闸门特有的错误码，比「ok 是 false」强得多：
+        没有闸门时端点会照常还原并回 `ok:true`，这里立刻红。
+        """
+        j = self._mask('{"c":"13812345678"}').get_json()
+        sid, masked = j["sid"], j["masked_text"]
+        with mock.patch.object(panel, "_EXT_MAX_BODY", 256):
+            r = self._ext("/api/ext/restore", {
+                "text": masked + ("x" * 1024), "sid": sid,
+                "stream_id": "m2", "final": True,
+            })
+        body = r.get_json() or {}
+        self.assertIsNot(body.get("blocking"), True,
+                         "(B) 类：restore 超限绝不许阻断，否则页面看到半截响应")
+        self.assertEqual(body.get("error"), "payload_too_large",
+                         f"必须命中体积闸门本身（没有闸门时会回 ok:true），实际 {body}")
+
+    def test_normal_restore_still_works_after_gate(self):
+        """闸门不能误伤正常链路（加闸门最常见的回归就是「顺手把正常路径也挡了」）。"""
+        body = '{"c":"13812345678"}'
+        j = self._mask(body).get_json()
+        r = self._restore(j["masked_text"], j["sid"], final=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["text"], body)
+
+    def _restore_sse(self, text, sid, stream_id, final):
+        """走 **SSE 分帧**路径的 restore。
+
+        必须显式带 `content_type`：不带时引擎走「非流式整体」分支提前 return，
+        `ext_frames` 一个条目都不会建 —— 那样写出来的上限用例会**永远绿**
+        （实测踩过，第一版就是这么写的）。
+        同理 `final=False` 也是必需的：`final=True` 会在返回前
+        `frames.pop(stream_id)`，条目同样留不下来。
+        """
+        return self._ext("/api/ext/restore", {
+            "text": text, "sid": sid, "stream_id": stream_id,
+            "final": final, "content_type": "text/event-stream",
+        })
+
+    def test_ext_frames_is_capped(self):
+        """`ext_frames` 是客户端可控字典：不设上限就能用大量 stream_id 撑大引擎内存。"""
+        cap = _FRAMES_CAP_AT_IMPORT
+        self.assertGreater(cap, 0)
+        self.assertLess(cap, 4096, "上限本身要是个「小数字」，否则等于没有上限")
+        j = self._mask('{"c":"13812345678"}').get_json()
+        sid = j["sid"]
+        # 每个新 stream_id 都会新增一个条目；非 final 才会留在 frames 里
+        for i in range(cap + 20):
+            r = self._restore_sse("data: {}\n\n", sid, f"cap-{i}", final=False)
+            self.assertEqual(r.status_code, 200)
+        frames = tr.sessions.get(sid, {}).get("ext_frames")
+        self.assertIsInstance(frames, dict,
+                              "这些 stream_id 必然建出 ext_frames，字典不该缺席")
+        self.assertGreater(len(frames), 0,
+                           "条目数为 0 说明这条路径根本没建帧缓冲，本用例没测到东西")
+        self.assertLessEqual(
+            len(frames), cap,
+            f"ext_frames 必须有条目上限（cap={cap}），实际 {len(frames)} 条 —— 淘汰没生效")
+
+    def test_streaming_restore_survives_eviction(self):
+        """淘汰之后**新** stream_id 仍必须能正常还原（淘汰的是别人的帧，不是自己的）。"""
+        j = self._mask('{"c":"13812345678"}').get_json()
+        sid, masked = j["sid"], j["masked_text"]
+        for i in range(_FRAMES_CAP_AT_IMPORT + 10):
+            self._restore_sse("data: {}\n\n", sid, f"churn-{i}", final=False)
+        # 跨两个 SSE 事件切开占位符，验证新流自己的缓冲是干净的（不串别人的残留）
+        cut = masked.index("}}") + 2
+        first, second = masked[:cut], masked[cut:]
+        r1 = self._restore_sse("data: " + json.dumps({"t": first}) + "\n\n",
+                               sid, "churn-final", final=False)
+        r2 = self._restore_sse("data: " + json.dumps({"t": second}) + "\n\ndata: [DONE]\n\n",
+                               sid, "churn-final", final=True)
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        out = r1.get_json()["text"] + r2.get_json()["text"]
+        self.assertNotIn("{{", out, f"跨事件切开的占位符必须拼回来，实际 {out!r}")
+        self.assertIn("13812345678", out)
 
 
 if __name__ == "__main__":

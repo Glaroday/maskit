@@ -446,7 +446,10 @@ def collect_findings_by_probe(probe_ids):
     """从 audit_events 表按 probe_id 查检测结果。返回 {probe_id: [finding, ...]}。"""
     out = {pid: [] for pid in probe_ids}
     # fetch_audit_events 不支持 probe_id 过滤，全量扫近 200 条匹配
-    evs = fetch_audit_events(since=0, limit=500)
+    # 必须 include_deprecated=True：这是**检测**读路径，不是给人看的列表。
+    # 默认的读侧降噪过滤会让被隐藏的信号在风险矩阵里永远看不到，而矩阵仍渲染绿色
+    # （假阴性）。降噪只应作用于 UI 列表。
+    evs = fetch_audit_events(since=0, limit=500, include_deprecated=True)
     for ev in evs:
         pid = ev.get("probe_id")
         if pid in out:
