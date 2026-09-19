@@ -21,7 +21,25 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 GOOGLE_KEY_RE = re.compile(r"AIza[0-9A-Za-z_-]{35,}")
 AWS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
 GITHUB_PAT_RE = re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")
-PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+# 私钥块：必须同时具备「BEGIN 头 + 足够长的体 + END 尾」才算命中。
+#
+# 【为什么不能只匹配裸头部】旧规则是 `-----BEGIN [A-Z ]*PRIVATE KEY-----`，
+# 只认头部，于是**如实描述这个检测功能**的文档/注释反而会被自己拦下：
+# `engine/audit_signals.py` 就是干「识别 PEM 私钥块」这件事的，任何说明它的
+# 文字都必然要写出那个头部（2026-09-19 实测：AUDIT 文档里一行散文
+# 「body = 反复重复的 <裸头部>，无 END」直接把 CI 的 version job 打红）。
+# 结果是门禁在惩罚「把代码讲清楚」——而绕过它的办法（运行时字符串拼接）
+# 比它拦下的东西还难读。
+#
+# 只认头部还有个更根本的问题：**裸头部不承载任何凭据信息**。真正的密钥一定
+# 有 base64 体；没有体的「密钥」本身就是零信息量的字面量。所以要求
+# 「体 + END」既消除了误报，又没放弃任何真实检出能力。
+#
+# 体长下限取 40 字节：真实 PEM 体（RSA/EC/Ed25519）都在 100 字符以上，
+# 40 是刻意压低的门槛——宁可多拦，也不放过把真密钥截断粘贴的情形。
+PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]{40,}?-----END [A-Z ]*PRIVATE KEY-----"
+)
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 

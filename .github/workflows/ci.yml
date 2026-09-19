@@ -165,7 +165,11 @@ jobs:
       - name: Install workflow lint dependency
         run: python -m pip install --quiet 'pyyaml>=6,<7'
 
-      - name: Version numbers must agree across panel.py / tauri.conf.json / Cargo.toml / package.json
+      # 这个步骤跑**两个**脚本，名字必须把两件事都说出来。
+      # 旧名字只写了版本号一致性，结果 audit 失败时（实测 2026-09-19：文档里引用了
+      # 一个 PEM 私钥头部字面量）报错信息指向「版本号不一致」，把人往完全错误的方向带。
+      # 步骤名是失败时唯一可见的线索，别让它说谎。
+      - name: Version numbers agree, and no credential/secret literals in tracked files
         run: |
           python scripts/check-version.py
           python scripts/audit-public-release.py

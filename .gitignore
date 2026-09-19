@@ -92,3 +92,8 @@ Thumbs.db
 tests/e2e_reports/
 tests/e2e_web_console.py
 
+
+# 本机审计 / 分析产出（非项目资产）：写的是「代码现状 + 当时的判断」，
+# 生命周期比代码短，且会随着代码演进迅速过期，留在仓库里只会误导后来者。
+# 曾于 d4edbf6 被误纳入跟踪，并因文中引用 PEM 头部字面量把 CI 的 version job 打红。
+AUDIT-*.md
