@@ -2695,11 +2695,15 @@ class OffsetMap:
         kept = []
         cs = cd = 0
         for s, e, tok in self.edits:
+            if s < cs:
+                raise ValueError(f"Edit 重叠: [{s}, {e}) 与前序边界 {cs} 冲突")
             if s > cs:
                 kept.append((cs, s, cd))
                 cd += s - cs
             cd += len(tok)
             cs = e
+        if cs > src_len:
+            raise ValueError(f"Edit 越界: 结束位置 {cs} 超过 src_len {src_len}")
         if cs < src_len:
             kept.append((cs, src_len, cd))
             cd += src_len - cs
@@ -2870,6 +2874,21 @@ def mask(text, sid):
         return text
     original = text
     om = OffsetMap.empty(len(original)) if NER_ENABLED else None
+    om_broken = False
+
+    def _update_om(edits, curr_len):
+        nonlocal om, om_broken
+        if om is None or om_broken or not edits:
+            return
+        try:
+            om = om.compose(OffsetMap(edits, curr_len))
+        except Exception as e:
+            om_broken = True
+            om = None
+            _ner_warn_once("om_compose",
+                           "OffsetMap 坐标合成降级，本次跳过 NER 识别: %s: %s"
+                           % (type(e).__name__, e))
+
     s = sessions.get(sid)
     if s is None:
         _new_session(sid)
@@ -2902,8 +2921,7 @@ def mask(text, sid):
             # 跳过已有占位符片段（防污染：多轮对话历史里带旧占位符）
             curr_len = len(text)
             text, edits = _mask_excluding_placeholders_ed(text, prefix_rx, _prefix_sub)
-            if om is not None and edits:
-                om = om.compose(OffsetMap(edits, curr_len))
+            _update_om(edits, curr_len)
 
     cw_rx = _custom_combined_regex()
     if cw_rx:
@@ -2921,8 +2939,7 @@ def mask(text, sid):
             return fwd.get(orig_key, word)
         curr_len = len(text)
         text, edits = _mask_excluding_placeholders_ed(text, cw_rx, _cw_sub)
-        if om is not None and edits:
-            om = om.compose(OffsetMap(edits, curr_len))
+        _update_om(edits, curr_len)
 
     # 被豁免的连接串**区间** [start, end)（end 即 userinfo 结尾的 `@` 之后）：
     # RULES 里 CONNSTR 排在 EMAIL 之前，本列表用于让 EMAIL 避开与这些区间重叠的
@@ -2991,14 +3008,14 @@ def mask(text, sid):
                 return m.group(0)
             curr_len = len(text)
             text, edits = _mask_excluding_placeholders_ed(text, rx, _rule_sub, group_idx=group_idx)
-            if om is not None and edits:
-                om = om.compose(OffsetMap(edits, curr_len))
+            _update_om(edits, curr_len)
 
     # ── AI 实体识别（NER）：人名 (NAME) / 机构 (ORG) / 详细地址 (ADDR) ──
     # 排在全部确定性规则之后：同一原文以规则/自定义词为准，语义模型只补规则覆盖不到
     # 的自由文本。模型在干净的 original 上抽取上下文，抽出的区间经 om.map_range
     # 翻译至伤疤文本坐标系，再由 _ner_entity_spans 按占位符切分（详见 DESIGN-v1.1-span-refactor.md §7.3）。
-    if NER_ENABLED:
+    # om_broken 或 om 为 None 时跳过 NER，严禁将 original 坐标作为回退直接用于伤疤文本。
+    if NER_ENABLED and not om_broken and om is not None:
         try:
             import ner_engine
             if not ner_engine.is_ner_available():
@@ -3019,7 +3036,7 @@ def mask(text, sid):
                     lbl = str(ent.get("type") or "TERM")
                     if e_orig - s_orig < 2 or s_orig < 0 or e_orig > len(original):
                         continue
-                    mapped_range = om.map_range(s_orig, e_orig) if om is not None else (s_orig, e_orig)
+                    mapped_range = om.map_range(s_orig, e_orig)
                     if mapped_range is None:
                         continue
                     s2, e2 = mapped_range
@@ -3044,7 +3061,8 @@ def mask(text, sid):
                     if token:
                         planned.append((s0 + lead, s0 + lead + len(frag), token))
                 if planned:
-                    planned.sort()
+                    # 起点相同时贪心优先覆盖更长的区间，防止短区间覆盖导致长区间残片明文泄漏
+                    planned.sort(key=lambda x: (x[0], -x[1]))
                     text = _mask_by_spans(text, planned)
         except Exception as e:
             _ner_warn_once("runtime", "NER 识别降级，本次未做实体识别: %s: %s" % (type(e).__name__, e))

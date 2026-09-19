@@ -5308,6 +5308,31 @@ class OffsetMapTests(unittest.TestCase):
             mapped = [om_total.map_point(i) for i in survivors]
             self.assertEqual(len(set(mapped)), len(mapped))
 
+    def test_offset_map_overlapping_edits_rejected(self):
+        """OffsetMap 必须拒绝重叠的 Edit 序列，防止构造出非法映射。"""
+        edits = [
+            tr.Edit(2, 6, "{{A}}"),
+            tr.Edit(5, 8, "{{B}}"),
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap(edits, 15)
+        self.assertIn("Edit 重叠", str(ctx.exception))
+
+    def test_offset_map_out_of_bounds_rejected(self):
+        """OffsetMap 必须拒绝超出 src_len 边界的 Edit。"""
+        edits = [tr.Edit(5, 12, "{{A}}")]
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap(edits, 10)
+        self.assertIn("Edit 越界", str(ctx.exception))
+
+    def test_offset_map_compose_dimension_mismatch_rejected(self):
+        """OffsetMap.compose 尺寸不匹配时必须抛出 ValueError。"""
+        om1 = tr.OffsetMap([tr.Edit(0, 5, "{{A}}")], 10)  # dst_len = 5 - 5 + len("{{A}}") + 5 = 10 - 5 + 7 = 12
+        om2 = tr.OffsetMap.empty(20)                      # src_len = 20 != 12
+        with self.assertRaises(ValueError) as ctx:
+            om1.compose(om2)
+        self.assertIn("尺寸不匹配", str(ctx.exception))
+
 
 class MaskExcludingPlaceholdersEdTests(unittest.TestCase):
     """_mask_excluding_placeholders_ed 与 Edit 生成的契约测试。"""

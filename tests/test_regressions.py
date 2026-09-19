@@ -7211,3 +7211,39 @@ class NerPriorityContractTests(unittest.TestCase):
         out = tr.mask("北京市西城区网点营业厅已关闭", "ner-ctx")
         self.assertNotIn("网点营业厅", out,
                          "确定性层替换后，语义模型仍应能保护机构名残片")
+
+    def test_om_compose_exception_graceful_degradation(self):
+        """防御性降级验证：若 OffsetMap.compose 遭遇异常，mask() 不得崩溃（拒绝 503），
+        确定性脱敏依然正常生效，仅安全跳过后续 NER 实体抽取。"""
+        self._set_words({"西城区": "区划"})
+        original_compose = tr.OffsetMap.compose
+
+        def mock_broken_compose(self, next_om):
+            raise ValueError("模拟 OffsetMap.compose 内部不变量被破坏")
+
+        tr.OffsetMap.compose = mock_broken_compose
+        try:
+            # 执行 mask：自定义词必须脱敏，且绝不抛出未捕获异常
+            out = tr.mask("北京市西城区网点营业厅已关闭", "om-degrade-sid")
+            self.assertNotIn("西城区", out, "确定性脱敏（自定义词）必须仍然成功生效")
+            self.assertIn("{{", out, "必须产出占位符")
+        finally:
+            tr.OffsetMap.compose = original_compose
+
+    def test_ner_spans_longest_first_on_same_start(self):
+        """同起点实体区间按长区间贪心优先排序，杜绝短区间截断导致的后半截明文泄漏。"""
+        # 构造同起点、不同终点的 planned 区间模拟
+        # 原始文本："张三丰在武当山工作" (len=9)
+        # 两个规划实体：[0, 2) "张三" 与 [0, 3) "张三丰"
+        text = "张三丰在武当山工作"
+        planned = [
+            (0, 2, "{{NAME_short}}"),
+            (0, 3, "{{NAME_longest}}"),
+        ]
+        # 按修复后的 key 排序：start 相同时，-end 越小即 end 越大排在前面
+        planned.sort(key=lambda x: (x[0], -x[1]))
+        res = tr._mask_by_spans(text, planned)
+        self.assertTrue(res.startswith("{{NAME_longest}}"),
+                        "长实体必须优先命中，避免短实体消费后留下 '丰' 字明文")
+        self.assertNotIn("丰", res[:len("{{NAME_longest}}") + 1])
+

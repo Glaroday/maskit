@@ -2,7 +2,7 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.3.0] - 2026-09-19
 
 ### 新增 / Added
 - 内置本地 AI 实体识别（NER，配置项 `ner_enabled`，默认关）：本地 ONNX 模型识别人名 / 机构 / 地址，补齐确定性规则覆盖不到的自由文本；设置页可开关，模型或依赖缺失时界面与健康检查直接说明原因。实测「规则 + NER」联动下，样例集敏感值的明文残留从 74% 降到 11%。
@@ -37,6 +37,8 @@
   *The browser extension now ships as its own release asset, `Maskit_<version>_extension.zip`: it is not inside the desktop installer, so web-app users without the source tree had nowhere to get it — now they download, unzip and load it from `chrome://extensions`.*
 
 ### 修复 / Bug Fixes
+- 脱敏：NER 在经规则替换后的文本上识别实体会导致上下文被截断、实体残片明文泄漏（如「西城区」被打码后，其后的「网点营业厅」失去前序上下文漏打码）；现改为在干净原文上抽取实体，经 OffsetMap 坐标单调映射回伤疤文本，并在映射失败时安全降级跳过 NER、绝不混用原文与伤疤坐标系，同起点实体按长区间贪心优先。
+  *Masking: running NER on text already mutated by deterministic rules truncated entity context and leaked entity fragments in plaintext (e.g. masking "Xicheng District" caused following "branch office" to lose its context and go unmasked); entities are now extracted from the clean original and translated back via a monotonic OffsetMap, with graceful degradation skipping NER on mapping errors without cross-coordinate mixing, and greedy longest-span selection for identical starts.*
 - 脱敏：数值型敏感值、敏感值当 JSON 键名、重复键三条路径既不命中也不抛异常，于是「零改写」分支把客户端原始字节原样放行——明文出网，而 fail-closed 只兜异常、兜不住「静默判定为无需改写」。三条现全部覆盖；协议字段、工具名与 JSON Schema 骨架按白名单保持原样。
   *Masking: three paths — numeric sensitive values, sensitive values used as JSON key names, and duplicate keys — neither matched nor raised, so the zero-rewrite branch passed the client's original bytes upstream verbatim: plaintext egress, and fail-closed only covers exceptions, not a silent "no rewrite needed". All three are covered now; protocol fields, tool names and JSON Schema skeletons stay intact via a whitelist.*
 - 脱敏：顶层键名扫描只在扩展链路生效，同一个请求体走代理链路与走扩展链路会得到不同结果；两条链路现共用同一判据。
