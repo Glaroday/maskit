@@ -5175,5 +5175,180 @@ class NerEngineIntegrationTests(unittest.TestCase):
         self.assertEqual(restored, text, "NER 识别出的占位符还原后必须与原文完全一致")
 
 
+class OffsetMapTests(unittest.TestCase):
+    """OffsetMap 与 Edit 的数据契约与数学性质测试（对应 DESIGN-v1.1-span-refactor.md §7.2 / §14.1）。"""
+
+    def test_empty_identity_map(self):
+        om = tr.OffsetMap.empty(10)
+        self.assertEqual(om.src_len, 10)
+        self.assertEqual(om.dst_len, 10)
+        for i in range(10):
+            self.assertEqual(om.map_point(i), i)
+        self.assertEqual(om.map_range(2, 7), (2, 7))
+        self.assertIsNone(om.map_range(5, 5))
+        self.assertIsNone(om.map_range(7, 2))
+
+    def test_real_defect_case_spans(self):
+        """设计文档 §1.1 / §7.2.1 真实缺陷用例。"""
+        # 原文: "北京市西城区网点营业厅已关闭" (len=14)
+        # 自定义词替换 [3, 6) "西城区" -> "{{TERM_sgpctc}}" (len=15)
+        # 伤疤文本: "北京市{{TERM_sgpctc}}网点营业厅已关闭" (len=23)
+        orig = "北京市西城区网点营业厅已关闭"
+        edits = [tr.Edit(3, 6, "{{TERM_sgpctc}}")]
+        om = tr.OffsetMap(edits, len(orig))
+        self.assertEqual(om.dst_len, len("北京市{{TERM_sgpctc}}网点营业厅已关闭"))
+
+        # 模型在原文上识别: [2, 11) '市西城区网点营业厅'
+        mapped = om.map_range(2, 11)
+        self.assertEqual(mapped, (2, 23))
+
+        # 被完全覆盖的实体应返回 None
+        self.assertIsNone(om.map_range(3, 6))
+
+    def test_property_p1_p2_p3_randomized(self):
+        """2000 组随机性质测试：P1 字符保真，P2 单射，P3 区间紧致。"""
+        import random
+        rng = random.Random(20260919)
+        tokens = ["{{TERM_abcdef}}", "{{PHONE_ghijkl}}", "{{ADDR_mnopqr}}"]
+
+        for _ in range(2000):
+            n = rng.randint(1, 40)
+            text = "".join(rng.choice("abcXYZ0123中文字") for _ in range(n))
+            edits, i = [], 0
+            while i < n:
+                if rng.random() < 0.25:
+                    ln = min(rng.randint(1, 4), n - i)
+                    edits.append(tr.Edit(i, i + ln, rng.choice(tokens)))
+                    i += ln + rng.randint(0, 2)
+                else:
+                    i += 1
+
+            # 重建目标串
+            out, cursor = [], 0
+            for s, e, tok in edits:
+                out.append(text[cursor:s])
+                out.append(tok)
+                cursor = e
+            out.append(text[cursor:])
+            target = "".join(out)
+
+            om = tr.OffsetMap(edits, len(text))
+            self.assertEqual(om.dst_len, len(target))
+
+            replaced = set()
+            for s, e, _ in edits:
+                replaced.update(range(s, e))
+            survivors = [idx for idx in range(len(text)) if idx not in replaced]
+
+            # P1: 字符保真
+            for idx in survivors:
+                m = om.map_point(idx)
+                self.assertIsNotNone(m)
+                self.assertEqual(target[m], text[idx])
+
+            # P2: 单射
+            mapped = [om.map_point(idx) for idx in survivors]
+            self.assertEqual(len(set(mapped)), len(mapped))
+
+            # P3: 区间紧致
+            for _ in range(3):
+                s = rng.randint(0, len(text))
+                e = rng.randint(s, len(text))
+                inside = [idx for idx in survivors if s <= idx < e]
+                got = om.map_range(s, e)
+                if not inside:
+                    self.assertIsNone(got)
+                else:
+                    want = (min(om.map_point(idx) for idx in inside),
+                            max(om.map_point(idx) for idx in inside) + 1)
+                    self.assertEqual(got, want)
+
+    def test_compose_multi_step_randomized(self):
+        """多步 OffsetMap.compose 后的映射依然保持 P1/P2/P3。"""
+        import random
+        rng = random.Random(20260920)
+        tokens = ["{{TERM_abcdef}}", "{{PHONE_ghijkl}}", "{{ADDR_mnopqr}}"]
+
+        for _ in range(1000):
+            steps = rng.randint(1, 4)
+            n = rng.randint(5, 35)
+            orig = "".join(rng.choice("abcXYZ0123中文字") for _ in range(n))
+            curr = orig
+            om_total = tr.OffsetMap.empty(len(orig))
+
+            for _ in range(steps):
+                edits, i = [], 0
+                while i < len(curr):
+                    if rng.random() < 0.2:
+                        ln = min(rng.randint(1, 3), len(curr) - i)
+                        edits.append(tr.Edit(i, i + ln, rng.choice(tokens)))
+                        i += ln + rng.randint(0, 2)
+                    else:
+                        i += 1
+                out, cursor = [], 0
+                for s, e, tok in edits:
+                    out.append(curr[cursor:s])
+                    out.append(tok)
+                    cursor = e
+                out.append(curr[cursor:])
+                next_text = "".join(out)
+                om_step = tr.OffsetMap(edits, len(curr))
+                om_total = om_total.compose(om_step)
+                curr = next_text
+
+            self.assertEqual(om_total.dst_len, len(curr))
+
+            survivors = []
+            for i in range(len(orig)):
+                p = om_total.map_point(i)
+                if p is not None:
+                    self.assertEqual(curr[p], orig[i])
+                    survivors.append(i)
+
+            mapped = [om_total.map_point(i) for i in survivors]
+            self.assertEqual(len(set(mapped)), len(mapped))
+
+
+class MaskExcludingPlaceholdersEdTests(unittest.TestCase):
+    """_mask_excluding_placeholders_ed 与 Edit 生成的契约测试。"""
+
+    def test_no_placeholder_simple_replace(self):
+        rx = re.compile(r"apple")
+        text, edits = tr._mask_excluding_placeholders_ed("one apple two apples", rx, lambda m: "{{FRUIT_abcdef}}")
+        self.assertEqual(text, "one {{FRUIT_abcdef}} two {{FRUIT_abcdef}}s")
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(edits[0], tr.Edit(4, 9, "{{FRUIT_abcdef}}"))
+        self.assertEqual(edits[1], tr.Edit(14, 19, "{{FRUIT_abcdef}}"))
+
+    def test_existing_placeholders_are_preserved_and_skipped(self):
+        rx = re.compile(r"\bcat\b")
+        inp = "a {{TERM_abcdef}} cat and a cat"
+        text, edits = tr._mask_excluding_placeholders_ed(inp, rx, lambda m: "{{ANIMAL_ghijkl}}")
+        self.assertEqual(text, "a {{TERM_abcdef}} {{ANIMAL_ghijkl}} and a {{ANIMAL_ghijkl}}")
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(edits[0], tr.Edit(18, 21, "{{ANIMAL_ghijkl}}"))
+        self.assertEqual(edits[1], tr.Edit(28, 31, "{{ANIMAL_ghijkl}}"))
+
+    def test_group_idx_partial_replace_captures_correct_span(self):
+        rx = re.compile(r"Bearer\s+([a-zA-Z0-9]+)")
+        def _sub(m):
+            gs, ge = m.span(1)
+            return m.group(0)[:gs - m.start()] + "{{KEY_abcdef}}" + m.group(0)[ge - m.start():]
+
+        inp = "header Bearer secret123 end"
+        text, edits = tr._mask_excluding_placeholders_ed(inp, rx, _sub, group_idx=1)
+        self.assertEqual(text, "header Bearer {{KEY_abcdef}} end")
+        self.assertEqual(len(edits), 1)
+        # Edit 必须精确覆盖 group 1 的 span [14, 23)，token 为 {{KEY_abcdef}}
+        self.assertEqual(edits[0], tr.Edit(14, 23, "{{KEY_abcdef}}"))
+
+    def test_no_match_returns_same_text_and_empty_edits(self):
+        rx = re.compile(r"nomatch")
+        inp = "nothing to see here"
+        text, edits = tr._mask_excluding_placeholders_ed(inp, rx, lambda m: "x")
+        self.assertEqual(text, inp)
+        self.assertEqual(edits, [])
+
+
 if __name__ == "__main__":
     unittest.main()

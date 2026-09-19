@@ -123,6 +123,19 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 - 测试样例中凭据形态的字符串必须一眼可见是伪造的（`sk-test-0000…`），真实上游 key 只能来自环境变量 `LLM_SHIELD_API_KEY`。
 - 新增任何对外网络请求必须默认关闭并登记到 `SECURITY.md` 出站清单。
 
+### 推送后必须回查 CI（本地绿 ≠ 推送后绿）
+
+本地门禁只覆盖「工作区里能被扫到的文件」。**实测事故（2026-09-19）**：`AUDIT-2026-09-19.md`
+带着一个 PEM 私钥头字面量被顺手纳入版本控制，本地门禁**全绿**（该文件当时还没 `git add`，
+而 `audit-public-release.py` 只扫 `git ls-files` 的输出 → 它看不见），推送后 CI 的 `version` job 直接红。
+
+- 只要动过「会被门禁扫到的文件」，**推送后必须回查 CI 结论**，不能拿本地结果收工。
+- **失败步骤名可能说谎**：`ci.yml` 的 `version` job 里那个步骤，`run` 块实际跑**两个**脚本
+  （`check-version.py` + `audit-public-release.py`），而步骤名只提了版本号一致性 ——
+  曾据此往「版本号不一致」的方向排查。看到失败先打开那个 `run` 块确认它到底跑了几件事。
+- 复核某个**已推送提交**的门禁状态，用 `git worktree add --detach <sha> <tmpdir>` 隔离复现，
+  不要切分支污染工作区；在隔离副本里可以放心地临时 `git add` 伪造凭据样本做反向验证。
+
 ---
 
 ## 5. 打包与发布规范
@@ -165,3 +178,44 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 - 打包产物位于：
   - Windows: `src-tauri\target\release\bundle\nsis\Maskit_<版本>_x64-setup.exe`；
   - macOS: `src-tauri/target/release/bundle/dmg/Maskit_<版本>_aarch64.dmg`。
+
+---
+
+## 6. 文档与产物的入库边界
+
+判据只有一条：**后来者 clone 下这个仓库，还需不需要它？**
+需要 → **项目资产**，入库；只服务本机某次会话 → **本机工作产物**，忽略。
+
+### 6.1 入库（项目资产）
+
+| 文件 | 为什么 |
+|---|---|
+| `README.md` / `README_EN.md` | 项目门面 |
+| `CONTRIBUTING.md` / `CODE_OF_CONDUCT.md` / `SECURITY.md` | 协作与安全契约 |
+| `CHANGELOG.md` | 发版日志（release 流水线从它切出 Release body） |
+| `AGENTS.md` / `CLAUDE.md` | **工程规范基准**。`CLAUDE.md` 只有一行 `@AGENTS.md`，是跨工具入口 —— 不入库则 red line 在克隆体上整体丢失 |
+| `docs/*.md` | 长期参考文档 |
+
+> **`DESIGN-*.md` 刻意不入库（项目决策，2026-09-19）**：设计文档确实说明「代码为什么长成
+> 这样」、否决了哪些方案，但它写于改动之前，落地时几乎必然与最终实现有偏差；一旦入库就会
+> 被后来者当成现状读，反而误导。**代码注释与测试才是当前事实**，设计文档留在本机做决策留档。
+
+### 6.2 忽略（本机工作产物）
+
+已在 `.gitignore`：`ai-coding/`（开发规格 / 交接 / 代码评审 / 会话证据）、
+`.claude/`、`.codex/`、`.pi/`、`.pi-subagents/`、`.workbuddy-ai/`、`.workbuddy/`、
+`.mcp.json`、`PROMOTION_GUIDE.md`、`AUDIT-*.md`、`DESIGN-*.md`、`HANDOVER.md`。
+
+**共同特征**：内容是「某次会话当下的判断」，生命周期比代码短，会随代码演进迅速过期。
+留在仓库里只会让后来者读到已经失效的结论。
+
+### 6.3 已经踩过的坑
+
+| 文件 | 事故 |
+|---|---|
+| `AUDIT-2026-09-19.md` | 被 `d4edbf6` 误纳入跟踪，文中 PEM 头部字面量把 CI 的 `version` job 打红。已 `git rm --cached` + 忽略 `AUDIT-*.md` |
+| `HANDOVER.md` | 会话交接文件（自带「接棒 AI 必读」「最后更新: <时间戳>」等字段）。**已 `git rm --cached` 出库**并加入忽略 |
+
+> ⚠️ **`.gitignore` 对已跟踪文件无效。** 要让规则生效必须先 `git rm --cached <file>`
+> （本地文件保留），否则 `git status` 会一直显示它、下次 `git add -A` 又原样带进仓库 ——
+> `d4edbf6` 就是这么发生的。**新增忽略规则时必须同时确认该文件是否已被跟踪。**

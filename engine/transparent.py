@@ -45,6 +45,7 @@ from credential_labels import CREDENTIAL_LABELS
 import audit_signals as _audit
 import base64
 import hashlib
+from typing import NamedTuple
 
 # 内置正则规则（敏感词字面在 config.json，正则规则固定，避免 UI 误改）
 ID_BOUND_L = r"(?<![A-Za-z0-9])"
@@ -2547,37 +2548,70 @@ def _lookup_by_suffix(token, sid):
     return _lookup(real, sid)
 
 
-def _mask_excluding_placeholders(text, rx, sub_fn):
-    """对 text 做正则替换，但跳过已有的占位符片段（防污染）。
+class Edit(NamedTuple):
+    """一次「原文 → 占位符」替换，坐标为**该次替换发生时**的文本坐标系。"""
+    start: int      # 闭
+    end: int        # 开
+    token: str      # 替换后的占位符（部分替换时仅为替换捕获组的占位符）
 
-    占位符格式 {{LABEL_后缀}}，后缀为 6 位纯辅音（存量兼容 hex6），自定义词里 2 字符的
-    hex 子串（如 'e3'）会把存量 hex6 占位符劈开 → 畸形占位符 → _PLACEHOLDER_RX 匹配
-    不到 → 还原永久失败。
-    不到 → 还原永久失败。修法：用 _PLACEHOLDER_RX 把文本切成「占位符 / 非占位符」
-    片段，只对非占位符片段做替换，占位符片段原样保留。
+
+def _mask_excluding_placeholders_ed(text, rx, sub_fn, group_idx=0):
+    """同 _mask_excluding_placeholders，额外返回本次替换产生的 Edit 列表。
+
+    Edit 坐标为**入参 text 的坐标系**（即本趟开始时的坐标系）。
+    对 text 做正则替换，但跳过已有的占位符片段（防污染）。
     """
     if not text:
-        return text
-    # 用 finditer 定位占位符位置，提取非占位符片段做替换，占位符原样拼接
+        return text, []
+
+    edits = []
     result = []
     last_end = 0
-    found_placeholder = False
+
+    def _process_chunk(chunk, base):
+        chunk_out = []
+        c_last = 0
+        for m in rx.finditer(chunk):
+            repl = sub_fn(m)
+            chunk_out.append(chunk[c_last:m.start()])
+            chunk_out.append(repl)
+            c_last = m.end()
+            if repl != m.group(0):
+                if group_idx == 0:
+                    edits.append(Edit(base + m.start(), base + m.end(), repl))
+                else:
+                    gs, ge = m.span(group_idx)
+                    prefix_len = gs - m.start()
+                    suffix_len = m.end() - ge
+                    tok = repl[prefix_len:len(repl) - suffix_len] if suffix_len else repl[prefix_len:]
+                    edits.append(Edit(base + gs, base + ge, tok))
+        chunk_out.append(chunk[c_last:])
+        return "".join(chunk_out)
+
     for m in _PLACEHOLDER_RX.finditer(text):
-        found_placeholder = True
-        # 占位符之前的非占位符片段：做替换
         before = text[last_end:m.start()]
-        result.append(rx.sub(sub_fn, before))
-        # 占位符本身：原样保留
+        if before:
+            result.append(_process_chunk(before, last_end))
         result.append(m.group())
         last_end = m.end()
-    # 尾部的非占位符片段
+
     tail = text[last_end:]
     if tail:
-        result.append(rx.sub(sub_fn, tail))
-    if not found_placeholder:
-        # 没有占位符，直接整体替换
-        return rx.sub(sub_fn, text)
-    return "".join(result)
+        result.append(_process_chunk(tail, last_end))
+
+    if not edits and last_end == 0:
+        return text, []
+
+    return "".join(result), edits
+
+
+def _mask_excluding_placeholders(text, rx, sub_fn, group_idx=0):
+    """对 text 做正则替换，但跳过已有的占位符片段（防污染）。
+
+    薄封装：转调 _mask_excluding_placeholders_ed 并丢弃 edits。
+    """
+    new_text, _ = _mask_excluding_placeholders_ed(text, rx, sub_fn, group_idx=group_idx)
+    return new_text
 
 
 # ── NER（语义实体识别）辅助 ───────────────────────────────────────────────────
@@ -2640,6 +2674,153 @@ def _mask_by_spans(text, spans):
     return "".join(out)
 
 
+class OffsetMap:
+    """由有序、互不重叠的 Edit 序列构造的单调坐标映射。
+
+    记录「存活区间」：src 上未被替换的区间 → 目标上的对应起点。
+    kept = [(src_start, src_end, dst_start), ...]，按 src_start 升序。
+    """
+
+    def __init__(self, edits=None, src_len=0, kept=None, dst_len=None):
+        self.src_len = src_len
+        if kept is not None:
+            self.kept = kept
+            self.dst_len = dst_len if dst_len is not None else (
+                kept[-1][2] + (kept[-1][1] - kept[-1][0]) if kept else 0
+            )
+            self.edits = edits or []
+            return
+
+        self.edits = sorted(edits, key=lambda x: x[0]) if edits else []
+        kept = []
+        cs = cd = 0
+        for s, e, tok in self.edits:
+            if s > cs:
+                kept.append((cs, s, cd))
+                cd += s - cs
+            cd += len(tok)
+            cs = e
+        if cs < src_len:
+            kept.append((cs, src_len, cd))
+            cd += src_len - cs
+        self.kept = kept
+        self.dst_len = cd
+
+    def _seg_of(self, i):
+        """返回包含 i 的存活区间下标；i 落在被替换区间内则返回 None。"""
+        lo, hi = 0, len(self.kept) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            a, b, d = self.kept[mid]
+            if i < a:
+                hi = mid - 1
+            elif i >= b:
+                lo = mid + 1
+            else:
+                return mid
+        return None
+
+    def map_point(self, i):
+        """i 落在存活区间内 → 返回目标坐标；落在被替换区间内 → 返回 None。"""
+        seg = self._seg_of(i)
+        if seg is None:
+            return None
+        a, b, d = self.kept[seg]
+        return d + (i - a)
+
+    def map_range(self, s, e):
+        """区间映射：两端向内收敛到最近的可定位点。
+
+        起点落在替换区间内 → 向右找到下一个存活区间的起点；
+        终点落在替换区间内 → 向左找到上一个存活区间的终点。
+        收敛后 s2 >= e2 表示该区间已被完全吃掉 → 返回 None。
+        """
+        if s >= e:
+            return None
+        # 起点：第一个 >= s 的存活字符
+        lo, hi = 0, len(self.kept) - 1
+        seg_s = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            a, b, d = self.kept[mid]
+            if b <= s:
+                lo = mid + 1
+            elif a >= e:
+                hi = mid - 1
+            else:
+                seg_s = mid
+                hi = mid - 1
+        if seg_s is None:
+            return None
+        a, b, d = self.kept[seg_s]
+        s2 = d + (max(s, a) - a)
+
+        # 终点：最后一个 < e 的存活字符
+        lo, hi = 0, len(self.kept) - 1
+        seg_e = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            a, b, d = self.kept[mid]
+            if a >= e:
+                hi = mid - 1
+            elif b <= s:
+                lo = mid + 1
+            else:
+                seg_e = mid
+                lo = mid + 1
+        if seg_e is None:
+            return None
+        a, b, d = self.kept[seg_e]
+        e2 = d + (min(e, b) - a)
+        if e2 <= s2:
+            return None
+        return s2, e2
+
+    def compose(self, next_om):
+        """合成 self (src->mid) 与 next_om (mid->dst)，返回总映射 (src->dst)。
+
+        双指针扫描两者的存活区间交集，时间复杂度 O(len(self.kept) + len(next_om.kept))。
+        """
+        if self.dst_len != next_om.src_len:
+            raise ValueError(f"OffsetMap 尺寸不匹配无法合成: {self.dst_len} vs {next_om.src_len}")
+        kept1 = self.kept
+        kept2 = next_om.kept
+        new_kept = []
+        i1 = i2 = 0
+        while i1 < len(kept1) and i2 < len(kept2):
+            s0, e0, d1 = kept1[i1]
+            t1_start = d1
+            t1_end = d1 + (e0 - s0)
+
+            s1, e1, d2 = kept2[i2]
+            t2_in_start = s1
+            t2_in_end = e1
+
+            inter_s = max(t1_start, t2_in_start)
+            inter_e = min(t1_end, t2_in_end)
+
+            if inter_s < inter_e:
+                new_s0 = s0 + (inter_s - t1_start)
+                new_e0 = s0 + (inter_e - t1_start)
+                new_d2 = d2 + (inter_s - t2_in_start)
+                new_kept.append((new_s0, new_e0, new_d2))
+
+            if t1_end < t2_in_end:
+                i1 += 1
+            elif t2_in_end < t1_end:
+                i2 += 1
+            else:
+                i1 += 1
+                i2 += 1
+
+        return OffsetMap(src_len=self.src_len, kept=new_kept, dst_len=next_om.dst_len)
+
+    @classmethod
+    def empty(cls, length):
+        """构造恒等映射（无任何编辑）。"""
+        return cls([], length)
+
+
 def _ner_entity_spans(text, entities):
     """把 NER 实体转成可安全替换的区间列表 [(start, end, label), ...]。
 
@@ -2687,6 +2868,8 @@ def mask(text, sid):
     """
     if not text:
         return text
+    original = text
+    om = OffsetMap.empty(len(original)) if NER_ENABLED else None
     s = sessions.get(sid)
     if s is None:
         _new_session(sid)
@@ -2717,7 +2900,10 @@ def mask(text, sid):
                 _hit(orig)
                 return fwd.get(orig, orig)
             # 跳过已有占位符片段（防污染：多轮对话历史里带旧占位符）
-            text = _mask_excluding_placeholders(text, prefix_rx, _prefix_sub)
+            curr_len = len(text)
+            text, edits = _mask_excluding_placeholders_ed(text, prefix_rx, _prefix_sub)
+            if om is not None and edits:
+                om = om.compose(OffsetMap(edits, curr_len))
 
     cw_rx = _custom_combined_regex()
     if cw_rx:
@@ -2733,7 +2919,10 @@ def mask(text, sid):
             orig_key = next((k for k in CUSTOM_WORDS if k.lower() == word.lower()), word)
             _hit(orig_key, label)
             return fwd.get(orig_key, word)
-        text = _mask_excluding_placeholders(text, cw_rx, _cw_sub)
+        curr_len = len(text)
+        text, edits = _mask_excluding_placeholders_ed(text, cw_rx, _cw_sub)
+        if om is not None and edits:
+            om = om.compose(OffsetMap(edits, curr_len))
 
     # 被豁免的连接串**区间** [start, end)（end 即 userinfo 结尾的 `@` 之后）：
     # RULES 里 CONNSTR 排在 EMAIL 之前，本列表用于让 EMAIL 避开与这些区间重叠的
@@ -2800,11 +2989,15 @@ def mask(text, sid):
                     gs, ge = m.span(group_idx)
                     return m.group(0)[:gs - m.start()] + repl_map[orig] + m.group(0)[ge - m.start():]
                 return m.group(0)
-            text = _mask_excluding_placeholders(text, rx, _rule_sub)
+            curr_len = len(text)
+            text, edits = _mask_excluding_placeholders_ed(text, rx, _rule_sub, group_idx=group_idx)
+            if om is not None and edits:
+                om = om.compose(OffsetMap(edits, curr_len))
 
     # ── AI 实体识别（NER）：人名 (NAME) / 机构 (ORG) / 详细地址 (ADDR) ──
     # 排在全部确定性规则之后：同一原文以规则/自定义词为准，语义模型只补规则覆盖不到
-    # 的自由文本。按区间替换的实现与边界见 _ner_entity_spans。
+    # 的自由文本。模型在干净的 original 上抽取上下文，抽出的区间经 om.map_range
+    # 翻译至伤疤文本坐标系，再由 _ner_entity_spans 按占位符切分（详见 DESIGN-v1.1-span-refactor.md §7.3）。
     if NER_ENABLED:
         try:
             import ner_engine
@@ -2813,9 +3006,29 @@ def mask(text, sid):
                                "NER 已开启但模型文件不可用（%s），本次未做实体识别"
                                % ner_engine.status().get("model_dir"))
             else:
-                entities = ner_engine.extract_entities(text)
+                entities = ner_engine.extract_entities(original)
+                translated_entities = []
+                for ent in entities:
+                    if not isinstance(ent, dict):
+                        continue
+                    try:
+                        s_orig = int(ent["start"])
+                        e_orig = int(ent["end"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    lbl = str(ent.get("type") or "TERM")
+                    if e_orig - s_orig < 2 or s_orig < 0 or e_orig > len(original):
+                        continue
+                    mapped_range = om.map_range(s_orig, e_orig) if om is not None else (s_orig, e_orig)
+                    if mapped_range is None:
+                        continue
+                    s2, e2 = mapped_range
+                    if e2 - s2 < 2:
+                        continue
+                    translated_entities.append({"start": s2, "end": e2, "type": lbl})
+
                 planned = []
-                for s0, e0, lbl in _ner_entity_spans(text, entities):
+                for s0, e0, lbl in _ner_entity_spans(text, translated_entities):
                     raw_frag = text[s0:e0]
                     frag = raw_frag.strip()
                     if len(frag) < 2:
@@ -2823,6 +3036,9 @@ def mask(text, sid):
                     # 实体区间两端可能带空白，收窄到 strip 后的边界，
                     # 免得把空格/换行一起换成占位符（还原后会丢排版）。
                     lead = len(raw_frag) - len(raw_frag.lstrip())
+                    # 记账口径说明（易错，必须保留）：_hit() 必须传伤疤坐标系的残片 frag，
+                    # 绝不能传原文实体。因为 restore() 会把占位符换回 fwd[TOKEN]，
+                    # 出网文本在该位置只剩残片，注册成完整原文会导致还原时把占位符覆盖的部分重复吐出。
                     _hit(frag, lbl)
                     token = fwd.get(frag)
                     if token:
