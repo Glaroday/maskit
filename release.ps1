@@ -55,6 +55,34 @@ git pull origin $currentBranch
 Assert-LastExit "git pull origin $currentBranch（请先手动处理冲突或网络问题）"
 Write-Host "远程分支已同步。" -ForegroundColor Green
 
+# 2.5 模型就绪前置检查 (Model Preflight Check)
+$nerDir = Join-Path $Root "engine\models\ner_mini_zh"
+$nerFiles = @("model_quantized.onnx", "tokenizer.json", "config.json")
+$nerMissing = $nerFiles | Where-Object { -not (Test-Path (Join-Path $nerDir $_)) }
+if ($nerMissing.Count -eq 0) {
+    $onnxSize = (Get-Item (Join-Path $nerDir "model_quantized.onnx")).Length
+    if ($onnxSize -gt 50MB) {
+        Write-Host "✓ NER 本地语义模型检查通过 ($([math]::Round($onnxSize/1MB, 1))MB)，将构建【全功能一体化发布包 (All-in-One)】" -ForegroundColor Green
+    } else {
+        Write-Warning "⚠️ engine\models\ner_mini_zh\model_quantized.onnx 体积过小 ($([math]::Round($onnxSize/1MB, 1))MB < 50MB)，文件可能损坏！"
+        if (-not $Yes) {
+            $confirm = Read-Host "模型可能损坏，是否仍要继续？[y/N]"
+            if ($confirm -notmatch '^[Yy]$') { exit 1 }
+        }
+    }
+} else {
+    Write-Host ""
+    Write-Warning "⚠️ 未检测到完整的 NER 本地语义模型（缺 $($nerMissing -join ', ')）！"
+    Write-Host "v0.3.0+ 核心特性包含 NER 实体识别。缺少模型将导致本次发布包退化为【轻量规则包】。" -ForegroundColor Yellow
+    if (-not $Yes) {
+        $confirm = Read-Host "确定要继续以【轻量规则包（不含 NER 模型）】发版吗？[y/N]"
+        if ($confirm -notmatch '^[Yy]$') {
+            Write-Host "已取消发版。请将模型三件套放置于 engine\models\ner_mini_zh\ 后重试。" -ForegroundColor Yellow
+            exit 0
+        }
+    }
+}
+
 # 3. 执行核心构建 (build.ps1 -ReleaseOnly)
 Write-Host "`n[2/4] 调用 build.ps1 执行打包与四道门禁验证..." -ForegroundColor Cyan
 $buildArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $Root "build.ps1"), "-ReleaseOnly")
@@ -76,6 +104,13 @@ $targetVer = $verLine.Matches[0].Groups[1].Value
 $tag = "v$targetVer"
 
 Write-Host "`n[3/4] 构建成功！目标版本: $targetVer (Tag: $tag)" -ForegroundColor Green
+
+$nsisPath = "src-tauri\target\release\bundle\nsis\Maskit_${targetVer}_x64-setup.exe"
+if (Test-Path $nsisPath) {
+    $nsisSize = [math]::Round((Get-Item $nsisPath).Length / 1MB, 1)
+    $pkgType = if ($nsisSize -gt 60) { "全功能一体包 (All-in-One)" } else { "轻量规则包" }
+    Write-Host "安装包产物: $nsisPath ($nsisSize MB) [$pkgType]" -ForegroundColor Cyan
+}
 
 if ($BuildOnly) {
     Write-Host "`n已指定 -BuildOnly，跳过 Git 提交与远程推送。" -ForegroundColor Yellow

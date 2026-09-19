@@ -2758,8 +2758,10 @@ def _start_proxy_locked():
         else:
             # POSIX sidecar 建立独立 session，停止时可连同其可能拉起的子进程一起回收。
             extra_kwargs["start_new_session"] = True
+        # Python 3.13 下二进制模式（未启用 text=True）传 bufsize=1 会触发
+        # RuntimeWarning: line buffering (buffering=1) isn't supported in binary mode。
+        # 此处省略 bufsize（使用默认缓冲），_reader 依然通过 stream.readline() 按行流式读取。
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             bufsize=1,
                              env=child_env,
                              **extra_kwargs)
     except FileNotFoundError:

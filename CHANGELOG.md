@@ -37,6 +37,8 @@
   *The browser extension now ships as its own release asset, `Maskit_<version>_extension.zip`: it is not inside the desktop installer, so web-app users without the source tree had nowhere to get it — now they download, unzip and load it from `chrome://extensions`.*
 
 ### 修复 / Bug Fixes
+- 引擎：消除 Python 3.13 下子进程 `bufsize=1` 二进制模式运行告警，发版脚本增加一体包模型完整性自检与前置门禁。
+  *Engine: eliminate Python 3.13 RuntimeWarning on subprocess `bufsize=1` in binary mode; add all-in-one bundle preflight gates to release scripts.*
 - 脱敏：NER 在经规则替换后的文本上识别实体会导致上下文被截断、实体残片明文泄漏（如「西城区」被打码后，其后的「网点营业厅」失去前序上下文漏打码）；现改为在干净原文上抽取实体，经 OffsetMap 坐标单调映射回伤疤文本，并在映射失败时安全降级跳过 NER、绝不混用原文与伤疤坐标系，同起点实体按长区间贪心优先。
   *Masking: running NER on text already mutated by deterministic rules truncated entity context and leaked entity fragments in plaintext (e.g. masking "Xicheng District" caused following "branch office" to lose its context and go unmasked); entities are now extracted from the clean original and translated back via a monotonic OffsetMap, with graceful degradation skipping NER on mapping errors without cross-coordinate mixing, and greedy longest-span selection for identical starts.*
 - 脱敏：数值型敏感值、敏感值当 JSON 键名、重复键三条路径既不命中也不抛异常，于是「零改写」分支把客户端原始字节原样放行——明文出网，而 fail-closed 只兜异常、兜不住「静默判定为无需改写」。三条现全部覆盖；协议字段、工具名与 JSON Schema 骨架按白名单保持原样。

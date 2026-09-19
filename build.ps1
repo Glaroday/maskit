@@ -238,6 +238,7 @@ Write-Host "测试解释器: $pyTest" -ForegroundColor DarkGray
 # 死在这里——连 Restore-Version 都跑不到，版本号停在半路（2026-08-16 实测）。
 # 成败一律只看 $LASTEXITCODE。
 $env:MASKIT_PYTHON = $pyTest
+$env:CODEBUDDY_SAFE_DELETE_ENABLED = "0"
 Write-Host "全量门禁（scripts/verify-all.py，与 CI 一致）..." -ForegroundColor Cyan
 $oldEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
@@ -267,7 +268,15 @@ Get-ChildItem -Path "engine" -Include "*.sqlite3*", "*.jsonl", "config.json", "c
 # 这是最难排查的一类「打包态漂移」。只告警不终止：不带模型打包是合法选项。
 $nerMissing = @("model_quantized.onnx", "tokenizer.json", "config.json") | Where-Object { -not (Test-Path (Join-Path "engine\models\ner_mini_zh" $_)) }
 if ($nerMissing.Count -gt 0) {
-    Write-Host ("警告：NER 模型不完整（缺 " + ($nerMissing -join "、") + "），本次打包不含语义实体识别") -ForegroundColor Yellow
+    Write-Host ("警告：NER 模型不完整（缺 " + ($nerMissing -join "、") + "），本次打包不含语义实体识别 [轻量规则包]") -ForegroundColor Yellow
+} else {
+    $onnxPath = "engine\models\ner_mini_zh\model_quantized.onnx"
+    $onnxSize = (Get-Item $onnxPath).Length
+    if ($onnxSize -lt 50MB) {
+        Write-Host "警告：$onnxPath 体积异常 ($([math]::Round($onnxSize/1MB, 1))MB < 50MB)，可能是损坏文件或未拉取的指针文件！" -ForegroundColor Red
+    } else {
+        Write-Host "✓ NER 本地语义模型已就绪 ($([math]::Round($onnxSize/1MB, 1))MB)，本次将构建【全功能一体化安装包 (All-in-One)】" -ForegroundColor Green
+    }
 }
 if (Test-Path "dist_engine") { Remove-Item -Recurse -Force "dist_engine" }
 if (Test-Path "build_engine") { Remove-Item -Recurse -Force "build_engine" }
@@ -300,6 +309,15 @@ if (-not (Test-Path "$srcEngine\MaskitEngine.exe") -or $srcCount -lt 100) {
     Restore-Version; Write-Error "打包源目录引擎同步失败（$srcCount 文件）"; exit 1
 }
 Write-Host "打包源目录引擎已同步: $srcCount 文件" -ForegroundColor Yellow
+
+# 验证模型是否成功同步进打包源目录
+$syncedModel = "$srcEngine\_internal\models\ner_mini_zh\model_quantized.onnx"
+if (Test-Path $syncedModel) {
+    $syncedSize = [math]::Round((Get-Item $syncedModel).Length / 1MB, 1)
+    Write-Host "✓ NER 语义模型已成功同步至打包源目录 ($syncedSize MB) [全功能一体包就绪]" -ForegroundColor Green
+} else {
+    Write-Host "提示：打包源目录不含 NER 模型 [轻量规则包]" -ForegroundColor DarkGray
+}
 
 # 6. Tauri bundle（尝试构建，exe 文件锁时才杀进程——打包红线：构建不碰运行进程）
 Write-Host "Tauri 打包（先尝试不杀进程）..." -ForegroundColor Cyan
