@@ -1,7 +1,7 @@
 # ==========================================
-# 阶段 1: 前端静态资源构建
+# 阶段 1: 前端静态资源构建（在原生构建架构上执行，避免 QEMU 模拟导致死锁或极度降频）
 # ==========================================
-FROM node:20-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
 WORKDIR /build/frontend
 
 COPY frontend/package*.json ./

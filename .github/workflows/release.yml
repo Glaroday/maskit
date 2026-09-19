@@ -344,7 +344,8 @@ jobs:
 
   release-draft:
     name: GitHub Release draft
-    needs: [docker, desktop, extension]
+    # 桌面端与扩展产物就绪即可直接发布，不被 Docker 多架构镜像构建阻塞
+    needs: [desktop, extension]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
