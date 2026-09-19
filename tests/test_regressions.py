@@ -629,10 +629,13 @@ class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
     def test_all_protocol_top_keys_pass_the_key_scanner(self):
         """键名扫描的**广谱**反向锁：`PROTOCOL_TOP_KEYS` 里一个都不许被改名。
 
-        默认词表下这些键名现在都不命中（实测 105 个全过），但**白名单没覆盖其中 61 个**
+        默认词表下这些键名都不命中，**白名单现已全量覆盖**（`PROTOCOL_TOP_KEYS` ⊆
+        `_MASK_PROTECTED_KEY_NAMES`，由下面那条用例强制）。补白名单前曾有 38 个漏网
         （`temperature` / `max_tokens` / `api_key` / `authorization` …）—— 也就是说
-        只要用户的自定义词表里出现同名或同形词，它们就会被写成占位符、上游直接 400。
-        这条用例的作用是把「默认词表恰好不命中」这个巧合变成**被监控的**性质：
+        只要用户的自定义词表里出现同名或同形词、或语义模型对该键名产生误判，
+        它们就会被写成占位符、上游直接 400（**整站 API 调用全挂**）。
+
+        这条用例把「默认词表恰好不命中」这个巧合变成**被监控的**性质：
         一旦有人往默认规则里加词命中这些键名，这里立刻红，而不是等用户报「网页 AI 全挂」。
         """
         for k in self.PROTOCOL_TOP_KEYS:
@@ -643,6 +646,27 @@ class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
             })
             self.assertIn(k, obj,
                           f"协议顶层键 {k!r} 被改名成了 {[x for x in obj if x != 'model' and x != 'messages']}")
+
+    def test_whitelist_covers_every_protocol_top_key(self):
+        """白名单必须**结构上**覆盖全部协议顶层键，而不是靠「默认词表恰好不命中」。
+
+        【为什么必须单独立一条】上面那条用例只证明「当前默认规则不命中」——
+        它挡不住「用户自定义词表里恰好有 `temperature`」或「语义模型把某个键名
+        误判成 PERSON」这两条路径：那两条一旦发生，键名就会被改名、上游 400，
+        而上面的用例**依然绿**（因为默认词表确实没命中）。
+
+        唯一能一次性封死这个类别的是**白名单本身**：进了白名单的键名根本不进
+        `mask()`，任何词表/模型都不可能改到它。所以这里直接对集合做包含断言，
+        把「漏了哪个键」变成编译期般的确定性事实。
+
+        ⚠️ 实测教训：单字母键 `n`（OpenAI 生成候选数）在批量补白名单时被漏掉过。
+        集合断言能自动抓住这类遗漏，人工逐条比对不能。
+        """
+        missing = sorted(set(self.PROTOCOL_TOP_KEYS) - set(tr._MASK_PROTECTED_KEY_NAMES))
+        self.assertEqual(
+            missing, [],
+            "以下协议顶层键不在 _MASK_PROTECTED_KEY_NAMES 里 —— 它们仍会被键名扫描改名，"
+            f"上游会直接 400：{missing}")
 
     def test_list_root_wrapper_key_is_never_renamed(self):
         """非对象根会被包成 `{__shield_root__: [...]}`，包装键**绝不能**被脱敏。
@@ -7082,3 +7106,120 @@ class CustomWordSuffixCollisionTests(unittest.TestCase):
         self.assertIn(tr._CUSTOM_WORD_FWD[word], masked, "新词必须正常打码")
         self.assertEqual(tr.restore(masked, sid2, final=True), f"这里出现{word}一次")
 
+
+
+_NER_READY_CACHE = None
+
+
+def _ner_ready():
+    """本地 NER 模型 + 依赖是否可用（供 skipUnless 用，与 test_shield 同口径）。"""
+    global _NER_READY_CACHE
+    if _NER_READY_CACHE is None:
+        try:
+            import ner_engine
+            _NER_READY_CACHE = bool(ner_engine.is_ner_available() and ner_engine._init_ner())
+        except Exception:
+            _NER_READY_CACHE = False
+    return _NER_READY_CACHE
+
+
+class NerPriorityContractTests(unittest.TestCase):
+    """语义模型（NER）与确定性层之间的**优先级契约**。
+
+    【为什么必须单独锁】`transparent.py` 的 NER 段注释写明「必须排在确定性规则之后跑，
+    同一原文以确定性命中为准」，另一处又写「以规则/自定义词为准」——
+    即 **自定义词与内置规则同属确定性优先层**，概率模型只补它们覆盖不到的自由文本。
+
+    这条契约此前**没有任何用例覆盖**，而它恰恰是最容易被改坏的：
+    「让 NER 先跑，好让它吃到干净原文」是个非常自然的想法（本地 NER 的漏检确实
+    源于此，见下面那条 expectedFailure），但一旦照做，确定性层就失去优先级 ——
+    实测模型会把紧随地址的 19 位卡号吸附进 ADDR 实体
+    （`上海市浦东新区世纪大道100号6222021234567890123` → ADDR span 跨到卡号里），
+    而 `ner_engine.py:437` 的注释自己就写了「连续数字串靠结构化规则先跑才安全」。
+
+    → 任何 span 化重构都必须让本类三条断言保持全绿。
+    """
+
+    def setUp(self):
+        self._old_ner = tr.NER_ENABLED
+        self._old_rules = tr.BUILTIN_RULES
+        self._old_words = dict(tr.CUSTOM_WORDS)
+        tr.NER_ENABLED = True
+        tr.BUILTIN_RULES = dict(tr.DEFAULT_BUILTIN_RULES)
+
+    def tearDown(self):
+        tr.NER_ENABLED = self._old_ner
+        tr.BUILTIN_RULES = self._old_rules
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update(self._old_words)
+        tr._refresh_custom_words_sorted()
+
+    def _set_words(self, words):
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update(words)
+        tr._refresh_custom_words_sorted()
+
+    @unittest.skipUnless(_ner_ready(), "本地 NER 模型/依赖不可用，跳过")
+    def test_custom_word_label_outranks_ner_label(self):
+        """自定义词的标签必须压过 NER：同一段文本以用户的显式词表为准。
+
+        实测 `张三在北京工作` + 自定义词 `张三→VIP`：模型认得这是 NAME，
+        但输出必须是 `{{VIP_..}}` —— 用户显式指定的分类不能被模型改掉。
+
+        ⚠️ 这条断言**本身鉴别力有限**，别只靠它：`_remember` 会复用自定义词的
+        常驻 token（`_CUSTOM_WORD_FWD`），所以即使自定义词替换那一步被整段跳过、
+        由 NER 命中，拿到的**仍是**自定义标签。负向对照实测过：把
+        `_custom_combined_regex` 打回 None，本断言照样绿。
+        真正证明「自定义词那条路确实在跑」的是下面那条 `ACME_PROJ_X`。
+        """
+        self._set_words({"张三": "VIP"})
+        out = tr.mask("张三在北京工作", "prio-cw")
+        self.assertIn("{{VIP_", out, "自定义词必须拿到自己的标签")
+        self.assertNotIn("{{NAME_", out, "NER 不许抢走自定义词已命中的原文")
+
+    @unittest.skipUnless(_ner_ready(), "本地 NER 模型/依赖不可用，跳过")
+    def test_custom_word_only_term_is_still_masked(self):
+        """NER 认不出的自定义词也必须被打码 —— 这条才是自定义词通路的判据。
+
+        用 `ACME_PROJ_X` 这类**模型绝不会识别的内部代号**：如果自定义词替换被
+        跳过/降级（例如为了「让 NER 吃干净原文」而把自定义词挪到 NER 之后），
+        它就原样出网。上面那条 `张三` 用例发现不了这种退化（token 复用会掩盖），
+        这条可以。
+        """
+        self._set_words({"ACME_PROJ_X": "内部代号"})
+        out = tr.mask("代号 ACME_PROJ_X 已上线", "prio-cw-only")
+        self.assertNotIn("ACME_PROJ_X", out, "自定义词必须独立于语义模型生效")
+
+    @unittest.skipUnless(_ner_ready(), "本地 NER 模型/依赖不可用，跳过")
+    def test_builtin_rule_outranks_ner(self):
+        """内置规则必须压过 NER：地址里的手机号按 PHONE 打码，不被 ADDR 吞掉。"""
+        self._set_words({})
+        out = tr.mask("北京市朝阳区建国路88号，电话13800138000", "prio-rule")
+        self.assertIn("{{PHONE_", out, "手机号必须按 PHONE 打码")
+        self.assertNotIn("13800138000", out, "手机号绝不许明文残留")
+
+    @unittest.skipUnless(_ner_ready(), "本地 NER 模型/依赖不可用，跳过")
+    @unittest.expectedFailure
+    def test_ner_context_survives_earlier_substitution(self):
+        """**已知缺陷**（v1.1 span 化重构的目标）：确定性层就地替换把文本切成
+        「伤疤文本」，NER 因此丢掉上下文，实体残片明文漏出。
+
+        实测 `北京市西城区网点营业厅已关闭` + 自定义词「西城区」→
+        输出 `北京市{{TERM_..}}网点营业厅已关闭`，**`网点营业厅` 明文残留**
+        （洁净原文上模型本可识别出 ORG `市西城区网点营业厅`）。
+
+        触发条件（实测界定，别扩大化）：规则/自定义词命中实体**中间**，
+        且切完的残片模型不再认得。反例：「自定义词命中机构名中间」
+        「内置规则命中地址内数字」**都不漏**（模型把实体切成两段，两段都打码）。
+        严重度：**部分实体泄漏**（地址/机构名的前缀或后缀），
+        **不是**手机号/卡号明文出网 —— 确定性规则永远先跑且优先，那一路是安全的。
+
+        为什么用 expectedFailure 而不是顺手修：唯一**不破坏上面两条优先级契约**的
+        修法是「原文只读 + 全量抽 span + 优先级消解 + 单次原子替换」，
+        属核心 `mask()` 重构（v1.1 里程碑）。修好后本用例会变成
+        **unexpected success**，届时删掉这个装饰器即可 —— 它会自己提醒。
+        """
+        self._set_words({"西城区": "区划"})
+        out = tr.mask("北京市西城区网点营业厅已关闭", "ner-ctx")
+        self.assertNotIn("网点营业厅", out,
+                         "确定性层替换后，语义模型仍应能保护机构名残片")

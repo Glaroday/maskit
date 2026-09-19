@@ -3223,7 +3223,9 @@ _MASK_PROTECTED_KEY_NAMES = frozenset(
         # 缓存 / 计费 / 诊断指令
         "cache_control", "ttl", "ephemeral",
         # 对话协议顶级控制参数（涵盖各大模型标准字段，对齐 PROTOCOL_TOP_KEYS）
-        "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens",
+        # ⚠️ 这一组是**协议骨架**，被改名等于上游 400。别漏 `n`（OpenAI 的
+        # `n` = 生成几条候选，单字母键最容易在补白名单时被漏掉）。
+        "temperature", "top_p", "top_k", "n", "max_tokens", "max_completion_tokens",
         "max_output_tokens", "presence_penalty", "frequency_penalty", "seed",
         "logprobs", "top_logprobs", "modalities", "audio", "prediction", "store",
         "service_tier", "reasoning", "reasoning_effort", "thinking_budget",

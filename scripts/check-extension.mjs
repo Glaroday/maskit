@@ -403,6 +403,30 @@ if (/async function handleRestore/.test(bg)) {
   }
 }
 
+// ── mask / mask_file 调用点必须判 blocking ───────────────────────────────────
+// 写方向（明文 → 上游）的失败语义与读方向**相反**，绝不能靠「失败就直通」兜：
+// 直通的代价是未脱敏原文出网。
+//
+// 实测漏过一次（2026-09-19）：maskMultipart 的文本分支有 `if (r && r.blocking)`，
+// 而同函数的 OOXML 分支漏了 —— 引擎 413/503 返回 blocking:true 时 `r.ok` 假，
+// 代码落到 `if (!replaced)`，**把未脱敏的原文档照原样打包上行**，popup 还按
+// 「直通」口径提示。附件是用户主动上传的完整文档，漏脱敏后果比文本链路严重。
+//
+// restore **故意不检查**：还原失败时 `r.ok` 假 → 透传原文（仍是占位符形态），
+// 用户看到 `{{PHONE_x}}` 而不是明文 —— 降级方向安全。别把它也加进来，
+// 那只会让页面在引擎抖动时整块报错。
+const maskSites = [...mainSrc.matchAll(/bridge\.call\(\s*'(mask|mask_file)'/g)]
+if (!maskSites.length) {
+  fail("bridge-main.js 里找不到 bridge.call('mask'/'mask_file') 调用点 —— 写方向链路缺失")
+} else {
+  for (const site of maskSites) {
+    if (!/\bblocking\b/.test(mainSrc.slice(site.index, site.index + 600))) {
+      fail(`bridge-main.js 的 ${site[1]} 调用点没判 blocking —— 引擎 413/503 时会把` +
+        '未脱敏原文（或原文档）直接放行出网，违背 fail-closed 红线')
+    }
+  }
+}
+
 // ── 结论 ────────────────────────────────────────────────────────────────────
 for (const n of notes) console.log(`check-extension:      ${n}`)
 if (errors.length) {
