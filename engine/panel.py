@@ -5746,15 +5746,17 @@ def api_ext_mask():
             # 这两个字段是**客户端原始请求体**，`items` 里凭据类只有 digest+preview，
             # 但同一行 payload 的 dialog 会把 API Key 原文一起写进 SQLite ——
             # 违反 AGENTS 约束 6「凭据类永远无法从 SQLite 回溯」。
-            # 代理链路在 transparent.py 的 _emit 前一直有这道清洗，扩展链路漏了。
+            # 必须先在完整 text 上执行双重凭据清洗（会话已知凭据 + 形态正则），再做长度截断；
+            # 严禁先截断再清洗，否则跨越 4000/800 边界的凭据会因正则特征破损而留下半截明文残片。
             # 清洗只针对**凭据形态**：普通 PII（手机号/身份证/姓名）的原文照旧保留，
             # 详情弹窗的「脱敏 ↔ 原文」对照能力不受影响。
+            scrubbed_dialog = tr._redact_credentials(tr._redact_session_credentials(text, s))
             tr._emit("MASK", ingress="ext", sid=sid,
                      count=hit_count,
                      new_count=len(s.get("new_orig") or set()),
                      items=items, host=str(data.get("host") or ""), path="/ext/mask",
-                     dialog=tr._redact_credentials(text[:4000]),
-                     req_preview=tr._redact_credentials(text[:800]),
+                     dialog=scrubbed_dialog[:4000],
+                     req_preview=scrubbed_dialog[:800],
                      mask_ms=round((time.perf_counter() - t0) * 1000, 1))
         return jsonify({"ok": True, "masked_text": masked, "sid": sid})
     except Exception as e:
@@ -5785,6 +5787,15 @@ def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
     in_buf = io.BytesIO(raw_bytes)
     if not zipfile.is_zipfile(in_buf):
         return raw_bytes, 0
+
+    # 解压体积上限防线：防止恶意构造的 Zip Bomb 导致解压内存爆满 (OOM)
+    _MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024  # 64MB
+    in_buf.seek(0)
+    with zipfile.ZipFile(in_buf, "r") as test_zin:
+        total_uncompressed = sum(item.file_size for item in test_zin.infolist())
+        if total_uncompressed > _MAX_TOTAL_UNCOMPRESSED:
+            _emit_log(f"[panel] Office 文档解压体积超限 ({total_uncompressed} > {_MAX_TOTAL_UNCOMPRESSED})，跳过内部脱敏")
+            return raw_bytes, 0
 
     out_buf = io.BytesIO()
     total_hits = 0

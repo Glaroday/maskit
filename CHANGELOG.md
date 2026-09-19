@@ -496,7 +496,16 @@ Release v0.2.6: Fix CI unit test deadlock, credential header clobbering (401 err
 - Docker 镜像（amd64 / arm64）内嵌 Web 控制台，远程访问需 `MASKIT_PANEL_TOKEN`。
 - 中英文界面一键切换、深浅主题。
 
-[Unreleased]: https://github.com/xiaYuTian11/maskit/compare/v0.2.3...HEAD
+[0.3.0]: https://github.com/xiaYuTian11/maskit/compare/v0.2.12...v0.3.0
+[0.2.12]: https://github.com/xiaYuTian11/maskit/compare/v0.2.11...v0.2.12
+[0.2.11]: https://github.com/xiaYuTian11/maskit/compare/v0.2.10...v0.2.11
+[0.2.10]: https://github.com/xiaYuTian11/maskit/compare/v0.2.9...v0.2.10
+[0.2.9]: https://github.com/xiaYuTian11/maskit/compare/v0.2.8...v0.2.9
+[0.2.8]: https://github.com/xiaYuTian11/maskit/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/xiaYuTian11/maskit/compare/v0.2.6...v0.2.7
+[0.2.6]: https://github.com/xiaYuTian11/maskit/compare/v0.2.5...v0.2.6
+[0.2.5]: https://github.com/xiaYuTian11/maskit/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/xiaYuTian11/maskit/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/xiaYuTian11/maskit/releases/tag/v0.2.3
 [0.2.2]: https://github.com/xiaYuTian11/maskit/releases/tag/v0.2.2
 [0.2.1]: https://github.com/xiaYuTian11/maskit/releases/tag/v0.2.1

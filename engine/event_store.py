@@ -399,8 +399,9 @@ def _update_stats(conn, rec, replay=False):
             #   关：只存打码 preview，库里永不出现明文。
             # 与 /api/logs 的 slim 红线不冲突——那条约束的是事件列表推送面，
             # 明文仍只经 /api/logs/detail 回源；这里是用户显式选择的统计维度。
-            # 凭据类 items 本身就没有 original（脱敏时即丢弃），永远走 preview。
-            if RECORD_PLAINTEXT_WORDS:
+            # 凭据类 items 强制绝不落原文（防 legacy 数据重放/历史残留）：恒只走 preview。
+            is_cred = bool(it.get("cred")) or lbl in CREDENTIAL_LABELS
+            if RECORD_PLAINTEXT_WORDS and not is_cred:
                 word = str(it.get("original") or it.get("preview") or "")
             else:
                 word = str(it.get("preview") or "")
@@ -2204,9 +2205,10 @@ def _today_stats_legacy(now=None, day_start=None):
         counter = counters.setdefault(ing, {})
         for it in rec.get("items") or []:
             lbl = str(it.get("label") or "其他")
-            word = it.get("original")
+            is_cred = bool(it.get("cred")) or lbl in CREDENTIAL_LABELS
+            word = str(it.get("preview") or "") if is_cred else (it.get("original") or str(it.get("preview") or ""))
             if not word:
-                word = str(it.get("preview") or "") or "?"
+                word = "?"
             key = (lbl, str(word))
             counter[key] = counter.get(key, 0) + 1
     by_ingress = {}

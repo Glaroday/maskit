@@ -138,5 +138,55 @@ class EventIndexTests(unittest.TestCase):
         self.assertIn("idx_events_type_id", names)
 
 
+class DailyWordsCredentialExclusionTests(unittest.TestCase):
+    """验证 daily_words 统计绝对不录入任何凭据类标签的 original（防 legacy/重放注入）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: self._cleanup(self.tmp))
+        self.old_db = event_store.DB_PATH
+        self.addCleanup(lambda: setattr(event_store, "DB_PATH", self.old_db))
+        event_store.DB_PATH = self.tmp / "ev.sqlite3"
+        event_store._reset_writer()
+
+    @staticmethod
+    def _cleanup(tmp):
+        for p in list(tmp.glob("*")):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def test_credential_original_never_enters_daily_words(self):
+        event_store.init_db()
+        fake_rec = {
+            "ts": 1700000000,
+            "type": "MASK",
+            "ingress": "proxy",
+            "items": [
+                {
+                    "label": "API_KEY",
+                    "original": "sk-proj-super-secret-key-12345",
+                    "preview": "sk-***345",
+                },
+                {
+                    "label": "PHONE",
+                    "original": "13800138000",
+                    "preview": "138****8000",
+                }
+            ]
+        }
+        with event_store.closing(event_store._connect()) as conn:
+            event_store._update_stats(conn, fake_rec)
+            rows = conn.execute("SELECT label, word FROM daily_words").fetchall()
+
+        words_by_label = {r[0]: r[1] for r in rows}
+        self.assertIn("API_KEY", words_by_label)
+        self.assertEqual(words_by_label["API_KEY"], "sk-***345",
+                         "凭据类无论如何只能落 preview，绝不许落 original")
+        self.assertEqual(words_by_label["PHONE"], "13800138000",
+                         "普通 PII 在开 RECORD_PLAINTEXT_WORDS 时正常记录原文")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1360,6 +1360,21 @@ class ExtCredentialScrubTests(ExtBridgeTestCase):
         for it in cred_items:
             self.assertNotIn("original", it, f"凭据项不许带 original：{it}")
 
+    def test_credential_straddling_truncation_boundary_is_redacted(self):
+        """凭据跨越 4000/800 字符截断边界时，必须先清洗再截断，绝不留半截明文残片。"""
+        # 构造刚好跨越 4000 字符边界的长文本，带 PHONE 确保命中
+        prefix = ("a" * 3975) + f" 电话{self.PHONE} "
+        body = json.dumps({"content": prefix + self.CRED + " tail"}, ensure_ascii=False)
+        j = self._mask(body).get_json()
+        self.assertTrue(j.get("ok"))
+        event_store.flush_event_queue()
+        evs = [e for e in event_store.fetch_events(limit=50)
+               if str(e.get("path") or "") == "/ext/mask"]
+        self.assertTrue(evs)
+        dialog = evs[-1].get("dialog") or ""
+        # 截断后的 dialog 绝对不能包含凭据原文
+        self.assertNotIn(self.CRED, dialog, "跨截断边界的凭据绝不许残留明文")
+
 
 class RestoreSizeGateTests(ExtBridgeTestCase):
     """审计 M2：`/api/ext/restore` 的体积闸门与 `ext_frames` 条目上限。
