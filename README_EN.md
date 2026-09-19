@@ -61,25 +61,31 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 ## ✨ Highlights & Feature Overview
 
 ### 🛡️ 1. Deep Masking with Multi-turn Consistency
-- **19 Built-in Scanner Rules**: API Keys/Tokens, PEM keys, DB connection strings, phone numbers, ID cards, emails, credit cards, private IPs;
-- **Custom Wordlists & Regex**: Categorized custom dictionary for names, codenames, and proprietary business terms; full regex support;
+- **20+ Built-in Scanner Rules**: API Keys/Tokens, PEM keys, DB connection strings, phone numbers, ID cards, emails, credit cards, private IPv4/IPv6, USCC unified social credit codes, and more;
+- **Custom Wordlists & Regex**: Categorized custom dictionary for names, codenames, and proprietary business terms; full regex support with resident deterministic placeholders;
 - **Sliding-window Placeholder Reuse**: Placeholders remain consistent across long conversations. "Alice" is assigned the exact same token in turn 1 and turn 20, preserving model reasoning consistency.
 
-### ⚡ 2. Millisecond SSE Stream Takeover (Native Typewriter Flow)
-- Intercepts `text/event-stream` chunk by chunk;
+### 🤖 2. Local AI Entity Recognition (NER Semantic Model)
+- **Unstructured Free-Text Protection**: Built-in lightweight local ONNX model detects Chinese person names (NAME), organizations (ORG), and detailed physical addresses (ADDR) where regex rules fall short;
+- **Clean Original Extraction + Monotonic OffsetMap**: Extracts entities from the clean original context and translates coordinates back to the mutated text via a monotonic `OffsetMap`, completely eliminating plaintext fragment leakage caused by context truncation;
+- **100% Offline Local Inference**: Runs entirely inside your local process without any external network calls; toggleable in Settings.
+
+### 🌐 3. Browser Extension Ecosystem (Web AI Privacy)
+- **Seamless Web AI Protection**: Dedicated Chrome & Edge MV3 extension for **ChatGPT, Claude, Kimi, Doubao, Qwen**, and other web-based AI platforms;
+- **Local Masking + Typewriter Stream Restoration**: Prompts sent from web tabs are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI; 18+ preset AI sites with one-click authorization.
+
+### ⚡ 4. Millisecond SSE Stream Takeover (Native Typewriter Flow)
+- Intercepts `text/event-stream` chunk by chunk with incremental restoration;
 - Automatically reassembles split tokens across chunk boundaries, **maintaining native typewriter responsiveness without lag**.
 
-### 🔌 3. No Root CA Installation + Native Fallback Passthrough (Never Breaks Your API)
+### 🔌 5. No Root CA Installation + Native Fallback Passthrough (Never Breaks Your API)
 - **Multi-port Reverse Proxy**: Dedicated local ports per model channel (e.g. `18701` for OpenAI, `18703` for Anthropic). Change `base_url` to local port without installing untrusted self-signed root CAs;
 - **Fallback Passthrough Guarantee**: If the proxy is stopped or closed, ports automatically fallback to raw transparent passthrough. **Your coding tools will never experience unexpected connection dropouts!**
 
-### 📊 4. Real-time Logs, Security Audit & Cost Tracking
+### 📊 6. Real-time Logs, Security Audit & Cost Tracking
 - Inspect full request/response diffs with one-click highlight mode;
-- Detect prompt leaks, model-swapping, and destructive commands;
+- **Passive Security Audit & Prompt Injection Detection**: Monitors upstream model responses and detects prompt extraction attempts, credential exfiltration instructions, and destructive command patterns;
 - Live token usage & model pricing cost estimation.
-
-### 🔒 5. 100% Local Execution, Zero Telemetry
-- All masking and unmasking happen inside your local process. No analytics, tracking SDKs, or cloud telemetry.
 
 ---
 
@@ -149,21 +155,17 @@ print(response.choices[0].message.content)
 4. **Masking Paths**: simply enter `/v1` (prefix matching automatically covers `/v1/chat/completions`, `/v1/models`, etc.);
 5. Save, then set your AI tool's Base URL to `http://127.0.0.1:18709/v1`!
 
-### 6. Browser Extension (ChatGPT / Claude Web)
+### 6. Browser Extension (ChatGPT, Claude & Web AI)
 
-The web apps have no Base URL to point at, so the extension under `extension/` routes the page's LLM requests through the local engine and restores placeholders as the response streams.
+Web-based AI platforms cannot configure an API Base URL. Use Maskit's browser extension for fully automated masking and stream unmasking:
 
-1. Get the extension: source users pick the repo's `extension/` folder; desktop-app users download `Maskit_<version>_extension.zip` from [Releases](https://github.com/xiaYuTian11/maskit/releases/latest), unzip it and pick the `maskit-extension` folder inside — the extension is not part of the desktop installer, and the web apps can only be covered through it. Then in Chrome / Edge open `chrome://extensions`, enable **Developer mode**, click **Load unpacked** and pick that folder;
-2. In the panel go to **Settings → Browser extension**, turn on **Enable the browser-extension bridge**, and copy the generated **access token**;
-3. Open the extension's options page, fill in the engine URL (default `http://127.0.0.1:5801`) and the token, and tick `chatgpt.com` / `claude.ai` (add custom sites on the same page).
+1. **Install Extension**: Download `Maskit_<version>_extension.zip` from [Releases](https://github.com/xiaYuTian11/maskit/releases/latest) and extract it. In Chrome/Edge, open `chrome://extensions` → toggle **Developer mode** → click **Load unpacked** and select the extracted folder (source users can directly load the `extension/` directory);
+2. **Connect to Engine**: In Maskit desktop dashboard `Settings → Browser Extension`, enable the extension bridge and copy your **Access Token** into the extension's settings popup;
+3. **Enable Sites**: Toggle target platforms (e.g. `chatgpt.com`, `claude.ai`, with 18+ preset sites supported and custom URL support).
 
-**Troubleshooting notes (important)**
-
-- **Extension events live in the Events page, not in Runtime logs.** Runtime logs are the mitmproxy subprocess stdout channel and never see extension endpoints; conversely the "mask failed" alert line *does* land there. Check both.
-- To filter extension traffic quickly, search **`/ext/`** in the events search box (`path` is a structured column and `/ext/mask` / `/ext/restore` are fixed values).
-- The **ingress** filter (All / Proxy link / Browser extension) shares one scope with the dashboard word entries, so a word's `×N` matches the log count after you click it.
-- **Unmasked states are always visible**: engine down → popup shows a yellow "passthrough"; bad token → red "token invalid"; bridge disabled → red "extension disabled". **In all three cases requests leave unmasked** — the extension will not cut your network (deliberate default; see `SECURITY.md`).
-- The share card covers the **proxy link only** (the scope is printed on the card), so its totals differ from the dashboard on purpose.
+> 💡 **Status & Troubleshooting**:
+> - Extension icon popup clearly displays current state: Green (Protected), Yellow (Engine offline, passthrough), Red (Invalid token or bridge disabled);
+> - Extension events are logged in the dashboard's "Event Logs" and can be filtered by ingress (Proxy Link vs Browser Extension).
 
 ---
 
@@ -275,18 +277,7 @@ python engine/panel.py
 cd frontend && npm run dev
 ```
 
-**End-to-end smoke (optional; run it after touching the extension / bridge code)**
-
-`tests/e2e_ext_bridge.py` drives **real Chrome + the real extension + a local mock site + the real engine** through 14 link-level assertions (masked outbound body, cross-chunk SSE restoration, multipart guard, default-bucket passthrough, sid table surviving SW recycle, …). It is **not part of CI** (it needs a real browser).
-
-Prerequisites: `pip install playwright && playwright install chromium` (using the interpreter that has the engine deps) and a **graphical session** — extensions only load in headed Chromium; Playwright's `headless=True` uses headless_shell, which does not support extensions.
-
-```bash
-python tests/e2e_ext_bridge.py             # run all
-python tests/e2e_ext_bridge.py -k multipart -v
-```
-
-> Why run it when unit tests are green: bridge failures are **silent passthrough** by default — the page looks perfectly normal and simply is not masked. A real browser is the only place this link can be verified.
+> 💡 **Testing Tip**: Run `python scripts/verify-all.py` for the complete 15-item test suite (unit tests, build, lint, version consistency, public release audit). If working on the browser extension, run `python tests/e2e_ext_bridge.py` for end-to-end browser tests.
 
 ---
 

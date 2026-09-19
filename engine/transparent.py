@@ -2630,6 +2630,12 @@ _NER_WARNED = set()
 
 def _ner_warn_once(key, msg):
     """NER 的失败必须可见（静默降级等于「以为开了、其实没脱」），但同类只记一次。"""
+    try:
+        import ner_engine
+        if hasattr(ner_engine, "record_skip"):
+            ner_engine.record_skip(key, msg)
+    except Exception:
+        pass
     if key in _NER_WARNED:
         return
     _NER_WARNED.add(key)
@@ -2659,14 +2665,21 @@ def _ner_doc_budget(seconds):
 
 
 def _mask_by_spans(text, spans):
-    """按 [start, end, repl) 区间一次性重建文本（spans 须已按 start 排序）。"""
+    """按 [start, end, repl) 区间一次性重建文本（spans 须已按 start 排序）。
+
+    重叠区间安全契约：
+    - 若出现区间重叠（start < cursor），后续重叠区间必须整段丢弃（continue）。
+    - 绝不能将重叠区间截断为 [cursor, end) 替换，因为 repl 绑定的完整原文在还原
+      (restore) 时会将前序已覆盖的明文重复吐出，导致文本严重错位与破坏性重复。
+    - 上游实体抽取层（ner_engine / _ner_entity_spans）负责确保实体区间两两不交。
+    """
     if not spans:
         return text
     out = []
     cursor = 0
     for start, end, repl in spans:
         if start < cursor:
-            continue          # 与已接受区间重叠：跳过，绝不让替换错位
+            continue          # 与已接受区间重叠：整段跳过，防错位且防还原重复吐字
         out.append(text[cursor:start])
         out.append(repl)
         cursor = end
@@ -2695,6 +2708,8 @@ class OffsetMap:
         kept = []
         cs = cd = 0
         for s, e, tok in self.edits:
+            if s < 0 or e < s:
+                raise ValueError(f"Edit 区间非法: [{s}, {e}) 必须满足 0 <= start <= end")
             if s < cs:
                 raise ValueError(f"Edit 重叠: [{s}, {e}) 与前序边界 {cs} 冲突")
             if s > cs:
@@ -3013,7 +3028,8 @@ def mask(text, sid):
     # ── AI 实体识别（NER）：人名 (NAME) / 机构 (ORG) / 详细地址 (ADDR) ──
     # 排在全部确定性规则之后：同一原文以规则/自定义词为准，语义模型只补规则覆盖不到
     # 的自由文本。模型在干净的 original 上抽取上下文，抽出的区间经 om.map_range
-    # 翻译至伤疤文本坐标系，再由 _ner_entity_spans 按占位符切分（详见 DESIGN-v1.1-span-refactor.md §7.3）。
+    # 翻译至伤疤文本坐标系，再由 _ner_entity_spans 按占位符切分（测试验证见
+    # tests/test_shield.py 中的 OffsetMapTests 与 tests/test_regressions.py）。
     # om_broken 或 om 为 None 时跳过 NER，严禁将 original 坐标作为回退直接用于伤疤文本。
     if NER_ENABLED and not om_broken and om is not None:
         try:

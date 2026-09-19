@@ -7214,7 +7214,7 @@ class NerPriorityContractTests(unittest.TestCase):
 
     def test_om_compose_exception_graceful_degradation(self):
         """防御性降级验证：若 OffsetMap.compose 遭遇异常，mask() 不得崩溃（拒绝 503），
-        确定性脱敏依然正常生效，仅安全跳过后续 NER 实体抽取。"""
+        确定性脱敏依然正常生效，仅安全跳过后续 NER 实体抽取，且降级事件计入 ner_engine.status().skips。"""
         self._set_words({"西城区": "区划"})
         original_compose = tr.OffsetMap.compose
 
@@ -7227,6 +7227,10 @@ class NerPriorityContractTests(unittest.TestCase):
             out = tr.mask("北京市西城区网点营业厅已关闭", "om-degrade-sid")
             self.assertNotIn("西城区", out, "确定性脱敏（自定义词）必须仍然成功生效")
             self.assertIn("{{", out, "必须产出占位符")
+            import ner_engine
+            st = ner_engine.status()
+            self.assertGreaterEqual(st.get("skips", {}).get("om_compose", 0), 1,
+                                   "OffsetMap 坐标合成失败必须登记进 ner_engine 的 skips 统计供健康检查可见")
         finally:
             tr.OffsetMap.compose = original_compose
 

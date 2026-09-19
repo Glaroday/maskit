@@ -5176,7 +5176,7 @@ class NerEngineIntegrationTests(unittest.TestCase):
 
 
 class OffsetMapTests(unittest.TestCase):
-    """OffsetMap 与 Edit 的数据契约与数学性质测试（对应 DESIGN-v1.1-span-refactor.md §7.2 / §14.1）。"""
+    """OffsetMap 与 Edit 的数据契约与数学性质测试（单调坐标映射、存活区间紧致性与合成保真验证）。"""
 
     def test_empty_identity_map(self):
         om = tr.OffsetMap.empty(10)
@@ -5308,6 +5308,16 @@ class OffsetMapTests(unittest.TestCase):
             mapped = [om_total.map_point(i) for i in survivors]
             self.assertEqual(len(set(mapped)), len(mapped))
 
+    def test_offset_map_inverted_edit_rejected(self):
+        """OffsetMap 必须拒绝倒置区间（end < start）或负数起点的 Edit。"""
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap([tr.Edit(8, 5, "{{X}}")], 15)
+        self.assertIn("Edit 区间非法", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            tr.OffsetMap([tr.Edit(-1, 5, "{{X}}")], 15)
+        self.assertIn("Edit 区间非法", str(ctx.exception))
+
     def test_offset_map_overlapping_edits_rejected(self):
         """OffsetMap 必须拒绝重叠的 Edit 序列，防止构造出非法映射。"""
         edits = [
@@ -5332,6 +5342,29 @@ class OffsetMapTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             om1.compose(om2)
         self.assertIn("尺寸不匹配", str(ctx.exception))
+
+
+class MaskBySpansContractTests(unittest.TestCase):
+    """_mask_by_spans 的数据契约与边界性质测试。"""
+
+    def test_non_overlapping_spans_replaced_cleanly(self):
+        text = "0123456789"
+        spans = [(1, 3, "{{A}}"), (6, 8, "{{B}}")]
+        out = tr._mask_by_spans(text, spans)
+        self.assertEqual(out, "0{{A}}345{{B}}89")
+
+    def test_overlapping_spans_second_span_skipped_entirely(self):
+        """后序重叠区间必须被整段丢弃，防止将绑定完整原词的占位符截断替换导致还原时重复吐字。"""
+        text = "0123456789"
+        # span1 覆盖 [1, 5)，span2 覆盖 [3, 8)
+        spans = [(1, 5, "{{FIRST}}"), (3, 8, "{{SECOND}}")]
+        out = tr._mask_by_spans(text, spans)
+        self.assertEqual(out, "0{{FIRST}}56789", "重叠的第二项必须被跳过，不可产生截断替换")
+
+    def test_empty_or_none_spans(self):
+        text = "hello world"
+        self.assertEqual(tr._mask_by_spans(text, []), text)
+        self.assertEqual(tr._mask_by_spans(text, None), text)
 
 
 class MaskExcludingPlaceholdersEdTests(unittest.TestCase):

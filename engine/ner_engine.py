@@ -79,6 +79,11 @@ def _warn_once(key, msg):
             pass
 
 
+def record_skip(key: str, msg: str = "") -> None:
+    """记录一次跳过原因并纳入 status().skips 统计（供外部如 transparent 的坐标降级调用）。"""
+    _warn_once(key, msg or f"NER 跳过: {key}")
+
+
 def begin_budget(seconds):
     """开启一段有总预算的调用序列（如整份 Office 文档逐 run 脱敏）。
 
