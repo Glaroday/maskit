@@ -6,9 +6,9 @@
 
 ### 新增 / Added
 - 内置本地 AI 实体识别（NER，配置项 `ner_enabled`，默认关）：本地 ONNX 模型识别人名 / 机构 / 地址，补齐确定性规则覆盖不到的自由文本；设置页可开关，模型或依赖缺失时界面与健康检查直接说明原因。实测「规则 + NER」联动下，样例集敏感值的明文残留从 74% 降到 11%。
-  **前提**：该效果需要 99MB 的本地模型文件与 `onnxruntime` / `tokenizers`（二者在 `requirements-dev.txt`，不在运行时依赖里）。模型不入仓库、CI 也不下载，**官方安装包与 Docker 镜像均不含模型**——那两种方式安装的用户开启 NER 只会看到「模型文件缺失」，效果数字不适用。需要该能力请用源码态运行或自行补齐模型目录。
+  **全功能一体包**：Windows 官方安装包已完整内置本地语义识别模型（All-in-One 全功能一体包，开箱即用，无需额外下载或配置），设置页开启即可直接使用。
   *New built-in local AI entity recognition (NER, config key `ner_enabled`, off by default): a local ONNX model detects person / organisation / address names that deterministic rules cannot cover; toggle in settings, and the reason is spelled out in the UI and health check when the model or its dependencies are missing. On the sample set, combining rules with NER cuts the plaintext left in requests from 74% to 11%.*
-  *Prerequisite: those numbers require the 99 MB local model plus `onnxruntime` / `tokenizers` (both in `requirements-dev.txt`, not runtime deps). The model is not in the repository and CI does not download it, so **neither the official installer nor the Docker image ships it** — users installing those ways see only "model file missing" and the figures do not apply. Run from source, or supply the model directory yourself.*
+  *All-in-One package: The official Windows installer bundles the local semantic recognition model out-of-the-box (All-in-One package, no extra downloads or configuration required), simply enable in settings to use.*
 - 安全审计新增提示词注入检测：伪造协议级系统轮次、索要系统提示词、凭据外发指令、base64/转义编码绕过；泛化的「忽略以上指令」句式只在同现客观载荷时上报，避免把模型讲解误判成投毒。
   *New prompt-injection detection in the security audit: faked protocol-level system turns, system-prompt extraction requests, credential-exfil instructions, and base64/escape-encoded payloads; ordinary "ignore previous instructions" wording is reported only when an objective payload co-occurs, so explanations are not mistaken for poisoning.*
 - 扩展设置页新增「推荐站点」：18 个国内外常见 AI 站点一键授权添加（含 Gemini / Grok / Perplexity / Copilot / Mistral / Poe、DeepSeek / 豆包 / 通义千问 / Qwen / Kimi / 元宝 / 智谱 / 文心一言 / 讯飞星火 / 小米 MiMo），路径未实测的站点统一打「未实测」标记。
