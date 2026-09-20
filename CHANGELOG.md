@@ -2,6 +2,16 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.3.2] - 2026-09-20
+
+### 修复 / Bug Fixes
+- 浏览器扩展：修复桌面端设置页误将内部协议 `http://tauri.localhost` 显示为服务地址的问题，自动回显 `http://127.0.0.1:5801` 并增加一键复制按钮。
+  *Browser extension: fix desktop settings page incorrectly showing internal `http://tauri.localhost` as engine URL; now displays `http://127.0.0.1:5801` with a one-click copy button.*
+
+### 优化 / Changed
+- 界面文案产品化：全面去除开发者内部黑话，将“旋转令牌”通俗化优化为“重置令牌”，重构服务异常阻断与高级设置的引导说明。
+  *UI text refinement: replaced internal jargon with clear descriptions, renamed "Rotate Token" to "Reset Token", and polished explanations across settings.*
+
 ## [0.3.1] - 2026-09-19
 
 ### 新增 / Added
@@ -508,6 +518,7 @@ Release v0.2.6: Fix CI unit test deadlock, credential header clobbering (401 err
 - Docker 镜像（amd64 / arm64）内嵌 Web 控制台，远程访问需 `MASKIT_PANEL_TOKEN`。
 - 中英文界面一键切换、深浅主题。
 
+[0.3.2]: https://github.com/xiaYuTian11/maskit/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/xiaYuTian11/maskit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/xiaYuTian11/maskit/compare/v0.2.12...v0.3.0
 [0.2.12]: https://github.com/xiaYuTian11/maskit/compare/v0.2.11...v0.2.12
