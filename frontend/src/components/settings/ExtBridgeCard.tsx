@@ -193,15 +193,35 @@ export function ExtBridgeCard({ cfg, toggle, saving }: ExtBridgeCardProps) {
         {/* 只读信息：引擎地址 + 统计 */}
         <div className="grid gap-2 sm:grid-cols-2">
           <div className="rounded-lg border bg-muted/20 px-3 py-2">
-            <div className="text-[11px] text-muted-foreground">{t('settings.extBridge.panelUrl')}</div>
-            <div className="mt-0.5 break-all font-mono text-xs">{window.location.origin}</div>
+            <div className="flex items-center justify-between">
+              <div className="text-[11px] font-medium text-muted-foreground">{t('settings.extBridge.panelUrl')}</div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-5 px-1.5 text-[10px] text-muted-foreground hover:text-foreground"
+                onClick={async () => {
+                  const isTauri = typeof window !== 'undefined' && (window.location.origin.includes('tauri.localhost') || window.location.protocol === 'tauri:')
+                  const targetUrl = isTauri ? 'http://127.0.0.1:5801' : window.location.origin
+                  await navigator.clipboard.writeText(targetUrl)
+                  toast(t('settings.extBridge.copied'))
+                }}
+              >
+                <Copy className="mr-1 h-3 w-3" />
+                {t('settings.extBridge.copy')}
+              </Button>
+            </div>
+            <div className="mt-0.5 break-all font-mono text-xs font-semibold text-foreground">
+              {typeof window !== 'undefined' && (window.location.origin.includes('tauri.localhost') || window.location.protocol === 'tauri:')
+                ? 'http://127.0.0.1:5801'
+                : window.location.origin}
+            </div>
             <div className="mt-0.5 text-[11px] text-muted-foreground">
               {t('settings.extBridge.panelUrlHint')}
             </div>
           </div>
           <div className="rounded-lg border bg-muted/20 px-3 py-2">
-            <div className="text-[11px] text-muted-foreground">{t('settings.extBridge.stats')}</div>
-            <div className="mt-0.5 font-mono text-xs">{statsText}</div>
+            <div className="text-[11px] font-medium text-muted-foreground">{t('settings.extBridge.stats')}</div>
+            <div className="mt-0.5 font-mono text-xs font-semibold text-foreground">{statsText}</div>
             <div className="mt-0.5 text-[11px] text-muted-foreground">
               {t('settings.extBridge.statsHint')}
             </div>
