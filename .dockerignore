@@ -18,11 +18,6 @@ shield-env-backup.json
 model_prices_cache.json
 diagnostics-*.json
 engine/config.json
-# 本地 NER 模型（99MB）：onnxruntime / tokenizers 只在 requirements-dev.txt 里，
-# 运行时镜像**不装**（见该文件注释）→ 容器内语义识别必然不可用，带模型进去
-# 只是白占 99MB 镜像层。需要容器内 NER 时自行挂载模型目录 + 装这两个依赖。
-# 注意模式必须是 `engine/models/`：模型实际落在 `engine/models/ner_mini_zh/`。
-engine/models/
 # 冒烟测试语料/脚本（根目录），不是运行时资产。
 _smoke_data/
 ai-coding/

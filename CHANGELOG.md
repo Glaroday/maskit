@@ -2,6 +2,16 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.3.1] - 2026-09-19
+
+### 新增 / Added
+- 全端全功能一体包（Windows、macOS、Docker）：CI 发布流水线自动化拉取本地 NER 模型并完整打包入包，开箱即用，免去手动下载配置。
+  *All-in-One packages across all platforms (Windows, macOS, Docker): the CI release pipeline automatically fetches the local NER model and bundles it out-of-the-box, eliminating manual downloads.*
+
+### 优化 / Changed
+- Docker 构建加速与解耦：前端静态构建改用宿主原生架构执行（`--platform=$BUILDPLATFORM`），消除 QEMU 模拟 Node.js 导致的构建死锁；桌面端发版与 Docker 解耦。
+  *Docker build acceleration & decoupling: frontend static build now runs on host native platform (`--platform=$BUILDPLATFORM`), removing QEMU emulation deadlocks; desktop release decoupled from Docker.*
+
 ## [0.3.0] - 2026-09-19
 
 ### 新增 / Added
@@ -498,6 +508,7 @@ Release v0.2.6: Fix CI unit test deadlock, credential header clobbering (401 err
 - Docker 镜像（amd64 / arm64）内嵌 Web 控制台，远程访问需 `MASKIT_PANEL_TOKEN`。
 - 中英文界面一键切换、深浅主题。
 
+[0.3.1]: https://github.com/xiaYuTian11/maskit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/xiaYuTian11/maskit/compare/v0.2.12...v0.3.0
 [0.2.12]: https://github.com/xiaYuTian11/maskit/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/xiaYuTian11/maskit/compare/v0.2.10...v0.2.11

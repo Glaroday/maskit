@@ -97,6 +97,14 @@ jobs:
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=raw,value=latest
+      - name: Fetch NER model for All-in-One Docker image
+        shell: bash
+        run: |
+          mkdir -p engine/models/ner_mini_zh
+          curl -sSL https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
+          unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
+          rm -f ner_mini_zh.zip
+          test -f engine/models/ner_mini_zh/model_quantized.onnx
       - name: Build and push
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
@@ -173,6 +181,15 @@ jobs:
           python3 -m pip install -r requirements-dev.txt
           npm --prefix frontend ci
           npm --prefix frontend run build
+
+      - name: Fetch NER model for All-in-One bundle
+        shell: bash
+        run: |
+          mkdir -p engine/models/ner_mini_zh
+          curl -sSL https://github.com/xiaYuTian11/maskit/releases/download/v0.3.0/ner_mini_zh.zip -o ner_mini_zh.zip
+          unzip -q -o ner_mini_zh.zip -d engine/models/ner_mini_zh
+          rm -f ner_mini_zh.zip
+          test -f engine/models/ner_mini_zh/model_quantized.onnx
 
       - name: Build PyInstaller sidecar (Windows)
         if: runner.os == 'Windows'
