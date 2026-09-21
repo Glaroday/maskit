@@ -47,6 +47,8 @@ const I18N = {
     attachText: '本页上传了 {n} 个文件。文件内容不会脱敏，只有文字字段会被打码。',
     attachTextImg: '本页上传了 {n} 个文件（含图片）。图片与附件里的内容不会脱敏，只有文字字段会被打码。',
     attachTextMasked: '本页上传了 {n} 个文本文件，文件内敏感信息已自动完成打码脱敏。',
+    attachTextLegacy:
+      '本页上传了 {n} 个旧版 Office 文件（.doc / .xls）：这类格式无法在不破坏文件的前提下脱敏，已原样上传（内容未打码）。请另存为 .docx / .xlsx 后再上传。',
     refreshBtn: '刷新',
     optionsBtn: '设置',
     colTime: '时间',
@@ -90,6 +92,8 @@ const I18N = {
     attachText: 'This page uploaded {n} file(s). File contents are NOT masked — only text fields are.',
     attachTextImg: 'This page uploaded {n} file(s), including images. Image and attachment contents are NOT masked — only text fields are.',
     attachTextMasked: 'This page uploaded {n} text file(s); sensitive data inside has been masked.',
+    attachTextLegacy:
+      'This page uploaded {n} legacy Office file(s) (.doc / .xls). These formats cannot be masked without destroying the file, so they were uploaded as-is (NOT masked). Please save them as .docx / .xlsx and upload again.',
     refreshBtn: 'Refresh',
     optionsBtn: 'Settings',
     colTime: 'Time',
@@ -310,7 +314,11 @@ function renderAttach(snap) {
   const box = $('attachBox');
   box.hidden = !rec;
   if (!rec) return;
-  if (rec.count > 0) {
+  if (rec.legacyCount > 0) {
+    // 旧版 Office 优先提示：它的处置建议与其他「附件不脱敏」不同（要换格式再传），
+    // 混在笼统提示里用户不知道下一步该做什么。
+    $('attachText').textContent = t('attachTextLegacy', { n: rec.legacyCount });
+  } else if (rec.count > 0) {
     $('attachText').textContent = t(rec.image ? 'attachTextImg' : 'attachText', { n: rec.count });
   } else if (rec.maskedCount > 0) {
     $('attachText').textContent = t('attachTextMasked', { n: rec.maskedCount });

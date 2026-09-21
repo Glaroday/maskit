@@ -448,32 +448,40 @@ export default function LogsPage() {
 
     if (masked || restored || unresolved || degraded) {
       return (
+        // 拆成上下两行（计数 / 标签）是**为根治重叠**：此前挤在单行里，标签组一旦被压缩，
+        // 内部 `whitespace-nowrap` 的子元素会溢出自身边界，与后面的「未还原 N」糊在一起
+        // （实测截图：`API_KEY` 与橙色 `未还原 4` 直接重叠）。拆行后同一行内不再存在
+        // 「可收缩元素 与 shrink-0 元素 抢宽度」的竞争，溢出统一由 overflow-hidden 裁切。
         <span
-          className="flex min-w-0 items-center gap-1.5 overflow-hidden text-[11px]"
+          className="flex min-w-0 flex-col justify-center gap-0.5 text-[11px]"
           title={[itemsPreviewText, row.method, row.host, row.path].filter(Boolean).join(' · ')}
         >
-          {masked && <span className="whitespace-nowrap shrink-0 text-blue-600 dark:text-blue-400">{t('logs.colMasked')} {row.count}</span>}
-          {restored && <span className="whitespace-nowrap shrink-0 text-emerald-600 dark:text-emerald-400">{t('logs.colRestored')} {row.restored}</span>}
+          {/* 第一行：计数。关键数字，永不与标签抢宽度 */}
+          <span className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+            {masked && <span className="shrink-0 whitespace-nowrap text-blue-600 dark:text-blue-400">{t('logs.colMasked')} {row.count}</span>}
+            {restored && <span className="shrink-0 whitespace-nowrap text-emerald-600 dark:text-emerald-400">{t('logs.colRestored')} {row.restored}</span>}
+            {unresolved && (
+              <span className="shrink-0 whitespace-nowrap text-amber-600 dark:text-amber-400" title={t('logs.unresolvedHint')}>
+                {t('logs.colUnresolved')} {row.unresolved}
+              </span>
+            )}
+            {degraded && (
+              <span className="shrink-0 whitespace-nowrap text-muted-foreground" title={t('logs.degradedHint')}>
+                {t('logs.colDegraded')} {row.degraded}
+              </span>
+            )}
+          </span>
+          {/* 第二行：命中标签。超出仅显示前两个 + 折叠计数 */}
           {itemLabels.length > 0 && (
-            <span className="flex min-w-0 shrink items-center gap-1">
+            <span className="flex min-w-0 items-center gap-1 overflow-hidden">
               {itemLabels.slice(0, 2).map((lb) => (
-                <span key={lb} className="whitespace-nowrap rounded bg-muted px-1 py-0.2 font-mono text-[9px] text-muted-foreground">
+                <span key={lb} className="shrink-0 whitespace-nowrap rounded bg-muted px-1 py-0.2 font-mono text-[9px] text-muted-foreground">
                   {lb}
                 </span>
               ))}
               {itemLabels.length > 2 && (
-                <span className="whitespace-nowrap text-[9px] text-muted-foreground">+{itemLabels.length - 2}</span>
+                <span className="shrink-0 whitespace-nowrap text-[9px] text-muted-foreground">+{itemLabels.length - 2}</span>
               )}
-            </span>
-          )}
-          {unresolved && (
-            <span className="whitespace-nowrap shrink-0 text-amber-600 dark:text-amber-400" title={t('logs.unresolvedHint')}>
-              {t('logs.colUnresolved')} {row.unresolved}
-            </span>
-          )}
-          {degraded && (
-            <span className="whitespace-nowrap shrink-0 text-muted-foreground" title={t('logs.degradedHint')}>
-              {t('logs.colDegraded')} {row.degraded}
             </span>
           )}
         </span>

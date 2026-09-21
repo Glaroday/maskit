@@ -244,6 +244,13 @@
   // 都会把 docx/xlsx/pptx 全部误判成文本附件（真机实测，见下方判定函数注释）。
   const OOXML_FILE_EXTS = new Set(['docx', 'xlsx', 'pptx', 'wps', 'et', 'dps', 'doc', 'xls']);
 
+  // 旧版 Office（OLE 复合二进制，.doc / .xls）：内容不是 ZIP，无法像 OOXML 那样解包改文本。
+  // 引擎对它们的「转换」是**有损重建**（丢图片/表格/样式，二进制碎片还会混入正文），因此
+  // 默认已关闭；关闭时这几个扩展名原样上行 = **完全不受保护**。单独列出只为给用户一条
+  // 明确的提示（「请另存为 .docx / .xlsx」），否则用户看到的只是笼统的「附件不脱敏」，
+  // 根本不知道该换格式。
+  const LEGACY_OFFICE_EXTS = new Set(['doc', 'xls']);
+
   // ─── 文本类文件扩展名与单文件上限（支持拖拽上传脱敏） ───
   const TEXT_FILE_EXTS = new Set([
     'txt', 'text', 'md', 'markdown', 'mdown', 'csv', 'tsv', 'json', 'jsonl', 'ndjson',
@@ -570,6 +577,9 @@
     let maskedCount = 0;
     let unmaskedCount = 0;
     let hasUnmaskedImage = false;
+    // 未脱敏的旧版 Office 文件单独计数：它们不是「漏了」而是「这类格式做不到」，
+    // 提示语与普通附件完全不同（要引导用户另存为 .docx / .xlsx）。
+    let legacyUnmaskedCount = 0;
     for (const item of items) {
       if (item.kind === 'string') continue;
       if (item.masked) {
@@ -577,6 +587,9 @@
       } else {
         unmaskedCount++;
         if (isImageItem(item)) hasUnmaskedImage = true;
+        if (item.kind === 'ooxmlFile' && LEGACY_OFFICE_EXTS.has(resolveFileExt(item.file, ''))) {
+          legacyUnmaskedCount++;
+        }
       }
     }
     if (unmaskedCount > 0 || maskedCount > 0) {
@@ -585,6 +598,7 @@
         image: hasUnmaskedImage,
         count: unmaskedCount,
         maskedCount: maskedCount,
+        legacyCount: legacyUnmaskedCount,
       });
     }
     // 零触碰原则（与文本 / Blob 分支一致）：一个敏感值都没命中时**不要重建 FormData**——

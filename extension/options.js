@@ -18,7 +18,7 @@ const reasonFor = (domain) => self.MASKIT_SHARED.unsupportedReason(domain);
 const I18N = {
   zh: {
     title: 'Data Maskit Browser Bridge',
-    subtitle: '把网页版 AI（ChatGPT / Claude / DeepSeek / 豆包 / 元宝 …）的请求送进本地 Maskit 引擎打码，回包流式还原。100% 本地运算，零外传。',
+    subtitle: '把网页版 AI（ChatGPT / Claude / DeepSeek 等）的请求送进本地 Maskit 引擎打码，回包流式还原。100% 本地运算，零外传。',
     secEngine: '引擎连接',
     engineHint: '本机引擎地址。默认端口 5801，改了端口就在这里同步。',
     panelUrlPh: 'http://127.0.0.1:5801',
@@ -71,7 +71,7 @@ const I18N = {
   },
   en: {
     title: 'Data Maskit Browser Bridge',
-    subtitle: 'Routes web-AI (ChatGPT / Claude / DeepSeek / Doubao / Yuanbao …) requests through the local Maskit engine for masking, and restores responses as they stream. 100% local, zero egress.',
+    subtitle: 'Routes web-AI (ChatGPT / Claude / DeepSeek, …) requests through the local Maskit engine for masking, and restores responses as they stream. 100% local, zero egress.',
     secEngine: 'Engine',
     engineHint: 'Local engine address. Default port 5801; keep this in sync if you changed it.',
     panelUrlPh: 'http://127.0.0.1:5801',

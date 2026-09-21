@@ -237,7 +237,8 @@ _ext_cfg_state = {
     "ext_token": "",
     "ext_block_when_engine_down": False,
     "ext_record_events": True,
-    "ext_convert_legacy_office": True,
+    # 旧版 Office(.doc/.xls) 转换开关，**默认关闭**（理由见下方完整默认配置里的长注释）。
+    "ext_convert_legacy_office": False,
 }
 
 
@@ -3430,7 +3431,21 @@ def default_config():
         # 扩展流量是否写入本地事件库与统计。**只管落库与统计**：脱敏/还原与
         # 「未脱敏状态」可见性照常（详见 SECURITY.md 与 SPEC §5.3 三条边界）。
         "ext_record_events": True,
-        "ext_convert_legacy_office": True,
+        # 旧版 Office(.doc / .xls) 转码开关，**默认关闭**。
+        #
+        # 它不是格式转换，而是有损重建：用 `decode('utf-16le', errors='ignore')` 从 OLE
+        # 二进制里“捞”可读字符串，再塞进手写的极简 OOXML 骨架。实测后果：
+        #   ① 图片/表格结构/样式/公式/多 sheet/批注/页眉页脚全部丢失；
+        #   ② 二进制碎片被当成正文段落捞进去（实测正文里出现整段乱码）；
+        #   ③ hits==0（完全无敏感信息）时**照样替换文件**，不需要脱敏的文件也遭破坏；
+        #   ④ 不经过 _pad_zip_to_size 对齐，体积可以膨胀（.xls 实测 +127%），
+        #      仍有上游 file_size_mismatch 拒收风险；
+        #   ⑤ 输出是 OOXML，却仍以 .doc 文件名与原 MIME 上传（扩展侧不改文件名），
+        #      上游按 application/msword 解析极易失败。
+        # 开着它 = 用户上传的文档在上游被换成另一个东西，AI 读到的内容（残缺 + 乱码）不可信。
+        # 关闭后 .doc / .xls 原样上行（文件完整、但不脱敏），扩展会明确提示用户另存为
+        # .docx / .xlsx 再传。这是“诚实告知不支持”优于“静默产出残缺文件”的取舍。
+        "ext_convert_legacy_office": False,
         "stream_response": True,
         # 流式接管黑名单：确认某上游接管后断连时把 host 填进来，保持整包路径。
         # 默认空：曾预置的 opencode.ai 是误判（真因是引擎在无完整 SSE 事件可发时
@@ -3843,7 +3858,7 @@ def normalize_config(raw, warnings=None):
         "ext_token": ext_token,
         "ext_block_when_engine_down": bool(raw.get("ext_block_when_engine_down", False)),
         "ext_record_events": bool(raw.get("ext_record_events", True)),
-        "ext_convert_legacy_office": bool(raw.get("ext_convert_legacy_office", True)),
+        "ext_convert_legacy_office": bool(raw.get("ext_convert_legacy_office", False)),
         "ner_enabled": bool(raw.get("ner_enabled", False)),
         "stream_response": bool(raw.get("stream_response", True)),
         "stream_exclude_hosts": _normalize_host_list(raw.get("stream_exclude_hosts")),
@@ -3951,7 +3966,7 @@ def _sync_runtime_config(cfg):
             "ext_token": str(cfg.get("ext_token") or ""),
             "ext_block_when_engine_down": bool(cfg.get("ext_block_when_engine_down", False)),
             "ext_record_events": bool(cfg.get("ext_record_events", True)),
-            "ext_convert_legacy_office": bool(cfg.get("ext_convert_legacy_office", True)),
+            "ext_convert_legacy_office": bool(cfg.get("ext_convert_legacy_office", False)),
         })
         try:
             set_record_plaintext_words(cfg.get("record_plaintext_words", True))
@@ -5834,7 +5849,19 @@ def _make_minimal_xlsx(lines):
 
 
 def _convert_and_mask_legacy_office(raw_bytes: bytes, ext: str, sid: str, tr):
-    """纯标准库提取老版 Office (.doc / .xls) 文本并转码为标准 .docx/.xlsx 脱敏字节流。"""
+    """旧版 Office (.doc / .xls) 兜底转码：**有损重建，默认关闭**。
+
+    仅当用户在设置里显式打开 `ext_convert_legacy_office` 时才会走到这里。它不是
+    格式转换：只有“从二进制里捞可读字符串 → 塞进手写极简 OOXML”两步，图片、表格
+    结构、样式、公式、多 sheet、批注、页眉页脚全部丢失，且二进制碎片会被一并当成
+    正文捞进去（实测正文中出现整段乱码）。保留实现是为了给“确实只关心纯文本、
+    且能接受格式尽失”的用户留一个显式开关，绝不能当作默认安全能力。
+
+    Returns:
+        (masked_bytes, hits)。注意 hits == 0（无任何敏感信息）时**也会返回重建后的
+        字节**，即调用方拿到的是一个已被改写的文件——这与 OOXML 路径
+        `if total_hits == 0: return raw_bytes, 0` 的“无命中绝不动文件”原则相反。
+    """
     text_lines = []
     # 1. 优先提取 UTF-16LE 文本段落（Word/Excel 经典编码）
     try:
@@ -5932,7 +5959,10 @@ def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
     返回: (masked_bytes, total_hits)
     """
     ext = (filename.lower().split(".")[-1] if "." in filename else "").strip()
-    if ext in ("doc", "xls") and _ext_cfg().get("ext_convert_legacy_office", True):
+    # 旧格式转换默认关闭：开了它产出的“转换结果”是有损重建（丢图片/丢表格/混入乱码），
+    # 用户上传的文件在上游会变成另一个东西。关闭时下面的 zipfile.is_zipfile 判定必然为假，
+    # 于是 .doc/.xls 原样返回（文件完整、但不脱敏），扩展侧会明确提示用户转存新格式。
+    if ext in ("doc", "xls") and _ext_cfg().get("ext_convert_legacy_office", False):
         return _convert_and_mask_legacy_office(raw_bytes, ext, sid, tr)
 
     in_buf = io.BytesIO(raw_bytes)

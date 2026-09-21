@@ -19,7 +19,12 @@
 
 (function (root) {
   /** manifest 静态 content_scripts 已覆盖的站点。改动必须与 manifest.json 同步。 */
-  const STATIC_SITES = ['chatgpt.com', 'claude.ai'];
+  // 开箱即用（manifest 静态注册 + 预授权，装完就有，无需手动添加）。
+  // **必须与 manifest.json 的 content_scripts.matches 一致**：check-extension 会双向比对，
+  // 改一边忘一边就会出现「界面显示已启用、实际脚本没注入」的静默失效。
+  // deepseek.com 于 2026-09-21 升为默认：文本链路的脱敏与流式还原均已实测；
+  // 其**文件上传**尚未适配（另两家已验证），所以只保证对话文本，不保证附件。
+  const STATIC_SITES = ['chatgpt.com', 'claude.ai', 'deepseek.com'];
 
   /**
    * 推荐站点：设置页一键添加用。
@@ -75,8 +80,13 @@
     { domain: 'mistral.ai', zh: 'Mistral Le Chat', en: 'Mistral Le Chat', verified: false },
     { domain: 'poe.com', zh: 'Poe', en: 'Poe', verified: false },
     // ── 国内常见 ──
-    { domain: 'deepseek.com', zh: 'DeepSeek', en: 'DeepSeek', verified: false },
-    { domain: 'doubao.com', zh: '豆包', en: 'Doubao', verified: false },
+    // DeepSeek 已升为开箱即用（见上 STATIC_SITES）；这里保留条目是为了让用户仍能
+    // 在推荐列表里看到它并补加其历史域名。verified: true 仅指**静态注册已生效**，
+    // 文件上传链路未适配，所以不保证附件脱敏。
+    { domain: 'deepseek.com', zh: 'DeepSeek', en: 'DeepSeek', verified: true },
+    // 豆包（www.doubao.com）已于 2026-09-21 从推荐列表**移除**：文本链路可用，但文件上传链路
+    // 与另外两家差异较大（实测文件不被支持）。留在推荐列表里只会让用户以为「加了就全都能用」，
+    // 排障时还会把精力引到错误的方向。它仍可被手动添加（见 LEGACY_UNVERIFIED），照常带未实测标注。
     { domain: 'tongyi.aliyun.com', zh: '通义千问', en: 'Tongyi Qianwen', verified: false },
     { domain: 'qwen.ai', zh: 'Qwen（国际版）', en: 'Qwen (global)', verified: false },
     { domain: 'kimi.com', zh: 'Kimi', en: 'Kimi', verified: false },
@@ -96,7 +106,7 @@
    * 不在推荐列表里的**历史/备用域名**：用户手输时也要按「未实测」标注，
    * 否则会与推荐列表里同一服务的另一个域名给出两套判据（SPEC 反复强调的同源问题）。
    */
-  const LEGACY_UNVERIFIED = ['chat.deepseek.com', 'kimi.moonshot.cn'];
+  const LEGACY_UNVERIFIED = ['chat.deepseek.com', 'kimi.moonshot.cn', 'doubao.com', 'www.doubao.com'];
 
   const UNVERIFIED_DOMAINS = PRESET_SITES
     .filter((p) => !p.verified)

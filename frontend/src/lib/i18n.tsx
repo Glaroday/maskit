@@ -1090,8 +1090,9 @@ const zh: Record<string, string> = {
   'settings.extBridge.rotateFail': '重置失败：{e}',
   'settings.extBridge.blockWhenDown': '服务异常时阻断网页请求',
   'settings.extBridge.blockWhenDownDesc': '默认关闭（脱敏服务未启动时直接直连，保证网页可用）。开启后：若服务未运行或令牌失效，将直接拦截网页发送，防止明文意外泄露。',
-  'settings.extBridge.convertLegacyOffice': '老版 Office 文档自动转码脱敏（.doc / .xls）',
-  'settings.extBridge.convertLegacyOfficeDesc': '开启后，上传老版 .doc / .xls 二进制格式将在内存中提取文本并无感转为规范的 .docx / .xlsx 脱敏发送；关闭时保持原样透传。',
+  'settings.extBridge.convertLegacyOffice': '转换旧版 Office 文档（有损重建，不推荐）',
+  'settings.extBridge.convertLegacyOfficeDesc':
+    '开启后 .doc / .xls 会被重建为极简 OOXML 以便对文本打码，但这不是保真转换：图片、表格结构、样式、公式与多余工作表全部丢失，二进制碎片还可能被当成正文混入（实测出现整段乱码）；即使文件不含敏感信息也会被改写。默认关闭——此时 .doc / .xls 原样上传（内容完整但不脱敏、不受保护），建议先另存为 .docx / .xlsx 再上传。',
   'settings.extBridge.formatsTitle': '文档脱敏格式支持说明',
   'settings.extBridge.supportedFormats': '支持常用格式：.docx、.xlsx、.pptx、.wps、.et、.dps，以及 .txt、.md、.csv、.json、.py、.js、.html、.sql 等 40+ 种文本与代码格式。',
   'settings.extBridge.unsupportedFormats': '暂不支持格式：.doc、.xls、.ppt（关闭转码时透传）、.pdf、压缩包（.zip/.rar）及图片文件（图片原样透传）。',
@@ -2189,8 +2190,9 @@ const en: Record<string, string> = {
   'settings.extBridge.rotateFail': 'Reset failed: {e}',
   'settings.extBridge.blockWhenDown': 'Block Web Requests on Service Error',
   'settings.extBridge.blockWhenDownDesc': 'Default off (requests pass through directly to keep the website working). When enabled, blocks requests if the engine is stopped or token is invalid, preventing accidental cleartext leaks.',
-  'settings.extBridge.convertLegacyOffice': 'Auto-convert & mask legacy Office documents (.doc / .xls)',
-  'settings.extBridge.convertLegacyOfficeDesc': 'When enabled, legacy .doc / .xls binary files are converted to modern .docx / .xlsx in-memory with masking. When disabled, they pass through untouched.',
+  'settings.extBridge.convertLegacyOffice': 'Convert legacy Office documents (lossy rebuild, not recommended)',
+  'settings.extBridge.convertLegacyOfficeDesc':
+    'When enabled, .doc / .xls are rebuilt into a minimal OOXML file so their text can be masked. This is NOT a faithful conversion: images, table structure, styles, formulas and extra sheets are all lost, and binary fragments may be pulled into the body text as garbage. Files with no sensitive data are rewritten too. Off by default — .doc / .xls are then uploaded as-is (intact but unmasked and unprotected); save them as .docx / .xlsx before uploading instead.',
   'settings.extBridge.formatsTitle': 'Document Masking Format Support',
   'settings.extBridge.supportedFormats': 'Supported formats: .docx, .xlsx, .pptx, .wps, .et, .dps, and 40+ text/code formats (.txt, .md, .csv, .json, .py, .js, .html, .sql, etc.).',
   'settings.extBridge.unsupportedFormats': 'Unsupported formats: .doc, .xls, .ppt (passed through if conversion is off), .pdf, archives (.zip/.rar), and images (passed through untouched).',

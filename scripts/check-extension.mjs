@@ -464,6 +464,67 @@ if (wmResets < 2) {
     'SW 冷启动首次 config 桥失败会让整页永久降级为精准模式，只能刷新页面才能恢复')
 }
 
+// ── 旧版 Office（.doc / .xls）不得被静默转换，也不得静默放行 ────────────────
+// 背景：引擎对 .doc/.xls 的所谓「转换」是**有损重建** —— 用 decode('utf-16le') 从 OLE
+// 二进制里捞可读字符串，再塞进手写的极简 OOXML 骨架。实测后果：图片/表格结构/样式/
+// 公式/多 sheet 全丢，二进制碎片被当成正文段落捞进去（正文里出现整段乱码），且
+// hits==0（文件毫无敏感信息）时**照样改写文件**，体积还可能膨胀（.xls 实测 +127%）。
+// 所以默认关闭，改由扩展明确告知「这类格式做不到脱敏，请另存为新格式」。
+// 两条红线都属「改的人当场看不出来、用户隔几天才发现」：
+//   ① 引擎默认值必须保持 False —— 改回 True 会让所有用户的 .doc 上传在上游变成
+//      另一个东西，而界面、日志、popup 上全都看不出来（hits 可能仍是 0）；
+//   ② 扩展必须真的计数（legacyCount）并给出**专门**提示（attachTextLegacy）——
+//      只报笼统的「附件不脱敏」会让用户以为自己操作错了，而不是格式不支持。
+const enginePanelPath = path.join(ROOT, 'engine', 'panel.py')
+if (!fs.existsSync(enginePanelPath)) {
+  fail('找不到 engine/panel.py —— 旧版 Office 转换默认值无人把关')
+} else {
+  const enginePanel = fs.readFileSync(enginePanelPath, 'utf8')
+  const onDefaults = [...enginePanel.matchAll(/ext_convert_legacy_office[^\n]*?\bTrue\b/g)]
+  if (onDefaults.length) {
+    fail(`engine/panel.py 有 ${onDefaults.length} 处 ext_convert_legacy_office 默认/回退值为 True —— ` +
+      '该转换是有损重建（丢图片/表格/样式、碎片混入正文、无敏感词也改写文件），必须保持默认关闭')
+  }
+  // 默认表 / 完整默认配置 / 读配置回退 / 运行时状态 四处都要关，漏一处就会重新打开。
+  const offDefaults = [...enginePanel.matchAll(/ext_convert_legacy_office[^\n]*?\bFalse\b/g)]
+  if (offDefaults.length < 3) {
+    fail(`engine/panel.py 只找到 ${offDefaults.length} 处 ext_convert_legacy_office=False —— ` +
+      '默认表 / 完整默认配置 / 读配置回退 / 运行时状态四处都要关，漏一处就漏开关')
+  }
+}
+if (!/const LEGACY_OFFICE_EXTS = new Set\(\[/.test(mainSrc)) {
+  fail('bridge-main.js 缺少 LEGACY_OFFICE_EXTS —— 旧版 Office 原样上行时无法给出专门提示')
+} else if (!/legacyCount/.test(mainSrc)) {
+  fail('bridge-main.js 声明了 LEGACY_OFFICE_EXTS 却没有 legacyCount 计数 —— 提示永远不会触发')
+}
+if (!/legacyCount/.test(sources['background.js'] || '')) {
+  fail('background.js 没有透传 legacyCount —— popup 读不到旧版 Office 告警计数')
+}
+if (!/attachTextLegacy/.test(sources['popup.js'] || '')) {
+  fail('popup.js 缺少 attachTextLegacy 文案 —— 旧版 Office 未脱敏时用户只看到笼统的「附件不脱敏」')
+}
+
+// ── mask 请求必须带 sid（否则多轮对话的占位符永远还原不回来）───────────────
+// 引擎的占位符映射表是**按 sid 隔离**的。此前 `/api/ext/mask` 调用压根不传 sid、
+// `mask-file` 传的也基本是空串，于是每轮都新签一个 → 模型引用上一轮（或文档脱敏那次）
+// 的占位符时，引擎在当前的表里查不到映射，只能原样吐回页面。
+// 用户看到的是「部分没被还原」，事件库里是 restored 与 unresolved 同时有值
+// （实测 2026-09-21：一次响应 restored=13 / unresolved=16，且相邻请求 sid 各不相同）。
+// 这两条静态可判，而运行时只表现为「少还原了几个字」，极难定位。
+const maskCallSites = [...bg.matchAll(/safeCall\(\s*'\/api\/ext\/mask'/g)]
+for (const site of maskCallSites) {
+  if (!/sid\s*:/.test(bg.slice(site.index, site.index + 300))) {
+    fail("background.js 的 /api/ext/mask 调用没带 sid —— 每轮新签 sid 会让多轮对话里" +
+      '的占位符无法还原（实测 restored 与 unresolved 同时有值）')
+  }
+}
+if (maskCallSites.length && !/async function findRecentSid/.test(bg)) {
+  fail('background.js 缺少 findRecentSid —— sid 无法按 tab+host 复用，跨轮次占位符还原不回来')
+}
+if (/async function findRecentSid/.test(bg) && !/v\.host !== host/.test(bg)) {
+  fail('background.js 的 findRecentSid 未按 host 区分 —— 同一标签页切换站点时会串用映射表')
+}
+
 // ── 结论 ────────────────────────────────────────────────────────────────────
 for (const n of notes) console.log(`check-extension:      ${n}`)
 if (errors.length) {

@@ -251,6 +251,9 @@ async function pushAttachment(tabId, payload) {
       image: !!prev.image || !!payload.image,
       count: Number(payload.count) || 0,
       maskedCount: Number(payload.maskedCount) || prev.maskedCount || 0,
+      // 旧版 Office(.doc/.xls) 未脱敏计数：与 maskedCount 同样「一旦出现过就保留」，
+      // 避免同一页面多次上传时，后一次的 payload 把前一次的告警抹掉。
+      legacyCount: Number(payload.legacyCount) || prev.legacyCount || 0,
       at: Date.now(),
     };
     await chrome.storage.session.set({ [ATTACH_KEY]: all });
@@ -302,6 +305,47 @@ async function validateSid(sid, tabId) {
     return rec.tabId === tabId && Date.now() - rec.issuedAt <= SID_TTL_MS;
   } catch (e) {
     return false;
+  }
+}
+
+/**
+ * 反查该 tab + host 最近签发的 sid，供**复用**引擎侧会话。
+ *
+ * **为什么必须复用**：引擎的占位符映射表是**按 sid 隔离**的。此前每个请求都新签一个
+ * sid（`bridge-main.js` 里 `let sid = null` 且 `/api/ext/mask` 根本不传 sid），于是同一标签页
+ * 多轮对话中，模型引用上一轮——或文档脱敏那次——的占位符时，引擎在「当前 sid」的表里
+ * 找不到映射，只能把 `{{...}}` 原样吐回页面。事件库里就是 restored 与 unresolved
+ * 同时有值（实测 2026-09-21：一次响应 restored=13 / unresolved=16，且相邻请求的 sid
+ * 每次都不一样）。用户看到的就是「部分没被还原」。
+ *
+ * 复用后同一 tab + host 的对话共享一张映射表，跨轮次引用可正常还原；
+ * **同一标签页内的重复打码也会因此走滑动窗口复用**（不再为同一个值重复造占位符）。
+ * host 变了（切站点）或超 TTL 就自然重新签发。
+ *
+ * 任何异常一律返回空串 = 退回「新签一个 sid」的旧行为：
+ * 最多是这一轮少还原几个占位符，不会影响打码本身。
+ */
+async function findRecentSid(tabId, host) {
+  if (!tabId || !host) return '';
+  try {
+    const all = await chrome.storage.session.get(null);
+    const now = Date.now();
+    let best = '';
+    let bestAt = -1;
+    for (const [k, v] of Object.entries(all || {})) {
+      // 只认引擎签发的 sid（`ext:` 前缀），跳过 maskit:* 等元数据键。
+      if (!k.startsWith('ext:') || !v || typeof v !== 'object') continue;
+      if (v.tabId !== tabId || v.host !== host) continue;
+      const at = typeof v.issuedAt === 'number' ? v.issuedAt : 0;
+      if (now - at > SID_TTL_MS) continue;
+      if (at > bestAt) {
+        bestAt = at;
+        best = k;
+      }
+    }
+    return best;
+  } catch (e) {
+    return '';
   }
 }
 
@@ -542,7 +586,9 @@ async function handleMask(payload, tabId, host) {
   if (!siteCovers(host, cfg.enabledSites)) {
     return { ok: false, passthrough: true, error: 'site_disabled' };
   }
-  const r = await safeCall('/api/ext/mask', { text, host });
+  // 带上本 tab + host 最近签发的 sid 以复用引擎会话（理由见 findRecentSid）。
+  // 不传的后果不是报错而是「部分占位符永远还原不回来」。
+  const r = await safeCall('/api/ext/mask', { text, host, sid: await findRecentSid(tabId, host) });
   if (r.ok) {
     await rememberSid(r.body.sid, tabId, host);
     await pushRecent({ host, path: 'mask', action: 'mask', count: 0, status: 'ok' });
@@ -556,7 +602,9 @@ async function handleMask(payload, tabId, host) {
 async function handleMaskFile(payload, tabId, host) {
   let filename = payload && typeof payload.filename === 'string' ? payload.filename.trim() : '';
   const base64 = payload && typeof payload.base64 === 'string' ? payload.base64 : '';
-  const sid = payload && typeof payload.sid === 'string' ? payload.sid : '';
+  // sid 优先用页面传来的（MAIN world 持有本次会话值），没有则复用本 tab+host 最近签发的。
+  const sid = (payload && typeof payload.sid === 'string' && payload.sid)
+    || (await findRecentSid(tabId, host));
   if (!base64) return { ok: false, passthrough: true };
   if (!filename) filename = 'attachment.xlsx';
 
