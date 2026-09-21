@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,6 +59,83 @@ class RenderReleaseNotesTests(unittest.TestCase):
         """Unreleased 章节面向下次发版，不能通过 'Unreleased' 当成版本号取出来。"""
         with self.assertRaises(SystemExit):
             rrn.render("Unreleased", ROOT / "CHANGELOG.md")
+
+
+class ExtensionUpdateNoticeTests(unittest.TestCase):
+    """「本次发版需不需要重载扩展」的自动判定。
+
+    为什么必须有：扩展与客户端是两套独立代码，客户端升级**不会**动到已安装的扩展，
+    所以大多数发版用户什么都不用做。但扩展真改了、用户又没重载时会**静默失效**
+    ——页面毫无异常，只是不再脱敏。靠发布者每次记得手写这句提示，必然会漏。
+    """
+
+    def test_render_appends_bilingual_notice_for_all_three_states(self):
+        cases = (("changed", "扩展有改动"),
+                 ("unchanged", "扩展无改动"),
+                 ("unknown", "无法自动判定"))
+        for state, needle in cases:
+            with self.subTest(state=state):
+                body = rrn.render("0.2.7", ROOT / "CHANGELOG.md", state)
+                self.assertIn(needle, body, f"{state} 的中文措辞缺失")
+                # 双语：每种状态都必须中英成对（Release 页面向海内外用户）。
+                # 注意变体选择符 U+FE0F 是可选的：`⚠️` / `ℹ️` 带它，而 `✅` 不带，
+                # 强行要求它存在会只放过两种状态（第一版就这么写的）。
+                self.assertRegex(body, r"(?s)> [⚠✅ℹ]️?.*\n> [⚠✅ℹ]️? .*[A-Za-z]")
+
+    def test_unknown_never_reads_as_no_change_needed(self):
+        """无法判定时**绝不能**说成「无改动」。
+
+        这是本机制最容易腐化的地方：一句 `except: return False` 就能让「不知道」
+        变成一句安心的「无需重新加载」，而它恰好会在契约真变了、最需要用户重载时骗人。
+        """
+        body = rrn.render("0.2.7", ROOT / "CHANGELOG.md", "unknown")
+        self.assertNotIn("无需", body)
+        self.assertNotIn("no need", body)
+
+    def test_extension_changed_is_none_without_a_ref(self):
+        """没有上一个 tag 时必须返回 None（三态），不能退化成 False。"""
+        self.assertIsNone(rrn.extension_changed(None, ROOT))
+
+    def test_extension_changed_returns_bool_on_real_history(self):
+        """真实仓库上必须能给出确定的 True/False，而不是恒 None。
+
+        只在有 git 历史时跑：浅克隆下 `_prev_tag` 拿不到东西，那是预期的 None。
+        """
+        prev = rrn._prev_tag(ROOT)
+        if not prev:
+            self.skipTest("无 git 历史（浅克隆），无法判定是预期行为")
+        self.assertIn(rrn.extension_changed(prev, ROOT), (True, False))
+
+    def test_prev_tag_never_falls_back_to_head(self):
+        """`HEAD^` 取不到时必须返回 None，**绝不能回退到 HEAD**。
+
+        浅克隆下（release job 的 checkout 若漏了 `fetch-depth: 0`）`describe HEAD`
+        会拿到**当前 tag 自己**，紧接着 `git diff <当前tag> HEAD -- extension/`
+        恒为空 → 把「扩展大改」算成「扩展无改动」，正是这个机制要防的假阴性。
+        用 mock 固定这一分支，不依赖 CI 的克隆深度。
+        """
+
+        def fake_git(args, cwd):
+            if args[-1] == "HEAD^":
+                return 128, ""          # 浅克隆：fatal: Not a valid object name HEAD^
+            if args[-1] == "HEAD":
+                return 0, "v9.9.9"      # 回退就会拿到这个（当前 tag 自己）
+            return 128, ""
+
+        with mock.patch.object(rrn, "_git", fake_git):
+            self.assertIsNone(rrn._prev_tag(ROOT))
+
+    def test_prev_tag_reads_parent_commit_not_current_tag(self):
+        """正常历史下取的是 HEAD^ 的 tag，而不是 HEAD 自己。"""
+        seen = []
+
+        def fake_git(args, cwd):
+            seen.append(args[-1])
+            return (0, "v0.3.2") if args[-1] == "HEAD^" else (0, "v0.3.3")
+
+        with mock.patch.object(rrn, "_git", fake_git):
+            self.assertEqual(rrn._prev_tag(ROOT), "v0.3.2")
+        self.assertEqual(seen[0], "HEAD^", "必须先查 HEAD^，且只查它")
 
     def test_missing_version_raises(self):
         """找不到版本号要 SystemExit，不能返回空字符串（否则 Release body 会空白）。"""

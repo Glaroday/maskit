@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.3.2'
+__version__ = '0.4.0'
 import json
 import codecs
 import copy
@@ -225,10 +225,29 @@ _origin_check_enabled = True
 # ── 浏览器扩展桥接（Browser Bridge v1）运行时状态 ──────────────────────────
 # 与 _origin_check_enabled 同款模式：load_config / save_config 写盘后由
 # _sync_runtime_config 原子同步，端点与 guard 不每次读盘。
+# ── 扩展协议版本（与产品版本**解耦**）────────────────────────────────
+#
+# 【为什么不能拿 __version__ 来比】扩展自己的 manifest.version 是 1.0.0，客户端版本与扩展的发布节奏不同步，
+# 两者**从来就不同步**（一个是浏览器扩展的发布节奏，一个是桌面 App 的），拿产品版本号
+# 做兼容判定必然误报。真正要回答的是「两边对 /api/ext/* 的字段与语义是否一致」，
+# 所以另立一个只随**接口契约**变化的整数。
+#
+# 改动规则：**只在 `/api/ext/*` 的请求/响应结构或语义发生变化时** +1，
+# 产品发版、UI 调整、内部重构一律不动它。
+# 扩展侧在 shared.js 里声明自己实现的版本（EXT_PROTOCOL_VERSION），两者不等即报警。
+EXT_PROTOCOL_VERSION = 1
+
 # ext_token 是 config.json 里第一个**长期**密钥（不随重启轮换），只对下面三个
 # 精确白名单端点有效；API_TOKEN 对全部 /api/* 有效（二选一）。
 # **精确白名单不用前缀**：否则扩展 token 能打到 /api/config、/api/ext/rotate-token。
-_EXT_ENDPOINTS = frozenset({"/api/ext/ping", "/api/ext/mask", "/api/ext/restore", "/api/ext/mask-file"})
+_EXT_ENDPOINTS = frozenset({"/api/ext/ping", "/api/ext/mask", "/api/ext/restore", "/api/ext/mask-file", "/api/ext/warn"})
+
+# 「疑似对话请求但 body 形态不受支持」的上报去重表（见 /api/ext/warn）。
+# 整站漏脱敏时每一发请求都会上报，不去重会把事件页刷满、把真正要看的风险记录挤掉。
+_ext_warn_seen: dict = {}
+# 去重表的硬上限（**严格有界**，不能只靠时间淘汰）：见 api_ext_warn 里的淘汰逻辑。
+# 该端点对已启用站点的任意页面脚本可达（path 由页面提供），不能假设调用方友善。
+_EXT_WARN_MAX = 200
 # 扩展上下文能出现的 Origin scheme。**扩展 ID 无法枚举**（解压加载/商店/profile 各异），
 # 所以只能按 scheme 放行；详见 _origin_ok() 里的实测说明与安全影响。
 _EXT_ORIGIN_SCHEMES = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
@@ -5713,9 +5732,63 @@ def _sweep_throttled(tr):
 def api_ext_ping():
     """扩展存活探针：SW 每 60s 调一次，拿版本 / 开关 / 累计计数。"""
     return jsonify({"ok": True, "version": __version__,
+                    # 协议版本：扩展侧比对本字段以发现「契约不兼容」
+                    # （拿 version 比没用，见 EXT_PROTOCOL_VERSION 的注释）
+                    "ext_protocol": EXT_PROTOCOL_VERSION,
                     "block_when_down": bool(_ext_cfg().get("ext_block_when_engine_down")),
                     "record_events": bool(_ext_cfg().get("ext_record_events", True)),
                     "stats": dict(_EXT_STATS)})
+
+
+@app.post("/api/ext/warn")
+def api_ext_warn():
+    """扩展上报：**URL 命中对话白名单，但 body 的 content-type 不在可打码集合内**。
+
+    这是本系统唯一一类「无感知漏脱敏」：用户以为内容被保护，实际原样明文出网。
+    扩展侧 `bridge-main.js` 在 `isUrlMaskable && !isMaskableBody` 时上报，这里复用
+    `transparent._emit_skip` 的事件通道（reason=`unsupported_content_type`），
+    让它在事件页可见、可筛选，而不是无声消失。
+
+    只在**本端点内**做 10s 去重，不改 `transparent._emit_skip` 的去重集合：
+    那条函数属于核心代理链路，本次改动不碰它。
+
+    只收元数据（host / 上游 path / content-type），**不收正文**：这个链路的意义恰恰是
+    「我们没能处理它」，把正文收进来等于把已经漏出去的明文再抄一份进 SQLite。
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        host = str(data.get("host") or "")[:120]
+        path = str(data.get("path") or "")[:200]
+        ct = str(data.get("content_type") or "")[:80]
+        key = (host, path, ct)
+        now = time.time()
+        if now - _ext_warn_seen.get(key, 0) < 10:
+            return jsonify({"ok": True, "deduped": True})
+        _ext_warn_seen[key] = now
+        if len(_ext_warn_seen) > _EXT_WARN_MAX:
+            # 先清过期项；**仍超限就按时间戳淘汰最旧的**，保证严格有界。
+            # 旧实现只删 >60s 的条目：60s 内灌进 200+ 个不同 key 就永不回收，
+            # 每个新 key 还会写一条 SQLite 事件。
+            for k in [k for k, ts in _ext_warn_seen.items() if now - ts > 60]:
+                _ext_warn_seen.pop(k, None)
+            overflow = len(_ext_warn_seen) - _EXT_WARN_MAX
+            if overflow > 0:
+                for k, _ts in sorted(_ext_warn_seen.items(), key=lambda kv: kv[1])[:overflow]:
+                    _ext_warn_seen.pop(k, None)
+        if _ext_cfg().get("ext_record_events", True):
+            import transparent as tr
+            # force=True：与「已配置客户端」同一条可见性通道，保证这条不会被静默丢弃。
+            tr._emit_skip(host=host, method="POST", path=path or "/ext/warn",
+                          reason="unsupported_content_type", content_type=ct,
+                          force=True)
+        return jsonify({"ok": True})
+    except Exception as e:
+        # 可观测性失败绝不能反噬请求本身：只记异常类型名，不记 message（可能带正文片段）。
+        try:
+            _emit_log(f"[panel] ext warn 失败: {type(e).__name__}")
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "engine_error"})
 
 
 @app.post("/api/ext/mask")
@@ -5956,7 +6029,10 @@ def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
 
     采用 Python 原生 zipfile 与 xml.etree.ElementTree，零外部依赖，毫秒级解包替换并重新封包。
     支持老版 Office (.doc / .xls) 内存安全提取文本与转码。
+
     返回: (masked_bytes, total_hits)
+    **只要命中过敏感值，返回的一定是打过码的字节**：体积无法与原始对齐时也不回退明文
+    （回退会让 hit_count 归零，扩展侧会误判成「无敏感信息」而静默放行）。
     """
     ext = (filename.lower().split(".")[-1] if "." in filename else "").strip()
     # 旧格式转换默认关闭：开了它产出的“转换结果”是有损重建（丢图片/丢表格/混入乱码），
@@ -6081,12 +6157,19 @@ def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
     if len(out_val) < len(raw_bytes):
         out_val = _pad_zip_to_size(out_val, len(raw_bytes))
     if len(out_val) != len(raw_bytes):
-        # 体积对不齐的两种情况：① 重压后反而变大；② 补白量超过 ZIP 注释字段的 64KB 上限。
-        # 此时**放弃内部脱敏、原样返回**：宁可「未脱敏但文件能正常上传」，
-        # 也不要「打码了却被上游拒收」——后者用户拿到的是一个报错，前者至少可用。
-        # 降级会记一条面板日志，用户可在日志页看到。
-        _emit_log(f"[panel] Office 重压缩体积无法对齐原始 ({len(out_val)} vs {len(raw_bytes)})，跳过内部脱敏")
-        return raw_bytes, 0
+        # 体积对不齐的两种情况：① 重压后反而变大（打码本身会让内容变长，而 ZIP 注释
+        # 补白**只能补大、不能削小**）；② 补白量超过 ZIP 注释字段的 64KB 上限。
+        #
+        # 此时**仍然返回已打码的字节**，绝不回退成原始明文：一旦回退，`hit_count` 会跟着
+        # 归零，扩展侧 `maskSingleFile` 就会把这份文件当成「没有敏感信息」——既不替换上传
+        # 内容、也不提示、也不记事件，用户以为受保护，整份文档却明文出网（实测可复现，
+        # 见 tests/test_ext_bridge.py 的 size-mismatch 用例）。
+        # 代价是上游若按上传前声明的 file_size 严格校验，可能回 file_size_mismatch 让这次
+        # 上传失败——那是用户可见的报错，远优于静默明文。降级留一条面板日志便于定位。
+        _emit_log(
+            f"[panel] Office 重压缩体积无法对齐原始 ({len(out_val)} vs {len(raw_bytes)})，"
+            f"仍返回脱敏结果（上游可能按 file_size 拒收）"
+        )
     return out_val, total_hits
 
 

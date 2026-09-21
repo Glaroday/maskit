@@ -15,6 +15,7 @@
   - [2. Claude Code 接入（结合 cc-switch 最简单）](#2-claude-code-接入结合-cc-switch-最简单)
   - [3. Codex / Pi / OpenCode / 终端 CLI 接入](#3-codex--pi--opencode--终端-cli-接入)
   - [4. Python / Node.js 等代码 SDK 接入](#4-python--nodejs-等代码-sdk-接入)
+  - [5. 浏览器扩展接入（ChatGPT / Claude / 豆包 等网页版 AI）](#5-浏览器扩展接入chatgpt--claude--豆包-等网页版-ai)
 - [五、验证脱敏与还原实测效果](#五验证脱敏与还原实测效果)
 - [六、进阶玩法：自定义敏感词库与规则开关](#六进阶玩法自定义敏感词库与规则开关)
 - [七、常见问题排查 (FAQ)](#七常见问题排查-faq)
@@ -223,6 +224,23 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+---
+
+### 5. 浏览器扩展接入（ChatGPT / Claude / 豆包 等网页版 AI）
+
+网页版 AI 无法修改 API Base URL，使用 Maskit 专属浏览器扩展即可实现网页原生流式打码与还原：
+
+1. **安装扩展**：
+   - 从 [GitHub Releases](https://github.com/xiaYuTian11/maskit/releases/latest) 下载 `Maskit_<版本>_extension.zip` 并解压；
+   - 打开 Chrome 或 Edge，访问 `chrome://extensions`，右上角开启**「开发者模式」**；
+   - 点击**「加载已解压的扩展程序」**，选择刚刚解压出的扩展目录。
+2. **授权配对**：
+   - 打开 Maskit 控制台的 **“设置 → 浏览器扩展”**，确保开关开启，并复制“访问令牌”；
+   - 点击浏览器右上角扩展图标，在弹窗中粘贴令牌保存。状态变为绿色即表示连接成功！
+3. **支持功能**：
+   - **双引擎拦截**：同时覆盖标准 Fetch 与底层 XMLHttpRequest（XHR），兼容 DeepSeek、ChatGPT、Claude、豆包等 18+ 站点；
+   - **附件脱敏**：网页上传 Word（`.docx` / `.doc`）、Excel（`.xlsx` / `.xls`）、PPT（`.pptx`）等文件时，在本地全自动脱敏后再出网，回复自动流式还原。
 
 ---
 

@@ -29,7 +29,8 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 
 - 🔑 **Credentials & Secrets**: `sk-proj-...`, `ghp_...`, Cloud AccessKeys, JWT Tokens, private keys;
 - 🌐 **Internal Infrastructure**: DB connection strings (`mysql://root:Pass123@192.168.1.50:3306/db`), private IP addresses (`10.x`, `172.16.x`, `192.168.x`);
-- 👤 **Business Privacy (PII)**: Phone numbers, ID numbers, real names, credit cards, proprietary internal project names.
+- 👤 **Business Privacy (PII)**: Phone numbers, ID numbers, real names, credit cards, proprietary internal project names;
+- 📄 **Documents & Attachments**: Word (`.docx` / `.doc`), Excel (`.xlsx` / `.xls`), and PowerPoint (`.pptx`) files uploaded to web AI containing confidential business data.
 
 **Maskit's Mission**: Act as a transparent local privacy gateway between your developer tools and external AI providers — **mask sensitive tokens before requests leave your machine, and restore them in real-time typewriter stream as answers arrive**!
 
@@ -71,8 +72,10 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 - **100% Offline Local Inference**: Runs entirely inside your local process without any external network calls; toggleable in Settings.
 
 ### 🌐 3. Browser Extension Ecosystem (Web AI Privacy)
-- **Seamless Web AI Protection**: Dedicated Chrome & Edge MV3 extension for **ChatGPT, Claude, Kimi, Doubao, Qwen**, and other web-based AI platforms;
-- **Local Masking + Typewriter Stream Restoration**: Prompts sent from web tabs are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI; 18+ preset AI sites with one-click authorization.
+- **Seamless Web AI Protection**: Dedicated Chrome & Edge MV3 extension for **ChatGPT, Claude, Kimi, Doubao, Qwen**, and other web AI platforms with 18+ preset sites with one-click authorization;
+- **Dual-Channel Interception (Fetch + XHR Engines)**: Intercepts standard Fetch as well as low-level `XMLHttpRequest` requests and streaming responses (XHR response restoration currently covers DeepSeek web only); other sites keep native behavior untouched;
+- **Direct Document & Attachment Masking**: Automatically parses and masks Word (`.docx` / `.doc`), Excel (`.xlsx` / `.xls`), and PowerPoint (`.pptx`) files locally before upload to cloud models;
+- **Local Masking + Typewriter Stream Restoration**: Prompts and attachments are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI with multi-turn session consistency.
 
 ### ⚡ 4. Millisecond SSE Stream Takeover (Native Typewriter Flow)
 - Intercepts `text/event-stream` chunk by chunk with incremental restoration;
@@ -164,6 +167,7 @@ Web-based AI platforms cannot configure an API Base URL. Use Maskit's browser ex
 3. **Enable Sites**: Toggle target platforms (e.g. `chatgpt.com`, `claude.ai`, with 18+ preset sites supported and custom URL support).
 
 > 💡 **Status & Troubleshooting**:
+> - **File & Attachment Masking**: The extension supports direct attachment uploads and Office document masking (`.docx` / `.xlsx` / `.pptx` and transcoded `.doc` / `.xls`), eliminating manual scrubbing;
 > - Extension icon popup clearly displays current state: Green (Protected), Yellow (Engine offline, passthrough), Red (Invalid token or bridge disabled);
 > - Extension events are logged in the dashboard's "Event Logs" and can be filtered by ingress (Proxy Link vs Browser Extension).
 

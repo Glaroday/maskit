@@ -121,8 +121,8 @@ if ($Version -and $Version.StartsWith("v", [StringComparison]::OrdinalIgnoreCase
     $Version = $Version.Substring(1)
 }
 if ($Version) {
-    if ($Version -notmatch '^\d+\.\d+\.\d+$') {
-        Write-Error "版本号必须是 X.Y.Z（收到: $Version）"; exit 1
+    if ($Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+        Write-Error "版本号必须是 X.Y.Z 或 X.Y.Z-prerelease（收到: $Version）"; exit 1
     }
     $newVer = $Version
     Write-Host "指定版本构建: $origVer -> $newVer" -ForegroundColor Cyan

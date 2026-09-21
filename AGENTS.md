@@ -144,6 +144,7 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
   - 任何 AI 助手（包括当前 Agent、任何子代理及后续会话）**严禁在未经用户明确书面授权确认的情况下执行任何发布动作**（包括但不限于：执行 `git push origin v*`、执行发版脚本 `release.ps1`、调用 GitHub API 创建 Release、修改线上 Release状态）；
   - 发版前必须先完成所有本地全量门禁，并向用户展示最终变动清单与验证证据，**在用户明确发出“确认发版/发版吧”等指令后方可执行**。用户如果仅要求“检查/审计/看看”，本轮只输出报告，严禁顺手执行发版。
   - **模型版本前置核验（用户约定，2026-09-19）**：严禁在自动化流水线中盲目外网拉取未知模型；当用户要求发版时，AI 助手在执行打包前应先主动确认当前依赖的本地语义模型（`ner_mini_zh`）是否存在官方权威重大升级；若有升级，向用户说明并在离线跑通 `test_benchmark_matrix.py` 评测矩阵后决定是否替换；若无升级，以本地已就绪模型直接构建【全功能一体包 (All-in-One)】。
+    核验结论必须**带日期锚点写进发版 commit message**（形如「模型核验 2026-09-21：`ckiplab/bert-base-chinese-ner` 上游无更新」）—— 核验是 AI 对上游发布的事实判断，仓库里没有痕迹可复核，不写日期锚点等于这项检查不可审计。
 
 - **发版日志中英双语规范（强制）**：
   - 每次发版时，`CHANGELOG.md` 与 GitHub Release 说明必须提供**中英双语（Bilingual）对照**，方便海内外开发者理解变更细节；
@@ -180,6 +181,21 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
   - Windows: `src-tauri\target\release\bundle\nsis\Maskit_<版本>_x64-setup.exe`；
   - macOS: `src-tauri/target/release/bundle/dmg/Maskit_<版本>_aarch64.dmg`。
 
+- **分支与开发流转规范（Branching Strategy）**：
+  - `master`：主干稳定分支，存放已验证、可随时上线的生产级代码。正式版 Tag（`vX.Y.Z`）仅在此分支打出；
+  - `dev`：开发与先行测试分支，所有新特性开发（如浏览器扩展 XHR 拦截、文件脱敏适配等）先在 `dev` 分支迭代并自测。
+
+- **Beta / 预发布版本更新隔离规范（Pre-release Isolation）**：
+  - 尚在迭代或稳定性待验证的先行特性，若需提前打包分发测试，发布为 **Beta 预发布版本**（如 `v0.2.x-beta.N`）；
+  - **客户端防打扰与更新隔离底线（客户端默认不检测 Beta 更新）**：桌面端 Tauri 更新器端点固定为 `releases/latest/download/latest.json`。GitHub 官方核心机制中，`releases/latest` 永远只指向最新的正式稳定 Release，**天然排除所有标记为 Pre-release 的预发布版本**。因此任何先行 Beta 发布在 GitHub Release 上必须显式标记为 **Pre-release**，且绝不能产出/覆盖正式版的 `latest.json`。现网所有已安装正式版客户端默认**绝对不会检测到 Beta 更新**，彻底杜绝未稳定改动骚扰普通用户。
+  - **Beta 发布暂不支持（2026-09-21 实测：一键与手工两条路都走不通）**：缺口全在版本号读取正则（都带闭合引号 `__version__ = '(\d+\.\d+\.\d+)'`）—— `build.ps1` 的 105/107 与 184-188、`release.ps1:101`；`bump-version.py` 的入参校验 `fullmatch(r"\d+\.\d+\.\d+")` 同样不收 prerelease 后缀，所以连「手改版本号」那一步都进不去。
+    走 `build.ps1 -Version "X.Y.Z-beta.N"` 时，**先炸的是 184-188 的读回校验**（在任何构建之前，因此并不浪费打包时间），报「版本分叉，打包中止」—— **该中止路径漏调 `Restore-Version`**（build.ps1 里其余 22 个失败点都调了），于是 7 个版本文件会留在 beta 的脏状态，而报错文案会把排查方向带向「哪个文件没同步」，实际是正则读不出来。`release.ps1` 见 `build.ps1` 非零即退出，到不了它自己的 101 行。
+    **需要预发布时不要走这两条路**（今天没有任何一条能通）；补齐上述正则与 `Restore-Version` 之前**一律不发 beta**。这是独立专项，不与正式发版混在一个改动里做。
+
+- **本地开发与联调热更新底线（用户明确约定，2026-09-20）**：
+  - 当修改了引擎（`engine/`）、前端（`frontend/`）或相关脱敏逻辑需要用户进行联调测试时，**AI 助手必须主动调用本地全量部署安装脚本（`.\scripts\local-dev-deploy.ps1 -Full`）完成编译、安全备份、替换本地安装目录（`<Maskit 安装目录>`，即 Tauri 默认安装位置）并重启客户端进程**；
+  - 严禁仅修改本地源码文件而不重新安装客户端就让用户进行测试验证（因为扩展调用的是已安装客户端 5801 端口的旧编译引擎，未安装会导致新脱敏逻辑完全不生效）。
+
 ---
 
 ## 6. 文档与产物的入库边界
@@ -194,6 +210,7 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 | `README.md` / `README_EN.md` | 项目门面 |
 | `CONTRIBUTING.md` / `CODE_OF_CONDUCT.md` / `SECURITY.md` | 协作与安全契约 |
 | `CHANGELOG.md` | 发版日志（release 流水线从它切出 Release body） |
+| `scripts/*.py` / `*.mjs` / `*.ps1` | 本地与 CI 共用的门禁、发版、打包、本地部署脚本。`verify-all.py` 是唯一门禁清单；`local-dev-deploy.ps1` 是 AGENTS.md §5 要求的联调热更新入口 —— 不入库则新克隆体拿不到它，却被告知「必须调用」 |
 | `AGENTS.md` / `CLAUDE.md` | **工程规范基准**。`CLAUDE.md` 只有一行 `@AGENTS.md`，是跨工具入口 —— 不入库则 red line 在克隆体上整体丢失 |
 | `docs/*.md` | 长期参考文档 |
 
@@ -203,9 +220,9 @@ python scripts/verify-all.py --list          # 打印清单（供漂移比对）
 
 ### 6.2 忽略（本机工作产物）
 
-已在 `.gitignore`：`ai-coding/`（开发规格 / 交接 / 代码评审 / 会话证据）、
+已在 `.gitignore`：`ai-coding/`（开发规格 / 调研快照 / 交接 / 代码评审 / 会话证据）、
 `.claude/`、`.codex/`、`.pi/`、`.pi-subagents/`、`.workbuddy-ai/`、`.workbuddy/`、
-`.mcp.json`、`PROMOTION_GUIDE.md`、`AUDIT-*.md`、`DESIGN-*.md`、`HANDOVER.md`。
+`.mcp.json`、`PROMOTION_GUIDE.md`、`AUDIT-*.md`、`DESIGN-*.md`、`HANDOVER.md`、`docs/*-REFERENCES.md`。
 
 **共同特征**：内容是「某次会话当下的判断」，生命周期比代码短，会随代码演进迅速过期。
 留在仓库里只会让后来者读到已经失效的结论。

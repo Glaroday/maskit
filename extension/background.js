@@ -26,7 +26,7 @@
 if (typeof importScripts === 'function') {
   importScripts('shared.js');
 }
-const { STATIC_SITES, siteMatchPattern, siteCovers, isLocalPanelUrl } = self.MASKIT_SHARED;
+const { STATIC_SITES, siteMatchPattern, siteCovers, isLocalPanelUrl, EXT_PROTOCOL_VERSION } = self.MASKIT_SHARED;
 
 const DEFAULTS = {
   token: '',
@@ -117,7 +117,15 @@ const SESSION_QUOTA_HINT = 1024 * 1024;
 // ── 内存缓存 ────────────────────────────────────────────────────────────────
 // 丢了也没关系（可从 panel 重新问），所以放内存；**sid 签发表绝不放这里**：
 // MV3 SW 空闲 ~30s 就被终止，内存 Map 必丢，推理模型思考几十秒不吐 chunk 是常态。
-let cache = { alive: null, version: '', blockWhenDown: false, recordEvents: true, stats: null, at: 0 };
+let cache = { alive: null, version: '', protocol: null, blockWhenDown: false, recordEvents: true, stats: null, at: 0 };
+// cache 是否已经被一次**成功的 ping** 填充过。用来区分「用户的显式选择」与
+// 「我们还没拿到过任何值」：前者要执行，后者才允许保守放行（见 restoreBlockWhenDownOnce）。
+let cacheFromPing = false;
+// 协议握手结果（引擎与扩展对 /api/ext/* 的契约是否一致）。
+// 默认 true：在第一次 ping 成功之前我们无法确认契约一致，按「不确定就不承诺」处理。
+// 注意它**不进 cache**：cache 会在 ping 失败时被写成 alive:false，而协议不匹配是
+// 「引擎可达但契约不对」，两件事必须分开表达。
+let protoMismatch = true;
 let downUntil = 0;
 // 403 配置性拒绝的退避状态（见 AUTH_HOLD_MS 注释）。与 downUntil 分开记：两者展示
 // 语义不同（一个黄标「引擎未运行」、一个红标「token 失效/扩展已关闭」），但**都**
@@ -152,6 +160,22 @@ async function getPanelUrl() {
 }
 
 // ── 状态与元数据缓冲（都只存元数据） ─────────────────────────────────────────
+
+/**
+ * 协议不匹配时在扩展图标上打角标。
+ *
+ * 为什么必须打到图标上：popup 只在用户主动点开时才看得到，而「契约不兼容」意味着
+ * 脱敏语义可能已经不对了——这种状态下最不该依赖用户想起来去点开看。
+ * 角标是唯一「不看也会注意到」的通道。
+ */
+async function applyProtoBadge(mismatch) {
+  try {
+    await chrome.action.setBadgeText({ text: mismatch ? '!' : '' });
+    if (mismatch) await chrome.action.setBadgeBackgroundColor({ color: '#d97706' });
+  } catch (e) {
+    /* 角标写不进去不能影响主链路 */
+  }
+}
 
 async function setStatus(engine, detail) {
   const next = { engine, detail: String(detail || '').slice(0, 80), at: Date.now() };
@@ -401,7 +425,38 @@ function isBlocking(data) {
   return !!(data && data.blocking === true);
 }
 
+// 「引擎不可用时阻断」是用户在面板里的**显式选择**，只存在引擎侧 config.json，
+// 扩展只能靠 ping 拿到。而 `cache` 是 SW 内存变量（初值 false），SW 被回收后如果
+// 引擎正好不可达，取值就回落成 false —— 恰恰在这个开关**唯一有意义**的场景里把用户
+// 的选择静默丢掉。所以拿到过就落一份到 session storage，冷启动时回读。
+// （用 session 而不是 local：它活过一个 SW 回收周期就够，不需要跨浏览器重启。）
+const BLOCK_ON_DOWN_KEY = 'maskit:blockWhenDown';
+let blockRestorePromise = null;
+
+/**
+ * SW 冷启动后把**曾经从引擎拿到过**的阻断开关读回来。
+ *
+ * 只回读「拿到过」的值：首次安装 / 从未 ping 通时仍然回落 false —— 不能因为拿不到
+ * 开关就擅自把网页打断（否则会在引擎没装时就断送用户的网页 AI）。
+ * 区别是「用户的显式选择」与「我们不知道」：前者必须执行，后者才可以保守放行。
+ */
+function restoreBlockWhenDownOnce() {
+  if (!blockRestorePromise) {
+    blockRestorePromise = chrome.storage.session
+      .get(BLOCK_ON_DOWN_KEY)
+      .then((s) => {
+        const v = s && s[BLOCK_ON_DOWN_KEY];
+        if (!cacheFromPing && typeof v === 'boolean') {
+          cache = { ...cache, blockWhenDown: v };
+        }
+      })
+      .catch(() => {});   // 读不到就按「不知道」处理，不影响主流程
+  }
+  return blockRestorePromise;
+}
+
 async function isBlockOnDown() {
+  await restoreBlockWhenDownOnce();
   if (Date.now() - cache.at > PING_TTL_MS) {
     await refreshPing().catch(() => {});
   }
@@ -427,10 +482,25 @@ async function refreshPing() {
   if (r.http === 200 && data && data.ok) {
     cache = {
       alive: true, version: data.version || '',
+      protocol: typeof data.ext_protocol === 'number' ? data.ext_protocol : null,
       blockWhenDown: data.block_when_down === true,
       recordEvents: data.record_events !== false,
       stats: data.stats || null, at: Date.now(),
     };
+    cacheFromPing = true;
+    // 落盘用户的选择：给 SW 冷启动留一条回读路径（见 restoreBlockWhenDownOnce）。
+    // 写失败不影响本次 ping 结果（只损失一次冷启动后的回读）。
+    try {
+      await chrome.storage.session.set({ [BLOCK_ON_DOWN_KEY]: cache.blockWhenDown });
+    } catch (e) { /* ignore */ }
+    // ── 协议握手 ────────────────────────────────────────────────────
+    // 比的是**协议版本**而不是产品版本（理由见 shared.js 的 EXT_PROTOCOL_VERSION 注释）。
+    // 握手缺失的代价：客户端改了 /api/ext/* 契约而用户没重载扩展时，扩展会**静默失效**
+    // ——页面毫无异常，用户只看到「怎么不脱敏了」，且没有任何地方能归因。
+    //
+    // `ext_protocol` 缺失（老引擎）也算不匹配：那时无法确认契约一致。
+    protoMismatch = cache.protocol !== EXT_PROTOCOL_VERSION;
+    await applyProtoBadge(protoMismatch);
     // 自愈：ping 成功即证明「引擎可达 + token 有效 + 面板开关已开」三件事同时成立，
     // 两个退避窗口都没有继续存在的理由，立刻解除。
     // 不这么做的话：用户改对 token 后仍要盲等最多 60s 才恢复脱敏，而这 60s 里的流量
@@ -557,6 +627,57 @@ async function safeCall(path, body) {
 
 // ── 业务处理 ────────────────────────────────────────────────────────────────
 
+/**
+ * 打字探针（autocomplete）判定。
+ *
+ * 【为什么需要】ChatGPT 等站点有补全接口，会**在用户还没点发送时**就把输入框内容发出去。
+ * 实测（2026-09-20）送过来的是**未上屏的拼音中间态**：
+ *     {"input_text":"帮我整合y'xia"} → NER 把 "y'xia" 判成 NAME
+ *     {"input_text":"帮我整合y'x"}   → NER 把 "y'x"（仅 3 字符）判成 ORG
+ * 这些垃圾映射本身无害（碎片不可能与真实姓名碰撞），但一旦写进主对话的复用表，
+ * 后续真实文本里出现同样的串就会被替换掉——属**跳轮污染**，用户可见。
+ *
+ * 【为什么不复用 sid】打字探针**脱敏照做**（隐私不能降：碎片里也可能真带手机号），
+ * 但不参与会话复用——映射不跳请求、不进主对话会话，污染面到此为止。
+ *
+ * 【判据为什么用 body 而不是 URL】这类请求与正常对话同处 `/backend-api/` 前缀下，
+ * 路径区分不了；`input_text` / `num_completions` 是补全接口独有的字段。
+ * 判定必须在 SW 侧做：页面上报的 payload 一律不可信（与 host/sid 同一条原则）。
+ */
+function isTypingProbe(text) {
+  // 便宜预筛：绝大多数请求两个字段都没有，没必要为它们 JSON.parse。
+  if (text.indexOf('"num_completions"') === -1 && text.indexOf('"input_text"') === -1) {
+    return false;
+  }
+  // 必须按**顶层键**判定。全文子串匹配会误伤：用户（Maskit 的用户就是开发者）
+  // 把带 `"input_text":` 的日志/JSON 贴进对话是日常，那轮真实对话因此被判成探针、
+  // 不复用 sid，回复里的占位符再也还原不回来，而页面上看不出任何异常。
+  try {
+    const o = JSON.parse(text);
+    return !!o && typeof o === 'object' && !Array.isArray(o)
+      && ('num_completions' in o || 'input_text' in o);
+  } catch (e) {
+    return false;   // 非 JSON（multipart 之类）→ 不是探针
+  }
+}
+
+/**
+ * 扩展上报「URL 命中对话白名单，但 body 的 content-type 打不开」。
+ *
+ * 这是本系统唯一一类无感知漏脱敏（详见 bridge-main.js 的 reportUnsupportedBody）。
+ * 引擎侧落一条 SKIP 事件（复用 _emit_skip），reason=unsupported_content_type。
+ * 去重与防刷在引擎端点内做，这里只做站点开关与总开关的兜底。
+ */
+async function handleWarn(payload, tabId, host) {
+  const path = payload && typeof payload.path === 'string' ? payload.path : '';
+  const ct = payload && typeof payload.content_type === 'string' ? payload.content_type : '';
+  const cfg = await getConfig();
+  if (cfg.enabled === false) return { ok: false, passthrough: true, error: 'ext_disabled' };
+  if (!siteCovers(host, cfg.enabledSites)) return { ok: false, passthrough: true, error: 'site_disabled' };
+  const r = await safeCall('/api/ext/warn', { host, path, content_type: ct });
+  return r.ok ? r.body : { ok: false };
+}
+
 async function handleMask(payload, tabId, host) {
   // payload 里的 host / sid 一律忽略（页面提供不可信）
   const text = payload && typeof payload.text === 'string' ? payload.text : '';
@@ -588,7 +709,11 @@ async function handleMask(payload, tabId, host) {
   }
   // 带上本 tab + host 最近签发的 sid 以复用引擎会话（理由见 findRecentSid）。
   // 不传的后果不是报错而是「部分占位符永远还原不回来」。
-  const r = await safeCall('/api/ext/mask', { text, host, sid: await findRecentSid(tabId, host) });
+  //
+  // 打字探针（autocomplete）**例外**：不复用 sid，防止未上屏的拼音碎片被 NER 误判后
+  // 混进主对话映射表（跳轮污染，详见 isTypingProbe 注释）。脱敏照做。
+  const sid = isTypingProbe(text) ? null : await findRecentSid(tabId, host);
+  const r = await safeCall('/api/ext/mask', { text, host, sid });
   if (r.ok) {
     await rememberSid(r.body.sid, tabId, host);
     await pushRecent({ host, path: 'mask', action: 'mask', count: 0, status: 'ok' });
@@ -693,6 +818,9 @@ async function handleAdmin(op) {
       attachments: (await chrome.storage.session.get(ATTACH_KEY))[ATTACH_KEY] || {},
       // 引擎不在时 popup 要给的去向——扩展不能独立工作，必须明说去哪装
       downloadUrl: DOWNLOAD_URL,
+      // 协议握手：不一致时 popup 必须显式报出来，不能等用户自己发现「怎么不脱敏了」
+      protoMismatch,
+      engineProtocol: (cache && typeof cache.protocol === 'number') ? cache.protocol : null,
       daily: (await chrome.storage.session.get(DAILY_KEY))[DAILY_KEY] || null,
       sidCount: sids.length,
       sessionBytes: bytes,
@@ -765,6 +893,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.action === 'mask_file') {
     handleMaskFile(msg.payload, tabId, host).then(sendResponse).catch((e) => sendResponse({ ok: false, passthrough: true, error: String(e) }));
+    return true;
+  }
+  if (msg.action === 'warn') {
+    // 可观测性通道：只上报元数据，失败也不影响请求链路。
+    handleWarn(msg.payload, tabId, host).then(sendResponse).catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
   if (msg.action === 'restore') {

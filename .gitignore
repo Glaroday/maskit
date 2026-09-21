@@ -5,6 +5,7 @@ scripts/preview-env.py
 scripts/preview_env.py
 scripts/seed-mock-data.py
 scripts/seed_mock_data.py
+test_samples/
 
 # Python
 __pycache__/
@@ -74,6 +75,11 @@ src-tauri/resources/engine/
 *.pdb
 
 # Local / IDE
+# 本机工作产物与个性化规则
+#
+# ⚠️ AGENTS.md / CLAUDE.md **不能**忽略：它们是项目的工程规范基准（判据见 AGENTS.md §6.1），
+# 克隆体上缺了它们等于整套 red line 整体丢失；CLAUDE.md 只是指向 AGENTS.md 的一行入口。
+# 二者曾于本机被误加入本忽略清单，恢复 git 跟踪时请确认它们在 `git ls-files` 里。
 PROMOTION_GUIDE.md
 .vscode/
 .idea/
@@ -105,3 +111,10 @@ HANDOVER.md
 # 设计文档：写于改动之前，落地时几乎必然与最终实现有偏差；入库会被后来者
 # 当成现状读。当前事实以代码注释与测试为准。判据见 AGENTS.md §6.1。
 DESIGN-*.md
+
+# 本机调研 / 方案探索 / 参考快照（统一归档至已忽略的 ai-coding/，或按通配忽略）
+docs/*-REFERENCES.md
+docs/DESIGN-*.md
+docs/AUDIT-*.md
+docs/RESEARCH-*.md
+

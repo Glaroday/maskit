@@ -96,7 +96,7 @@ jobs:
           tags: |
             type=ref,event=tag
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-rc') }}
       - name: Fetch NER model for All-in-One Docker image
         shell: bash
         run: |
@@ -370,6 +370,12 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # 必须取全历史：`render-release-notes.py` 用 `git describe HEAD^` 判定
+          # 「相对上一个 tag，extension/ 有没有改动」。浅克隆下 HEAD^ 不存在，
+          # 判定会退化成拿当前 tag 与当前提交相比（恒无差异）→ Release 页谎报
+          # 「扩展无改动」，而扩展没重载时会静默失效。
+          fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: 'maskit-*'
@@ -382,6 +388,11 @@ jobs:
         run: |
           set -euo pipefail
           unsigned_count=$(find release-assets -name UNSIGNED.txt -type f | wc -l)
+          is_prerelease=false
+          if [[ "$GITHUB_REF_NAME" == *"-beta"* || "$GITHUB_REF_NAME" == *"-alpha"* || "$GITHUB_REF_NAME" == *"-rc"* ]]; then
+            is_prerelease=true
+          fi
+
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             # Release 已存在 —— 走的是「移动 tag 重跑」场景：把 body 更新到最新的双语版本，
             # 资产由下面的 `gh release upload --clobber` 覆盖；注意 upload 不会删除线上多余资产，
@@ -392,14 +403,22 @@ jobs:
               exit 0
             fi
             note=$(python3 scripts/render-release-notes.py "${GITHUB_REF_NAME#v}")
-            gh release edit "$GITHUB_REF_NAME" --notes "$note"
+            if [ "$is_prerelease" = true ]; then
+              gh release edit "$GITHUB_REF_NAME" --notes "$note" --prerelease
+            else
+              gh release edit "$GITHUB_REF_NAME" --notes "$note"
+            fi
           else
             if [ "$unsigned_count" -gt 0 ]; then
               note='At least one desktop bundle is UNSIGNED. No updater signature was produced for it, so automatic updates are not offered for those bundles; install them manually instead.'
             else
               note=$(python3 scripts/render-release-notes.py "${GITHUB_REF_NAME#v}")
             fi
-            gh release create "$GITHUB_REF_NAME" --draft --generate-notes --title "Data Maskit $GITHUB_REF_NAME" --notes "$note"
+            if [ "$is_prerelease" = true ]; then
+              gh release create "$GITHUB_REF_NAME" --draft --prerelease --generate-notes --title "Data Maskit $GITHUB_REF_NAME" --notes "$note"
+            else
+              gh release create "$GITHUB_REF_NAME" --draft --generate-notes --title "Data Maskit $GITHUB_REF_NAME" --notes "$note"
+            fi
           fi
           # 清理线上已存在的 Tauri 构建中间产物（仅 v0.2.7 那次出现的新增项；现有 Release 上的资产
           # gh release upload 不会自动删除，这里手动清掉，避免发布页混进 bundle_dmg.sh / icon.icns /
@@ -415,11 +434,16 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" "$file" --clobber
           done < <(find release-assets -type f ! -name 'latest.json' -print0)
 
-          # 若存在已签名安装包（.sig），自动组装并上传 latest.json 更新元数据
-          python3 scripts/generate-latest-json.py release-assets
-          if [ -f release-assets/latest.json ]; then
-            gh release upload "$GITHUB_REF_NAME" release-assets/latest.json --clobber
-            echo "Uploaded latest.json for $GITHUB_REF_NAME"
+          # 若存在已签名安装包（.sig），且非 Beta 预发布版本，自动组装并上传 latest.json 更新元数据
+          # Beta 预发布版本绝对不上传 latest.json，防止现网普通客户端误检测到更新
+          if [ "$is_prerelease" = false ]; then
+            python3 scripts/generate-latest-json.py release-assets
+            if [ -f release-assets/latest.json ]; then
+              gh release upload "$GITHUB_REF_NAME" release-assets/latest.json --clobber
+              echo "Uploaded latest.json for $GITHUB_REF_NAME"
+            fi
+          else
+            echo "Pre-release $GITHUB_REF_NAME detected; skipped generating latest.json to isolate auto-updates."
           fi
 
           # 所有资产上传完成后自动发布，避免长期停留 Draft —— 但**仅限签名完整时**。
@@ -439,6 +463,11 @@ jobs:
             echo "::warning title=未签名 Release 已保持草稿::$unsigned_count 个安装包未签名、未生成 latest.json；为避免全量用户更新检查 404，Release 保持 Draft。"
             echo "Kept release $GITHUB_REF_NAME as draft (unsigned artifacts)."
           else
-            gh release edit "$GITHUB_REF_NAME" --draft=false
-            echo "Published release $GITHUB_REF_NAME"
+            if [ "$is_prerelease" = true ]; then
+              gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
+              echo "Published pre-release $GITHUB_REF_NAME (isolated from updater)"
+            else
+              gh release edit "$GITHUB_REF_NAME" --draft=false
+              echo "Published release $GITHUB_REF_NAME"
+            fi
           fi

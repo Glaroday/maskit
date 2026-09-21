@@ -121,6 +121,9 @@
     .guide-link { font-size: 12px; color: var(--primary); }
     .box.attach { border-color: var(--warn-bd); background: var(--warn-bg); }
     .attach-text { font-size: 11px; color: var(--warn); }
+    /* 协议不匹配告警：与「附件不脱敏」同为警告级，共用 warn 色，但单独一类便于以后区分 */
+    .box.proto { border-color: var(--warn-bd); background: var(--warn-bg); }
+    .proto-text { font-size: 11px; color: var(--warn); }
   </style>
 </head>
 <body>
@@ -161,6 +164,12 @@
   <!-- 本页出现过带文件的请求：明说「附件/图片内容不脱敏」，不静默放行 -->
   <div class="box attach" id="attachBox" hidden>
     <div id="attachText" class="attach-text"></div>
+  </div>
+
+  <!-- 协议不匹配：客户端改了 /api/ext/* 契约而扩展没跟着更新时，脱敏语义可能已经不对。
+       必须显式报出来——否则用户只看到「怎么不脱敏了」，页面上毫无异常，无从归因。 -->
+  <div class="box proto" id="protoBox" hidden>
+    <div id="protoText" class="proto-text"></div>
   </div>
 
   <footer>

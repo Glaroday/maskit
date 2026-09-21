@@ -2,6 +2,34 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.4.0] - 2026-09-21
+
+### 新增 / Added
+- 浏览器扩展：新增 XMLHttpRequest（XHR）请求与单文件/Blob 直传拦截，覆盖现代 Web AI 文件上传与对象存储直传场景。
+  *Browser extension: added XMLHttpRequest and single-file/Blob upload interception, protecting modern web-AI file uploads and object storage direct uploads.*
+- 浏览器扩展：设置页新增老版 Office 文档（.doc / .xls）自动转码脱敏开关，并补注文档格式支持清单。
+  *Browser extension: added auto-convert & mask switch for legacy Office documents (.doc / .xls) with supported formats list in settings.*
+- 拦截日志：类型筛选新增「浏览器扩展」大类并精简收敛底层原语，列表强化显示浏览器扩展与文档脱敏徽标。
+  *Logs: added Browser Extension category in type filter, consolidated low-level primitives, and added badges for extension and doc masking.*
+
+### 修复 / Bug Fixes
+- 浏览器扩展：修复 DeepSeek 网页版 XHR 流式回复中占位符未还原的问题（XHR 响应还原目前**仅覆盖 DeepSeek**；附件上传场景尚未适配）。
+  *Browser extension: fixed unrestored placeholders in XHR-streamed replies on DeepSeek web (XHR response restoration currently covers DeepSeek only; attachment uploads are not yet supported).*
+- 浏览器扩展：修复脱敏桥超时响应未还原与广泛模式读取失败导致的静默放行问题。
+  *Browser extension: fixed unrestored responses after bridge timeouts and silent bypasses when wide-mode failed to load.*
+- 浏览器扩展：修复正文特征词导致会话复用失效，以及 URLSearchParams 表单与同步 XHR 漏脱敏问题。
+  *Browser extension: fixed session-reuse breakage caused by typing-probe false positives, plus unmasked URLSearchParams and sync XHR requests.*
+- 浏览器扩展：修复服务工作线程冷启动后「引擎不可用即阻断」配置丢失，以及部分异常路径静默放行的问题。
+  *Browser extension: fixed lost "block on engine down" setting after service-worker restart and silent bypasses on exception paths.*
+- 浏览器扩展：完善 Claude / DeepSeek 等网页端单数 `/completion` 路径匹配，补全签发表校验诊断日志。
+  *Browser extension: improved path matching for singular `/completion` endpoints and added diagnostic logs for signature validation.*
+- 引擎：修复 Office 文档重压缩体积无法与原始字节对齐时静默返回原文的问题，确保始终脱敏出网。
+  *Engine: fixed original document leakage when OOXML recompression length misaligned, ensuring masked bytes are always sent.*
+- 引擎：修复大写 Content-Type 响应未还原与超大 JSON 解析阻塞问题，收敛漏脱敏上报去重缓存。
+  *Engine: fixed unrestored uppercase Content-Type responses, event loop stalls on huge JSONs, and bounded extension deduplication tables.*
+- 发版流程：修复浅克隆下扩展变更自动检测失效的问题。
+  *Release: fixed extension change detection failing under shallow git clones.*
+
 ## [0.3.2] - 2026-09-20
 
 ### 修复 / Bug Fixes

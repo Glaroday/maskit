@@ -195,8 +195,23 @@
     return '';
   }
 
+  /**
+   * 扩展实现的 `/api/ext/*` 协议版本。
+   *
+   * 必须与 `engine/panel.py` 的 `EXT_PROTOCOL_VERSION` 保持一致：引擎在 ping 里回传它
+   * 支持的版本，SW 比对不一致就在 popup 与图标角标上报警。
+   *
+   * 【为什么不比产品版本号】扩展 `manifest.version`（1.0.0）与客户端 `version`
+   * 是两条独立的发布节奏，**从来就不同步**，拿它比必然误报。这个整数**只在接口契约**
+   * （`/api/ext/*` 的请求/响应字段或语义）变化时 +1：产品发版、UI 调整、内部重构一律不动。
+   *
+   * 【为什么必须有】没有它，客户端改了契约而用户没重载扩展时，扩展会**静默失效**
+   * —— 页面毫无异常，用户只看到「怎么不脱敏了」，且没有任何地方能归因。
+   */
+  const EXT_PROTOCOL_VERSION = 1;
+
   root.MASKIT_SHARED = {
-    STATIC_SITES, PRESET_SITES, UNSUPPORTED_REASON,
+    STATIC_SITES, PRESET_SITES, UNSUPPORTED_REASON, EXT_PROTOCOL_VERSION,
     siteMatchPattern, normalizeDomain, siteCovers, unsupportedReason,
     PANEL_URL_RE, isLocalPanelUrl,
   };

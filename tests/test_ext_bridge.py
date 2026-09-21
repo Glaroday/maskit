@@ -228,6 +228,19 @@ class TokenAndSwitchTests(ExtBridgeTestCase):
         self.assertEqual(r.status_code, 403)
         self.assertEqual((r.get_json() or {}).get("error"), "invalid_token")
 
+    def test_ping_reports_ext_protocol_for_handshake(self):
+        """ping 必须回传协议版本，否则扩展无法发现「契约不兼容」。
+
+        为什么不能拿 version 顶替：扩展 manifest.version 与客户端 version 是两条
+        独立的发布节奏（1.0.0 vs 0.3.2），拿它比必然误报。协议版本只随
+        `/api/ext/*` 的字段/语义变化。
+        """
+        r = self._ext("/api/ext/ping", method="get")
+        body = r.get_json() or {}
+        self.assertIsInstance(body.get("ext_protocol"), int,
+                              f"ping 必须回传整数 ext_protocol，实际 {body.get('ext_protocol')!r}")
+        self.assertEqual(body["ext_protocol"], panel.EXT_PROTOCOL_VERSION)
+
     def test_ping_reports_switches_and_stats(self):
         body = self._ext("/api/ext/ping", method="get").get_json()
         self.assertEqual(body["version"], panel.__version__)
@@ -671,6 +684,76 @@ class FailureVisibilityTests(ExtBridgeTestCase):
             masked_sst = zout.read("xl/sharedStrings.xml").decode("utf-8")
             self.assertNotIn("13812345678", masked_sst)
             self.assertIn("{{PHONE_", masked_sst)
+
+    def test_mask_file_size_mismatch_still_returns_masked(self):
+        """回归：体积无法与原始对齐时，也必须返回**打码后**的字节，绝不放行明文。
+
+        旧实现是 `return raw_bytes, 0`，而 ZIP 注释补白**只能补大、不能削小**，于是
+        「打码后重压变大」的文件（本例只大 131 字节）会静默退回原文，且 hit_count 一起
+        归零 —— 扩展侧 `maskSingleFile` 据此判成「这份文件没有敏感信息」，既不替换
+        上传内容、也不提示、也不记事件，用户以为受保护而整份文档明文出网。
+
+        断言分两层：元数据层（hit_count > 0）与字节层（返回的不是原文、正文里没有
+        明文手机号/邮箱）。只看第一层会漏掉「hits 有值但返回原文」的实现。
+        """
+        import base64
+        import io
+        import zipfile
+
+        head = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+        )
+        tail = "</w:body></w:document>"
+        # 20 段、每段一个不同手机号 + 一个邮箱：打码增量（明文 11 位 → 占位符 16 字节）
+        # 超过重压能省下的体积，稳定落在「体积对不齐」这条路径上。
+        paras = "".join(
+            f"<w:p><w:r><w:t>记录{i} 手机 138001380{i:02d} 邮箱 user{i}@example.com</w:t></w:r></w:p>"
+            for i in range(20)
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+            z.writestr("word/document.xml", (head + paras + tail).encode("utf-8"))
+        raw = buf.getvalue()
+
+        r = self._ext(
+            "/api/ext/mask-file",
+            {"filename": "mismatch.docx", "base64": base64.b64encode(raw).decode("ascii")},
+        )
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json() or {}
+        self.assertTrue(j.get("ok"))
+        self.assertGreater(j.get("hit_count", 0), 0, "体积对不齐时 hit_count 不得归零")
+
+        out = base64.b64decode(j["base64"])
+        self.assertNotEqual(out, raw, "不得把原始明文原样返回")
+        with zipfile.ZipFile(io.BytesIO(out), "r") as zout:
+            xml = zout.read("word/document.xml").decode("utf-8")
+        self.assertNotIn("13800138000", xml)
+        self.assertNotIn("user0@example.com", xml)
+        self.assertIn("{{PHONE_", xml)
+        self.assertIn("{{EMAIL_", xml)
+
+
+class WarnDedupeBoundTests(ExtBridgeTestCase):
+    """/api/ext/warn 的去重表必须**严格有界**。"""
+
+    def test_seen_table_stays_bounded_under_flood(self):
+        """60 秒内灌进远超上限的不同 key 时，表仍必须有界（不能只靠时间淘汰）。
+
+        旧实现只在 len > 200 时删「> 60s」的条目：窗口内灌 200+ 个不同 key 就
+        永不回收（每个新 key 还写一条事件）。该端点的 host/path 由页面提供，
+        对已启用站点的任意页面脚本可达，不能假设调用方友善。
+        """
+        panel._ext_warn_seen.clear()
+        overflow = panel._EXT_WARN_MAX + 50
+        for i in range(overflow):
+            r = self._ext("/api/ext/warn", {
+                "host": f"h{i}.example.com", "path": f"/p{i}", "content_type": "text/plain",
+            })
+            self.assertEqual(r.status_code, 200)
+        self.assertLessEqual(len(panel._ext_warn_seen), panel._EXT_WARN_MAX,
+                             "去重表在窗口内胀破上限 —— 它必须按时间淘汰到严格有界")
 
 
 class StatsSwitchTests(ExtBridgeTestCase):
@@ -1469,6 +1552,81 @@ class RestoreSizeGateTests(ExtBridgeTestCase):
         out = r1.get_json()["text"] + r2.get_json()["text"]
         self.assertNotIn("{{", out, f"跨事件切开的占位符必须拼回来，实际 {out!r}")
         self.assertIn("13812345678", out)
+
+
+# ====================== 无感知漏脱敏的上报通道 ======================
+
+class UnsupportedBodyWarnTests(ExtBridgeTestCase):
+    """扩展上报「该脱敏但 body 打不开」→ 必须落库。
+
+    这是本系统唯一一类**无感知漏脱敏**：URL 命中对话白名单说明我们判定它该脱敏，
+    content-type 不在可打码集合又说明我们根本没读到内容 —— 结果是用户以为内容
+    被保护，实际原样明文出网，而页面上毫无异常。
+
+    实测（2026-09-20）尚无站点走到这一支。一旦某站改用 x-protobuf / 二进制 JSON
+    提交对话，就会整站静默漏掉；届时唯一的线索就是这条上报。所以「能落库」本身
+    就是被测的行为，不是附带断言。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 清模块级去重表。它是**进程级全局态**，不清就会跳用例残留：实测先跑的
+        # dedupes 用例写进同一个 key 后，本条用例的请求被当成 10s 内的重复而跳过，
+        # 查库直接 0 条（与本用例真正要验的行为毫无关系）。
+        panel._ext_warn_seen.clear()
+        # 显式建库：库里原本不存在时，第一条事件才会触发 _ensure_db()→init_db()，
+        # 而本用例是先发请求、后查表，不建表会直接 `no such table: events`。
+        event_store.init_db()
+
+    def _events(self, sql, params=()):
+        """查事件库。写入是**批量线程**，查之前必须 _flush_and_drain_events()。"""
+        with sqlite3.connect(event_store.DB_PATH) as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def test_warn_persists_pass_event_with_filterable_reason(self):
+        r = self._ext("/api/ext/warn", {
+            "host": "chatgpt.com",
+            "path": "/backend-api/f/conversation",
+            "content_type": "application/x-protobuf",
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue((r.get_json() or {}).get("ok"), r.get_json())
+        self._flush_and_drain_events()          # 写线程是批量的，必须 flush 才可见
+        # reason / content_type 不是独立列，在 payload JSON 里（_emit 把所有 kw 塞进去）
+        rows = self._events(
+            "SELECT type, host, payload FROM events WHERE type IN ('PASS','SKIP')"
+            " AND payload LIKE ?", ("%unsupported_content_type%",))
+        self.assertEqual(len(rows), 1, f"应恰好一条事件，实际 {rows}")
+        typ, host, pl = rows[0]
+        # force=True 走「已配置客户端」通道 → PASS（与「过网关必有日志」同一可见性口径，
+        # 且不经 _emit_skip 的 reason 去重集合，去重由本端点自己做）
+        self.assertEqual(typ, "PASS", f"事件类型应为 PASS，实际 {typ}")
+        rec = json.loads(pl)
+        self.assertEqual(rec.get("reason"), "unsupported_content_type")
+        self.assertEqual(rec.get("content_type"), "application/x-protobuf")
+        self.assertEqual(rec.get("path"), "/backend-api/f/conversation")
+        self.assertEqual(host, "chatgpt.com")
+
+    def test_warn_dedupes_within_window(self):
+        """同 (host,path,ct) 10s 内只记一条。
+
+        整站漏脱敏时每个请求都会上报；不去重会把事件页刷满，反而把真正要看的
+        风险记录挤掉。
+        """
+        payload = {"host": "chatgpt.com", "path": "/backend-api/f/conversation",
+                   "content_type": "application/x-protobuf"}
+        for _ in range(5):
+            self._ext("/api/ext/warn", payload)
+        self._flush_and_drain_events()
+        rows = self._events(
+            "SELECT COUNT(*) FROM events WHERE payload LIKE ?",
+            ("%unsupported_content_type%",))
+        self.assertEqual(rows[0][0], 1, "10s 窗口内应只落一条")
+
+    def test_warn_rejects_without_token(self):
+        """warn 与其它 /api/ext/* 同一条鉴权防线，不能因为它是「只上报」就放行。"""
+        r = self._ext("/api/ext/warn", {"host": "chatgpt.com"}, token="wrong-token")
+        self.assertEqual(r.status_code, 403)
 
 
 if __name__ == "__main__":

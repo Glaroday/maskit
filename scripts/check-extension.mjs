@@ -513,7 +513,8 @@ if (!/attachTextLegacy/.test(sources['popup.js'] || '')) {
 // 这两条静态可判，而运行时只表现为「少还原了几个字」，极难定位。
 const maskCallSites = [...bg.matchAll(/safeCall\(\s*'\/api\/ext\/mask'/g)]
 for (const site of maskCallSites) {
-  if (!/sid\s*:/.test(bg.slice(site.index, site.index + 300))) {
+  // 简写属性（`{ text, host, sid }`）没有冒号，所以必须同时认 `sid:` 与 `sid,` / `sid }`。
+  if (!/sid\s*[:,}]/.test(bg.slice(site.index, site.index + 300))) {
     fail("background.js 的 /api/ext/mask 调用没带 sid —— 每轮新签 sid 会让多轮对话里" +
       '的占位符无法还原（实测 restored 与 unresolved 同时有值）')
   }
@@ -523,6 +524,89 @@ if (maskCallSites.length && !/async function findRecentSid/.test(bg)) {
 }
 if (/async function findRecentSid/.test(bg) && !/v\.host !== host/.test(bg)) {
   fail('background.js 的 findRecentSid 未按 host 区分 —— 同一标签页切换站点时会串用映射表')
+}
+
+// ── 打字探针（autocomplete）必须与主对话映射表隔离 ──────────────────────────
+// ChatGPT 的补全接口会在用户点发送**之前**把输入框内容发出去。实测（2026-09-20）
+// 送的是未上屏的拼音中间态：`{"input_text":"帮我整合y'xia"}` → NER 把 `y'xia` 判成 NAME，
+// `{"input_text":"帮我整合y'x"}` → 把仅 3 字符的 `y'x` 判成 ORG。
+// 碎片本身无害，但一旦写进主对话复用表，后续真实文本里出现同样的串就会被替换——跨轮污染。
+if (!/function isTypingProbe\s*\(/.test(bg)) {
+  fail('background.js 缺少 isTypingProbe —— 打字探针会污染主对话映射表（跳轮误替换）')
+}
+if (/function isTypingProbe\s*\(/.test(bg) && !/isTypingProbe\(text\)\s*\?\s*null/.test(bg)) {
+  fail('打字探针没有隔离 sid —— 必须是 `isTypingProbe(text) ? null : ...`，否则映射仍会跨轮污染')
+}
+if (!/"num_completions"/.test(bg) || !/"input_text"/.test(bg)) {
+  fail('isTypingProbe 的判据丢失 —— 必须按 body 字段判定（补全接口与正常对话同处' +
+    ' /backend-api/ 前缀下，按 URL 根本区分不了）')
+}
+// 判据必须落在**顶层键**上：全文子串匹配的误伤面太大 —— Maskit 的用户就是开发者，
+// 把含 `"input_text":` 的日志/JSON 贴进对话是日常，那轮真实对话会被判成探针、
+// 不复用 sid，回复里的占位符再也还原不回来，而页面上看不出任何异常。
+if (/function isTypingProbe\s*\(/.test(bg)) {
+  const at = bg.indexOf('function isTypingProbe')
+  const fnBody = bg.slice(at, at + 900)
+  if (!/JSON\.parse/.test(fnBody)) {
+    fail('isTypingProbe 没有按顶层键判定（缺 JSON.parse）—— 全文子串匹配会把' +
+      '「用户贴进对话的含 input_text 的 JSON」误判成补全探针')
+  }
+  if (/return\s+\/[^\n]*\b(?:input_text|num_completions)\b/.test(fnBody)) {
+    fail('isTypingProbe 退回成了全文正则匹配 —— 同上，误伤「把日志贴进对话」的日常场景')
+  }
+}
+
+// ── XHR 路径必须与 fetch 路径同样处理 URLSearchParams ────────────────────
+// fetch 侧早就显式处理了；XHR 少这一支时，用 `application/x-www-form-urlencoded`
+// 提交对话的站点会**整站静默漏脱敏**（且原先连留痕都没有）。
+if (!/const isUrlParams\s*=/.test(mainSrc) || !/isUrlParams && isUrlMaskable/.test(mainSrc)) {
+  fail('bridge-main.js 的 XHR 路径没处理 URLSearchParams —— 表单编码提交对话时会静默漏脱敏')
+}
+
+// ── 无感知漏脱敏必须留痕 ───────────────────────────────────────────────────
+// `isUrlMaskable && !isMaskableBody` = 我们判定该脱敏，却根本没读到内容。
+// 必须在上报之后才放行，否则某站改用 x-protobuf / 二进制 JSON 时会整站静默漏脱敏、
+// 页面上毫无异常、事件库里也没有任何线索。
+if (!/const reportUnsupportedBody\s*=/.test(mainSrc)) {
+  fail('bridge-main.js 缺少 reportUnsupportedBody —— 「该脱敏但 body 打不开」会无声漏掉')
+}
+if (/const reportUnsupportedBody\s*=/.test(mainSrc) &&
+  !/isUrlMaskable\s*&&\s*!isMaskableBody\(resource\)\)\s*\{\s*reportUnsupportedBody\(/.test(mainSrc)) {
+  fail('bridge-main.js 未在放行前上报不支持的 body —— 漏脱敏会无感知发生')
+}
+if (!/handleWarn\(/.test(bg) || !/'\/api\/ext\/warn'/.test(bg)) {
+  fail('background.js 缺少 warn 通道 —— 漏脱敏事件进不了事件库')
+}
+
+// ── 协议握手：两边的版本号必须一致 ───────────────────────────────────────
+// EXT_PROTOCOL_VERSION 是「/api/ext/* 契约版本」，引擎与扩展各存一份。它是**唯一**能
+// 发现「客户端改了契约、而用户没重载扩展」的机制，而两边数字一旦漂移，就会**永远误报**
+// （或者在真不兼容时反而不报）。所以这里必须交叉比对，不能各查各的存在性。
+const sharedSrc = sources['shared.js'] || ''
+const popupSrc = sources['popup.js'] || ''
+if (!/EXT_PROTOCOL_VERSION/.test(sharedSrc)) {
+  fail('shared.js 缺少 EXT_PROTOCOL_VERSION —— 扩展无法发现自己与客户端契约不兼容')
+}
+const panelPath = path.join(ROOT, 'engine', 'panel.py')
+const panelPy = fs.existsSync(panelPath) ? fs.readFileSync(panelPath, 'utf8') : null
+const mExt = sharedSrc.match(/EXT_PROTOCOL_VERSION\s*=\s*(\d+)/)
+const mEng = panelPy && panelPy.match(/^EXT_PROTOCOL_VERSION\s*=\s*(\d+)/m)
+if (mExt && !mEng) {
+  fail('engine/panel.py 缺少模块级 EXT_PROTOCOL_VERSION —— 扩展拿到 undefined 会恒报不匹配，' +
+    '变成全民误报')
+}
+if (mExt && mEng && mExt[1] !== mEng[1]) {
+  fail(`协议版本不一致：shared.js=${mExt[1]} vs panel.py=${mEng[1]} —— ` +
+    '两边必须同步（改契约时一起 +1），否则要么永远误报、要么真不兼容时反而不报')
+}
+if (!/protoMismatch/.test(bg) || !/applyProtoBadge/.test(bg)) {
+  fail('background.js 未做协议握手 —— 契约不兼容时扩展会静默失效（页面无异常、无从归因）')
+}
+if (!/chrome\.action\.setBadgeText/.test(bg)) {
+  fail('协议不匹配未打到图标角标 —— popup 只在点开时可见，最该被注意到的状态反而看不见')
+}
+if (!/renderProto\(/.test(popupSrc)) {
+  fail('popup.js 没有 renderProto —— 协议不匹配时用户看不到任何提示')
 }
 
 // ── 结论 ────────────────────────────────────────────────────────────────────

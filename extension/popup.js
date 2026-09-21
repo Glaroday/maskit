@@ -10,7 +10,7 @@
 
 'use strict';
 
-const { siteCovers, unsupportedReason } = self.MASKIT_SHARED;
+const { siteCovers, unsupportedReason, EXT_PROTOCOL_VERSION } = self.MASKIT_SHARED;
 
 const I18N = {
   zh: {
@@ -25,6 +25,8 @@ const I18N = {
     statusOk: '引擎正常',
     statusDown: '引擎未运行，已直通 {n}s',
     statusBlocked: '引擎异常，已阻断',
+    protoWarn:
+      '扩展与客户端协议不匹配（扩展 v{p} ⇄ 客户端 v{e}）。脱敏行为可能已不正确，请重新加载扩展。',
     statusInvalidToken: 'token 失效，请到设置更新',
     statusInvalidTokenHold: 'token 失效，请到设置更新（已降速重试中）',
     statusDisabledPanel: '扩展已关闭（面板开关）',
@@ -70,6 +72,8 @@ const I18N = {
     statusOk: 'Engine OK',
     statusDown: 'Engine not running, passthrough {n}s',
     statusBlocked: 'Engine error, blocking',
+    protoWarn:
+      'Extension/client protocol mismatch (extension v{p} ⇄ client v{e}). Masking may be incorrect — reload the extension.',
     statusInvalidToken: 'Token invalid, update it in settings',
     statusInvalidTokenHold: 'Token invalid — update it in settings (retrying at low rate)',
     statusDisabledPanel: 'Extension bridge disabled (panel switch)',
@@ -327,6 +331,27 @@ function renderAttach(snap) {
   }
 }
 
+/**
+ * 协议不匹配告警。
+ *
+ * 【为什么不复用上面那行状态】状态行表达的是「引擎可达 / 不可达 / 已阻断」，而协议
+ * 不匹配恰恰发生在**引擎完全正常**的时候——塞进状态行等于把「引擎是好的」说成
+ * 「引擎有问题」，直接误导排查方向。
+ *
+ * 触发条件的本质：客户端改了 `/api/ext/*` 的契约，而用户没重载扩展。此时脱敏语义
+ * 可能已经不对（例如某字段被改名，扩展读到 undefined 却当成空值继续跑）。
+ */
+function renderProto(snap) {
+  const box = $('protoBox');
+  const mismatch = !!(snap && snap.protoMismatch);
+  box.hidden = !mismatch;
+  if (!mismatch) return;
+  const engineProto = (snap && snap.engineProtocol != null) ? snap.engineProtocol : '?';
+  $('protoText').textContent = t('protoWarn', {
+    p: String(EXT_PROTOCOL_VERSION), e: String(engineProto),
+  });
+}
+
 function render(snap) {
   lastSnapshot = snap;
   const cfg = (snap && snap.config) || {};
@@ -348,6 +373,7 @@ function render(snap) {
 
   renderStatus(snap);
   renderGuide(snap);
+  renderProto(snap);
   renderAttach(snap);
   renderRecent(snap);
   renderUnmatched(snap);

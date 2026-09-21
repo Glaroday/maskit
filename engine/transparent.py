@@ -407,6 +407,11 @@ _INFLIGHT_MAX_IDLE = 900
 # 连接（含进行中的 SSE 流）。正常 LLM 请求（含多模态 base64 图片）远达不到这个
 # 量级，到这里基本是异常客户端或误发文件，按 fail-closed 拒绝比拖垮整个代理好。
 _MAX_REQUEST_BODY = 32 * 1024 * 1024
+# 响应体还原上限（32MB）：json.loads + 全树遍历同样是同步 CPU 操作，几十 MB 的响应
+# 足以把 event loop 占住数秒，期间**同进程内所有会话**的脱敏/还原一起停摆。
+# 请求侧上一行早有这道闸，响应侧原先只受上游返回体大小间接限制。
+# 超限时的处置：跳过还原 + 留痕（事件页可见），而不是默默卡死代理。
+_MAX_RESPONSE_RESTORE_BODY = 32 * 1024 * 1024
 # 数据目录：打包后从 LLM_SHIELD_DATA_DIR 环境变量读（panel.py 启动子进程时设置）；开发时回退到脚本目录
 _DATA_ROOT = Path(os.environ.get("LLM_SHIELD_DATA_DIR") or str(_ROOT)).resolve()
 _skip_seen = {}
@@ -5037,7 +5042,7 @@ def response(flow: http.HTTPFlow):
         _drop(sid)
         return
 
-    ct = flow.response.headers.get("content-type", "")
+    ct = (flow.response.headers.get("content-type", "") or "").lower().strip()
     _touch(sid)
     _sweep()
     source = sessions.get(sid, {}).get("source", {})
@@ -6214,7 +6219,20 @@ def responseheaders(flow: http.HTTPFlow):
 
 
 def _handle_json(flow, sid):
-    body = json.loads(flow.response.content)
+    raw = flow.response.content or b""
+    # 体积闸（与请求侧 _MAX_REQUEST_BODY 对齐）：见该常量的注释。超限时**不还原**
+    # 但必须留痕——否则用户看到裸占位符会以为是引擎坏了，而事件页毫无线索。
+    if len(raw) > _MAX_RESPONSE_RESTORE_BODY:
+        _emit_skip(
+            host=getattr(flow.request, "host", None) or flow.request.pretty_host,
+            method=getattr(flow.request, "method", "") or "",
+            path=flow.metadata.get("shield_orig_path") or flow.request.path,
+            reason="response_too_large",
+            content_type=flow.response.headers.get("content-type", "") or "",
+            force=True,
+        )
+        return
+    body = json.loads(raw)
     body = _restore_tree(body, sid)
     flow.response.content = json.dumps(body, ensure_ascii=False).encode("utf-8")
 

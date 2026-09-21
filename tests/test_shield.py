@@ -931,6 +931,61 @@ class ShieldEngineTests(unittest.TestCase):
             self.assertEqual(got["choices"][0]["message"]["content"], "收到：客户张三的电话是13812345678")
         self._with_no_reload(run)
 
+    def test_response_content_type_accepts_any_case(self):
+        """响应 content-type 的大小写/空白必须归一化后再判。
+
+        上游回 `Text/Event-Stream`（或按 HTTP 习惯写成 `Text/Event-Stream ; charset=utf-8`）
+        时，原先大小写敏感的 `"text/event-stream" in ct` 会全部落空 → 整段响应不还原，
+        用户直接看到裸 `{{PHONE_xxxxxx}}`。这是响应侧唯一一处没做 `lower()` 的判据。
+        """
+
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "客户的电话是13812345678"}]
+            })
+            tr.request(flow)
+            masked = json.loads(flow.request.content)["messages"][0]["content"]
+            flow.response = SimpleNamespace(
+                headers={"content-type": " Text/Event-Stream ; charset=utf-8"},
+                status_code=200,
+                content=("data: %s\n\n" % json.dumps(
+                    {"choices": [{"delta": {"content": masked}}]}, ensure_ascii=False)).encode("utf-8"),
+            )
+            tr.response(flow)
+            self.assertIn("13812345678", flow.response.content.decode("utf-8"),
+                          "大小写/空白的 content-type 也必须走还原")
+        self._with_no_reload(run)
+
+    def test_oversized_json_response_skips_restore_but_leaves_a_trace(self):
+        """响应体超限：不改 body（避免卡死 event loop），但**必须留痕**。
+
+        只断言「没还原」会漏掉「默默失败」这种更坏的情形：用户看到裸占位符会以为
+        引擎坏了，而事件页里什么都没有。所以两条都要钉。
+        """
+
+        def run():
+            flow = self._flow("api.openai.com", "/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "客户的电话是13812345678"}]
+            })
+            tr.request(flow)
+            masked = json.loads(flow.request.content)["messages"][0]["content"]
+            raw = json.dumps({"choices": [{"message": {"content": masked}}]},
+                             ensure_ascii=False).encode("utf-8")
+            flow.response = SimpleNamespace(headers={"content-type": "application/json"},
+                                            status_code=200, content=raw)
+            skips = []
+            old_skip = tr._emit_skip
+            try:
+                tr._emit_skip = lambda **kw: skips.append(kw)
+                with mock.patch.object(tr, "_MAX_RESPONSE_RESTORE_BODY", 8):
+                    tr.response(flow)
+            finally:
+                tr._emit_skip = old_skip
+            self.assertEqual(flow.response.content, raw, "超限时不得改动 body")
+            self.assertTrue(any(k.get("reason") == "response_too_large" for k in skips),
+                            "超限跳过还原必须留痕，否则用户以为引擎坏了")
+        self._with_no_reload(run)
+
     def test_restore_event_reports_counts_and_status(self):
         captured = []
         old_emit = tr._emit
