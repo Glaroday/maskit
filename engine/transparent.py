@@ -3199,7 +3199,13 @@ def restore(text, sid, channel="", escape=False, final=False):
     final:   True = 不再等后续 chunk，缓冲区一次性吐出。
     """
     s = sessions.get(sid)
-    if not s or not isinstance(text, str):
+    if not isinstance(text, str):
+        return text
+    if not s:
+        # 会话不存在 → **原样返回，绝不还原**。这是安全门：替换流程会查全局复用表
+        # `_RECENT_REV`，放行等于让任意自造 sid 都能借复用表还原占位符
+        # （test_t7 守这条）。但必须如实计数，否则「页面上满屏未还原」在统计里是 0。
+        _count_orphans_without_session(sid, text)
         return text
     pend = s["pending"]
     if not isinstance(pend, dict):  # 兼容旧结构
@@ -3242,10 +3248,21 @@ def restore(text, sid, channel="", escape=False, final=False):
                     via_suffix = True
                     real_token = canon
         if orig is None:
-            # 占位符查不到原文（复用表被淘汰/会话被扫掉/客户端历史带入的孤儿）：
-            # 只有当它是标准的紧凑形态时才计数 unresolved，原样返回（不能猜）
-            if _PLACEHOLDER_RX.match(whole):
-                s["unresolved"] = s.get("unresolved", 0) + 1
+            # 占位符查不到原文（复用表被淘汰/会话被扫掉/引擎重启后没预热回来的
+            # 凭据类/客户端历史带入的孤儿）：原样返回（不能猜），但**必须如实计数**。
+            #
+            # 计数面不能只认严格形态 `_PLACEHOLDER_RX`——它要求 `{{` 后**紧跟**
+            # `[A-Z0-9]{1,12}_`，于是这两类真实出现的形态全被漏掉：
+            #   `{{ EMAIL_abcdfg }}`（模型按 Jinja 习惯加空格）
+            #   `{{email_abcdfg}}`（标签被小写化）
+            # 它们能进本函数（外层就是 `_BRACED_PLACEHOLDER_RX`，允许内部空白与
+            # 大小写），却匹配不上严格正则 → 页面上明明一堆没还原、事件页只报 1 个。
+            # 用户真机实测报过这个漏报（Claude 侧「未还原 1」而屏幕上有多个）。
+            #
+            # 能走到这里说明外层**已判定为双花括号占位符形态**，计数不会误伤：
+            # 后缀是 6 位 hex 或 6 位纯辅音，普通文本不会自然出现 `{{ word_abcdfg }}`。
+            s["unresolved"] = s.get("unresolved", 0) + 1
+            _record_unresolved_sample(s, whole)
             return whole
         s["restored"] = s.get("restored", 0) + 1
         s["restored_tokens"].add(real_token or canon)
@@ -3274,6 +3291,14 @@ def restore(text, sid, channel="", escape=False, final=False):
                 if real is not None:
                     orig = _lookup(real, sid)
             if orig is None:
+                # ⚠️ 只对**真·转义形态**计数。`_ESCAPED_PLACEHOLDER_RX` 的反斜杠量词是
+                # `\\{0,3}`（允许 0 个反斜杠），所以它**同样匹配** `{{EMAIL_x}}`、
+                # `{EMAIL_x}` 这些非转义形态——那些形态第一遍/第三遍已经计过，
+                # 这里再计一次会让计数整体**翻倍**（实测：3 个孤儿报成 6 个）。
+                # 判据用「整段里有没有反斜杠」最直白，也与该遍的语义严格一致。
+                if "\\" in whole:
+                    s["unresolved"] = s.get("unresolved", 0) + 1
+                    _record_unresolved_sample(s, whole)
                 return whole
             s["restored"] = s.get("restored", 0) + 1
             s["degraded"] = s.get("degraded", 0) + 1
@@ -3306,6 +3331,21 @@ def restore(text, sid, channel="", escape=False, final=False):
                 if real is not None:
                     orig = _lookup(real, sid)
             if orig is None:
+                # 这一遍的形态判据（`_LOOSE_PLACEHOLDER_RX`）本身就要求
+                # `LABEL_` + 6 位 hex 或 6 位纯辅音后缀——注释里已论证过
+                # 「这种组合正常文本里不会自然出现」，与替换判据同源，
+                # 所以查不到时同样计数，不会因为「怕是残片」就把漏还原藏起来。
+                #
+                # ⚠️ 唯一例外：前一字符是反斜杠 → 这是 `\{\{X\}\}` 的**内部片段**
+                # （本遍的 `\{{1,2}` 会从转义块的第 2 个 `{` 开始匹配），上一遍已
+                # 处理并计数过；不排除就会把转义形态计两次（实测报成 2，样本里
+                # 同时留下 `\{\{X\}\}` 与 `{X}` 两条）。
+                # **只能在计数上排除，不能提前 return**：提前 return 会连
+                # 「该片段其实查得到原文、本该被还原」的情况一起跳过——
+                # 实测这一版直接把 test_t7 打红（响应里该有的还原没了）。
+                if not (m.start() > 0 and m.string[m.start() - 1] == "\\"):
+                    s["unresolved"] = s.get("unresolved", 0) + 1
+                    _record_unresolved_sample(s, whole)
                 return whole
             s["restored"] = s.get("restored", 0) + 1
             s["degraded"] = s.get("degraded", 0) + 1
@@ -3336,6 +3376,99 @@ def _count_unresolved(sid, n=1):
             s["unresolved"] = int(s.get("unresolved") or 0) + n
         except Exception:
             pass
+
+
+# 未还原占位符的样本留存上限。只留形态（token 本身是占位符，不含任何明文），
+# 落库安全；上限压到 5 是为了不让长响应把 payload 撑大。
+_UNRESOLVED_SAMPLES_MAX = 5
+
+
+def _record_unresolved_sample(s, tok):
+    """留存几个「查不到原文」的占位符样本，供事件详情弹窗定位。
+
+    为什么必须留：`unresolved` 原先只有一个计数，用户看到「未还原 7」却无从知道
+    是哪些 token、什么形态。而这两种情况的处置完全不同，光看计数分不出来：
+
+    - 形态正常（`{{EMAIL_abcdfg}}`）→ 引擎表里真的没有它：引擎重启后
+      **凭据类永远不会被 `_warmup_recent_from_db` 预热**（库里只有 digest+preview，
+      红线 4），或是复用表 TTL 过期 / 会话被 sweep 掉；
+    - 形态被改写（`{{ email_abcdfg }}`、小写标签、剥掉花括号）→ 模型在动输出格式，
+      是「哪天彻底还原不回来」的前兆。
+
+    只做诊断，不参与任何还原决策，异常一律吞掉。
+    """
+    try:
+        lst = s.get("unresolved_samples")
+        if not isinstance(lst, list):
+            lst = s["unresolved_samples"] = []
+        if len(lst) < _UNRESOLVED_SAMPLES_MAX and tok not in lst:
+            lst.append(tok)
+    except Exception:
+        pass
+
+
+# ── 会话不存在时的孤儿计数兜底表 ──────────────────────────────────────────
+# sid -> [count, [样本...], ts]
+#
+# 为什么需要它：`restore()` / `restore_stream_chunk()` 在**会话不存在**时必须
+# 原样返回——这不是偷懒，是安全门。替换流程会去查**全局**复用表 `_RECENT_REV`，
+# 一旦放行，任意自造 sid（`ext:000…0`）都能借复用表把占位符还原出来
+# （tests/test_ext_bridge.py::test_t7 守的就是这条，改动实测当场变红）。
+#
+# 但原样返回的副作用是：「页面上满屏 `{{...}}`」在统计里**一个数字都没有**，
+# 用户只看到还原不了、查不到原因。真机报过——重启引擎后打开 Claude 历史对话，
+# 屏幕上一堆未还原，事件页只有一条 `unresolved=1`，用户直接质疑统计造假。
+#
+# 于是这里**只计数、不还原**：数出文本里有几个占位符形态，留给
+# `/api/ext/restore` 合并进 RESTORE 事件。样本只存占位符本身，不含任何明文。
+_NO_SESSION_ORPHANS = {}
+_NO_SESSION_ORPHANS_MAX = 256
+
+
+def _count_orphans_without_session(sid, text):
+    """会话不存在时只统计文本里的占位符形态（绝不还原、绝不猜原文）。
+
+    只认 `_BRACED_PLACEHOLDER_RX`（双花括号，容错内部空白与大小写）：
+    这是页面上最显眼、也是模型原样吐回时最常见的形态；裸 token / 单花括号
+    在本遍不做统计，避免把正文里的普通标识符算进来（那属于宽松遍的判据，
+    它需要会话上下文来区分残片）。
+    """
+    try:
+        n = 0
+        samples = []
+        for m in _BRACED_PLACEHOLDER_RX.finditer(text):
+            n += 1
+            if len(samples) < _UNRESOLVED_SAMPLES_MAX:
+                samples.append(m.group(0))
+        if n <= 0:
+            return
+        if sid not in _NO_SESSION_ORPHANS and len(_NO_SESSION_ORPHANS) >= _NO_SESSION_ORPHANS_MAX:
+            # 超上限淘汰最老的一条（与 _EXT_FRAMES_MAX 同思路，防止内存被顶上去）
+            oldest = min(_NO_SESSION_ORPHANS.items(), key=lambda kv: kv[1][2])[0]
+            _NO_SESSION_ORPHANS.pop(oldest, None)
+        rec = _NO_SESSION_ORPHANS.get(sid)
+        if rec is None:
+            _NO_SESSION_ORPHANS[sid] = [n, samples, time.time()]
+        else:
+            rec[0] += n
+            for x in samples:
+                if len(rec[1]) < _UNRESOLVED_SAMPLES_MAX and x not in rec[1]:
+                    rec[1].append(x)
+            rec[2] = time.time()
+    except Exception:
+        pass
+
+
+def _take_orphans_without_session(sid):
+    """取走并清零（同一 sid 只应被一条 RESTORE 事件消费）。返回 (count, samples)。"""
+    try:
+        rec = _NO_SESSION_ORPHANS.pop(sid, None)
+        if not rec:
+            return 0, []
+        return int(rec[0] or 0), [str(x) for x in (rec[1] or [])][:_UNRESOLVED_SAMPLES_MAX]
+    except Exception:
+        return 0, []
+
 
 
 def _restore_tree(obj, sid, key=None, depth=0):
@@ -4270,6 +4403,22 @@ def error(flow):
             ev_type = "CANCEL"  # 用户主动取消，非故障
         elif "getaddrinfo" in msg or "Name or service not known" in msg:
             ev_type = "DNS_ERROR"  # 上游域名解析失败，属上游侧
+        # 诊断前缀：区分「发请求时连接就已经是死的」（典型是复用了被上游关掉的空闲连接）
+        # 与「上游已经开始回包、中途断开」（上游侧问题）。两者现象都是 connection closed，
+        # 但修法完全不同 —— 没有这组字段只能靠猜（2026-09-20 排查即卡在这里）。
+        #   resp=0 → 连响应头都没收到；resp=1 → 上游已开始回包。
+        #   ms 短（<1s）且 resp=0 → 连接在发送阶段就不可用；ms 长 → 上游迟迟不回或中途挂起。
+        try:
+            _elapsed_ms = int((time.time() - float(getattr(flow.request, "timestamp_start", 0) or 0)) * 1000)
+        except Exception:
+            _elapsed_ms = -1
+        try:
+            _req_len = len(flow.request.raw_content or b"")
+        except Exception:
+            _req_len = -1
+        _err_name = type(err).__name__ if err is not None else "?"
+        _has_resp = 1 if getattr(flow, "response", None) is not None else 0
+        msg = f"[err={_err_name} resp={_has_resp} req={_req_len}B ms={_elapsed_ms}] " + msg
         # 流式接管中途被切断时 _finish() 不执行，没有 RESTORE 事件可对照，
         # 光看 ERR 无法判断断在哪。带上回调次数/字节数还原现场。
         if flow.metadata.get("shield_streamed"):
@@ -5546,7 +5695,12 @@ def restore_stream_chunk(text, sid, stream_id, content_type="", escape=False, fi
     当前扩展链路每次 mask 均签发唯一的独立 sid，单 sid 对应单条流；通道状态由 sid 隔离。
     """
     s = sessions.get(sid)
-    if not s or not isinstance(text, str):
+    if not isinstance(text, str):
+        return text
+    if not s:
+        # 同 restore()：会话不存在 → 原样返回（安全门，绝不借全局复用表还原），
+        # 但要如实计数，否则整条流在统计里是 0、页面上却满是 `{{...}}`。
+        _count_orphans_without_session(sid, text)
         return text
     frames = s.get("ext_frames")
     if not isinstance(frames, dict):
@@ -5875,7 +6029,9 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
     items = []
     try:
         restored_tokens = s.get("restored_tokens") or set()
+        seen_toks = set()
         for orig, tok in list(s.get("fwd", {}).items())[:30]:
+            seen_toks.add(tok)
             m = _PLACEHOLDER_PARTS_RX.match(tok)
             lbl = s.get("labels", {}).get(orig, "")
             is_cred = lbl in CREDENTIAL_LABELS
@@ -5902,6 +6058,31 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
             except Exception:
                 pass
             items.append(item)
+        # 补充：跨请求复用表（_RECENT_REV / _CUSTOM_WORD_REV）中还原出来的历史敏感项
+        for tok in restored_tokens:
+            if tok in seen_toks or len(items) >= 30:
+                continue
+            seen_toks.add(tok)
+            rec = _RECENT_REV.get(tok) or _CUSTOM_WORD_REV.get(tok)
+            if rec and len(rec) >= 2:
+                orig, lbl = rec[0], rec[1]
+                m = _PLACEHOLDER_PARTS_RX.match(tok)
+                is_cred = lbl in CREDENTIAL_LABELS
+                item = {
+                    "tok": tok,
+                    "label": lbl,
+                    "hash": m.group(2) if m else "",
+                    "length": len(orig),
+                    "preview": _preview(orig, lbl),
+                    "restored": True,
+                    "from_history": True,
+                }
+                if is_cred:
+                    item["cred"] = True
+                    item["digest"] = _cred_digest(orig)
+                else:
+                    item["original"] = orig
+                items.append(item)
     except Exception:
         items = []
     # 上游 4xx + 请求带可疑 reasoning_effort：附加排查提示。透明代理不改请求

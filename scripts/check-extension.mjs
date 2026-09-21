@@ -427,6 +427,43 @@ if (!maskSites.length) {
   }
 }
 
+// `callMask()` 是 mask 的封装（6s 超时 + 一次重试，定义见 bridge-main.js）。
+// 封装内部已判 blocking，但**调用点**仍必须各自判 —— 否则调用点会把一个非 ok 的
+// 结果当成成功继续往下走。这里把封装调用点一并纳入扫描，避免新增一层抽象之后
+// 把原来的红线检查架空。
+const callMaskSites = [...mainSrc.matchAll(/\bcallMask\(/g)]
+for (const site of callMaskSites) {
+  if (!/\bblocking\b/.test(mainSrc.slice(site.index, site.index + 600))) {
+    fail('bridge-main.js 的 callMask() 调用点没判 blocking —— 引擎 413/503 时会把' +
+      '未脱敏原文直接放行出网，违背 fail-closed 红线')
+  }
+}
+
+// ── 响应还原判据不得用「URL 是否属上传域」 ───────────────────────────────
+// `STORAGE_OR_UPLOAD_HOSTS` 里含 claude.ai / chatgpt.com / doubao.com / deepseek.com
+// 四个**主域**（为了兜住路径不带 upload/files 关键字的附件端点，属有意为之的保守匹配），
+// 于是 `isUploadOrStorageUrl(url)` 在这些站点上**恒为 true**。拿它的**否定形式**当还原
+// 判据（曾经写成 `(m.sid && !isUploadOrStorageUrl(url)) ? wrapResponse(...) : res`），
+// 结果是主站上走 FormData / Blob 分支的请求**永不还原**，页面永久停在裸 `{{...}}`。
+// 唯一正确的判据是「body 是否真被改写」（`m.masked`）。
+const badJudge = [...mainSrc.matchAll(/!\s*isUploadOrStorageUrl\s*\(/g)]
+if (badJudge.length) {
+  fail(`bridge-main.js 里有 ${badJudge.length} 处用 !isUploadOrStorageUrl(url) 作判据 —— ` +
+    '该函数对四个主域恒为 true，会让主站的 FormData/Blob 请求永不还原；' +
+    '还原判据必须是 m.masked（body 真被改写）')
+}
+
+// ── getWideMode 失败必须清缓存 ─────────────────────────────────────────────
+// `wideModePromise` 是赋值即缓存。若失败（SW 冷启动时的 config 桥超时）也留在缓存里，
+// 该标签页**整个生命周期**都会按精准模式跑 —— 表现为「有些站点完全不脱敏」，
+// 且只有手动刷新页面才能恢复（真机上极易被误判成引擎坏了）。
+// 因此缓存重置（`wideModePromise = null`）至少要有两处：初始化 + 失败回退。
+const wmResets = [...mainSrc.matchAll(/wideModePromise\s*=\s*null/g)].length
+if (wmResets < 2) {
+  fail('bridge-main.js 的 getWideMode 失败时没有清缓存（wideModePromise = null）——' +
+    'SW 冷启动首次 config 桥失败会让整页永久降级为精准模式，只能刷新页面才能恢复')
+}
+
 // ── 结论 ────────────────────────────────────────────────────────────────────
 for (const n of notes) console.log(`check-extension:      ${n}`)
 if (errors.length) {

@@ -12,7 +12,7 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Globe, Copy, RefreshCw, AlertTriangle } from 'lucide-react'
+import { Globe, Copy, RefreshCw, AlertTriangle, FileText, CheckCircle2, XCircle } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -188,6 +188,40 @@ export function ExtBridgeCard({ cfg, toggle, saving }: ExtBridgeCardProps) {
             onCheckedChange={(v) => toggle('ext_block_when_engine_down', v)}
             aria-label={t('settings.extBridge.blockWhenDown')}
           />
+        </div>
+
+        {/* 老版 Office 文档自动转码脱敏 */}
+        <div className="flex items-start justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-2.5">
+          <div className="space-y-0.5">
+            <div className="text-[13px] font-medium">{t('settings.extBridge.convertLegacyOffice')}</div>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              {t('settings.extBridge.convertLegacyOfficeDesc')}
+            </p>
+          </div>
+          <Switch
+            checked={!!cfg?.ext_convert_legacy_office}
+            disabled={saving || !enabled}
+            onCheckedChange={(v) => toggle('ext_convert_legacy_office', v)}
+            aria-label={t('settings.extBridge.convertLegacyOffice')}
+          />
+        </div>
+
+        {/* 格式支持与不支持说明备注 */}
+        <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 space-y-2">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+            <FileText className="h-3.5 w-3.5 text-blue-500" />
+            {t('settings.extBridge.formatsTitle')}
+          </div>
+          <div className="space-y-1.5 text-[11px] leading-relaxed">
+            <div className="flex items-start gap-1.5 text-emerald-600 dark:text-emerald-400">
+              <CheckCircle2 className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+              <span>{t('settings.extBridge.supportedFormats')}</span>
+            </div>
+            <div className="flex items-start gap-1.5 text-muted-foreground">
+              <XCircle className="h-3.5 w-3.5 shrink-0 mt-0.5 text-amber-500" />
+              <span>{t('settings.extBridge.unsupportedFormats')}</span>
+            </div>
+          </div>
         </div>
 
         {/* 只读信息：引擎地址 + 统计 */}

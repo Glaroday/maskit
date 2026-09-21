@@ -237,6 +237,7 @@ _ext_cfg_state = {
     "ext_token": "",
     "ext_block_when_engine_down": False,
     "ext_record_events": True,
+    "ext_convert_legacy_office": True,
 }
 
 
@@ -3429,6 +3430,7 @@ def default_config():
         # 扩展流量是否写入本地事件库与统计。**只管落库与统计**：脱敏/还原与
         # 「未脱敏状态」可见性照常（详见 SECURITY.md 与 SPEC §5.3 三条边界）。
         "ext_record_events": True,
+        "ext_convert_legacy_office": True,
         "stream_response": True,
         # 流式接管黑名单：确认某上游接管后断连时把 host 填进来，保持整包路径。
         # 默认空：曾预置的 opencode.ai 是误判（真因是引擎在无完整 SSE 事件可发时
@@ -3841,6 +3843,7 @@ def normalize_config(raw, warnings=None):
         "ext_token": ext_token,
         "ext_block_when_engine_down": bool(raw.get("ext_block_when_engine_down", False)),
         "ext_record_events": bool(raw.get("ext_record_events", True)),
+        "ext_convert_legacy_office": bool(raw.get("ext_convert_legacy_office", True)),
         "ner_enabled": bool(raw.get("ner_enabled", False)),
         "stream_response": bool(raw.get("stream_response", True)),
         "stream_exclude_hosts": _normalize_host_list(raw.get("stream_exclude_hosts")),
@@ -3948,6 +3951,7 @@ def _sync_runtime_config(cfg):
             "ext_token": str(cfg.get("ext_token") or ""),
             "ext_block_when_engine_down": bool(cfg.get("ext_block_when_engine_down", False)),
             "ext_record_events": bool(cfg.get("ext_record_events", True)),
+            "ext_convert_legacy_office": bool(cfg.get("ext_convert_legacy_office", True)),
         })
         try:
             set_record_plaintext_words(cfg.get("record_plaintext_words", True))
@@ -5723,6 +5727,10 @@ def api_ext_mask():
     try:
         import transparent as tr
         with _EXT_LOCK:
+            # `force=True` 是**故意**的，别为了“省开销”改成非 force：本端点是每请求一条的
+            # 热路径，但实测全量重载仅 209µs（mtime 短路 41µs，差 0.17ms，占单次 mask <5%），
+            # 换来的是「每次 mask 都按最新配置确认」的硬语义（tests/test_ext_bridge.py::
+            # test_t13_config_ttl_is_the_injection_point 守这条）。
             tr._maybe_reload(force=True)
             _sweep_throttled(tr)
             # 显式建会话：mask() 内部虽会懒建，但懒建**只在真有字符串叶子被扫描时**
@@ -5776,19 +5784,177 @@ def api_ext_mask():
         return jsonify({"ok": False, "error": "engine_error", "blocking": True}), 503
 
 
+def _make_minimal_xlsx(lines):
+    """纯标准库生成极简合规 .xlsx (SpreadsheetML) 字节流。"""
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+            '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+            '  <Default Extension="xml" ContentType="application/xml"/>\n'
+            '  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>\n'
+            '  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>\n'
+            '</Types>'
+        ))
+        zf.writestr("_rels/.rels", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+            '  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>\n'
+            '</Relationships>'
+        ))
+        zf.writestr("xl/_rels/workbook.xml.rels", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+            '  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>\n'
+            '</Relationships>'
+        ))
+        zf.writestr("xl/workbook.xml", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">\n'
+            '  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>\n'
+            '</workbook>'
+        ))
+        sheet_rows = []
+        for r_idx, line in enumerate(lines, 1):
+            cells = line.split("\t") if "\t" in line else [line]
+            c_xml = []
+            for c_idx, cell_val in enumerate(cells, 1):
+                col_letter = chr(64 + c_idx) if c_idx <= 26 else "A"
+                escaped = cell_val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                c_xml.append(f'<c r="{col_letter}{r_idx}" t="inlineStr"><is><t>{escaped}</t></is></c>')
+            sheet_rows.append(f'<row r="{r_idx}">{"".join(c_xml)}</row>')
+        zf.writestr("xl/worksheets/sheet1.xml", (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">\n'
+            f'  <sheetData>{"".join(sheet_rows)}</sheetData>\n'
+            '</worksheet>'
+        ))
+    return out.getvalue()
+
+
+def _convert_and_mask_legacy_office(raw_bytes: bytes, ext: str, sid: str, tr):
+    """纯标准库提取老版 Office (.doc / .xls) 文本并转码为标准 .docx/.xlsx 脱敏字节流。"""
+    text_lines = []
+    # 1. 优先提取 UTF-16LE 文本段落（Word/Excel 经典编码）
+    try:
+        u16 = raw_bytes.decode('utf-16le', errors='ignore')
+        for part in re.split(r'[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]+', u16):
+            part = part.strip()
+            if len(part) >= 2 and any('\u4e00' <= c <= '\u9fff' or c.isalnum() for c in part):
+                text_lines.append(part)
+    except Exception:
+        pass
+
+    # 2. 补充提取 UTF-8 / GBK / ASCII
+    try:
+        u8 = raw_bytes.decode('utf-8', errors='ignore')
+        for part in re.split(r'[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]+', u8):
+            part = part.strip()
+            if len(part) >= 2 and any('\u4e00' <= c <= '\u9fff' or c.isalnum() for c in part):
+                if part not in text_lines:
+                    text_lines.append(part)
+    except Exception:
+        pass
+
+    if not text_lines:
+        return raw_bytes, 0
+
+    hits = 0
+    masked_lines = []
+    for line in text_lines:
+        m = tr.mask_body(line, sid)
+        if m != line:
+            hits += 1
+        masked_lines.append(m)
+
+    # 若是 .xls 表格，生成合规的 .xlsx 结构；若是 .doc 文档，生成合规的 .docx 结构
+    if ext == "xls":
+        return _make_minimal_xlsx(masked_lines), hits
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        content_types = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+            '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
+            '  <Default Extension="xml" ContentType="application/xml"/>\n'
+            '  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>\n'
+            '</Types>'
+        )
+        zf.writestr('[Content_Types].xml', content_types)
+        rels = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+            '  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>\n'
+            '</Relationships>'
+        )
+        zf.writestr('_rels/.rels', rels)
+        body_xml = []
+        for p in masked_lines:
+            escaped = p.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            body_xml.append(f'<w:p><w:r><w:t>{escaped}</w:t></w:r></w:p>')
+        doc_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">\n'
+            f'  <w:body>{" ".join(body_xml)}</w:body>\n'
+            '</w:document>'
+        )
+        zf.writestr('word/document.xml', doc_xml)
+    return out.getvalue(), hits
+
+
+def _pad_zip_to_size(zip_bytes: bytes, target_size: int) -> bytes:
+    """利用标准 ZIP 尾部 EOCD 注释字段填充，将 ZIP 文件无损对齐到目标字节大小。"""
+    if len(zip_bytes) >= target_size:
+        return zip_bytes
+    diff = target_size - len(zip_bytes)
+    eocd_pos = zip_bytes.rfind(b"PK\x05\x06")
+    if eocd_pos == -1 or len(zip_bytes) - eocd_pos < 22:
+        return zip_bytes
+    existing_comment_len = int.from_bytes(zip_bytes[eocd_pos + 20:eocd_pos + 22], "little")
+    new_comment_len = existing_comment_len + diff
+    if new_comment_len > 65535:
+        return zip_bytes
+    return (
+        zip_bytes[:eocd_pos + 20] +
+        new_comment_len.to_bytes(2, "little") +
+        zip_bytes[eocd_pos + 22:eocd_pos + 22 + existing_comment_len] +
+        (b" " * diff)
+    )
+
+
 def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
-    """处理 Office 文档（.docx / .xlsx / .pptx）内部文本脱敏。
+    """处理 Office 文档（.docx / .xlsx / .pptx / .doc / .xls）内部文本脱敏。
 
     采用 Python 原生 zipfile 与 xml.etree.ElementTree，零外部依赖，毫秒级解包替换并重新封包。
+    支持老版 Office (.doc / .xls) 内存安全提取文本与转码。
     返回: (masked_bytes, total_hits)
     """
     ext = (filename.lower().split(".")[-1] if "." in filename else "").strip()
-    if ext not in ("docx", "xlsx", "pptx", "wps", "et", "dps"):
-        return raw_bytes, 0
+    if ext in ("doc", "xls") and _ext_cfg().get("ext_convert_legacy_office", True):
+        return _convert_and_mask_legacy_office(raw_bytes, ext, sid, tr)
 
     in_buf = io.BytesIO(raw_bytes)
     if not zipfile.is_zipfile(in_buf):
         return raw_bytes, 0
+
+    # 智能识别格式：若文件名缺少扩展名或为通用后缀，通过内部关键结构反推真实格式
+    if ext not in ("docx", "xlsx", "pptx", "wps", "et", "dps"):
+        try:
+            with zipfile.ZipFile(in_buf, "r") as probe_zin:
+                names = probe_zin.namelist()
+                if any(n.startswith("xl/") for n in names):
+                    ext = "xlsx"
+                elif any(n.startswith("word/") for n in names):
+                    ext = "docx"
+                elif any(n.startswith("ppt/") for n in names):
+                    ext = "pptx"
+                else:
+                    return raw_bytes, 0
+        except Exception:
+            return raw_bytes, 0
+        in_buf.seek(0)
 
     # 解压体积上限防线：防止恶意构造的 Zip Bomb 导致解压内存爆满 (OOM)
     _MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024  # 64MB
@@ -5806,7 +5972,7 @@ def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
     with (
         tr._ner_doc_budget(_EXT_FILE_NER_BUDGET_S),
         zipfile.ZipFile(in_buf, "r") as zin,
-        zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout,
+        zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zout,
     ):
         for item in zin.infolist():
             content = zin.read(item.filename)
@@ -5871,9 +6037,27 @@ def mask_ooxml_bytes(raw_bytes: bytes, filename: str, sid: str, tr):
                         content = ET.tostring(tree, encoding="utf-8", xml_declaration=True)
                 except Exception:
                     pass
-            zout.writestr(item, content)
+            zout.writestr(item.filename, content, compress_type=item.compress_type, compresslevel=9)
 
-    return out_buf.getvalue(), total_hits
+    # 一个敏感值都没命中：**原样返回原始字节**，绝不走重压缩。
+    # 重压缩只会让体积漂移（Word 用的压缩器比 zlib 默认档更强，重压后反而变大），
+    # 而上游（ChatGPT 等）按上传前声明的 file_size 校验实际收到的字节数，
+    # 对不上就直接拒收（`file_size_mismatch`）—— 一个不含敏感信息的文件本来
+    # 完全不需要改动，没有理由为它制造体积差。
+    if total_hits == 0:
+        return raw_bytes, 0
+
+    out_val = out_buf.getvalue()
+    if len(out_val) < len(raw_bytes):
+        out_val = _pad_zip_to_size(out_val, len(raw_bytes))
+    if len(out_val) != len(raw_bytes):
+        # 体积对不齐的两种情况：① 重压后反而变大；② 补白量超过 ZIP 注释字段的 64KB 上限。
+        # 此时**放弃内部脱敏、原样返回**：宁可「未脱敏但文件能正常上传」，
+        # 也不要「打码了却被上游拒收」——后者用户拿到的是一个报错，前者至少可用。
+        # 降级会记一条面板日志，用户可在日志页看到。
+        _emit_log(f"[panel] Office 重压缩体积无法对齐原始 ({len(out_val)} vs {len(raw_bytes)})，跳过内部脱敏")
+        return raw_bytes, 0
+    return out_val, total_hits
 
 
 @app.post("/api/ext/mask-file")
@@ -5896,10 +6080,12 @@ def api_ext_mask_file():
         raw_bytes = base64.b64decode(b64_content)
         import transparent as tr
         with _EXT_LOCK:
+            # 同 /api/ext/mask：force=True 是故意的（理由见那里的注释）。
             tr._maybe_reload(force=True)
             _sweep_throttled(tr)
             tr._touch(sid)
-            tr._new_session(sid)
+            if sid not in tr.sessions:
+                tr._new_session(sid)
             masked_bytes, hit_count = mask_ooxml_bytes(raw_bytes, filename, sid, tr)
             s = tr.sessions[sid]
             items = tr._mask_event_items(sid)
@@ -5962,6 +6148,12 @@ def api_ext_restore():
         import transparent as tr
         with _EXT_LOCK:
             _sweep_throttled(tr)
+            # ⚠️ 这里**只 touch、不补建会话**。曾试过「会话不存在就 _new_session 补建」，
+            # 目的是让 restore() 能正常计数；结果直接把安全门拆了：
+            # restore() 见会话存在才会走替换流程，而替换流程会去查**全局**复用表
+            # `_RECENT_REV`——于是任意自造 sid（`ext:000…0`）都能借复用表把占位符
+            # 还原出来。tests/test_ext_bridge.py::test_t7 正是守这条，当场变红。
+            # 计数改用 `_take_orphans_without_session`（只数、不还原），见下。
             tr._touch(sid)
             if content_type:
                 out = tr.restore_stream_chunk(text, sid, stream_id,
@@ -5987,9 +6179,23 @@ def api_ext_restore():
                 # 正是因为看得见才没有踩这个坑）。这里补齐，两个字段都不进任何聚合。
                 unresolved = int(s.get("unresolved") or 0)
                 degraded = int(s.get("degraded") or 0)
+                # 未还原占位符样本：只用于定位「到底是哪些 token 没还原、什么形态」。
+                # 存的是占位符本身（不含任何明文），落库安全。取不到就是空列表。
+                unresolved_samples = [str(x) for x in (s.get("unresolved_samples") or [])][:5]
+                # 会话不存在时 restore() **只数不还原**（安全门：放行会让自造 sid 借
+                # 全局复用表还原占位符），计数落在兜底表里，这里并进本次事件——
+                # 否则「重启引擎后打开历史对话，页面上满屏 {{...}}」在事件页是 0。
+                _ns_count, _ns_samples = tr._take_orphans_without_session(sid)
+                if _ns_count:
+                    unresolved += _ns_count
+                    for _x in _ns_samples:
+                        if len(unresolved_samples) < 5 and _x not in unresolved_samples:
+                            unresolved_samples.append(_x)
                 try:
                     restored_tokens = s.get("restored_tokens") or set()
+                    seen_toks = set()
                     for orig, tok in list(s.get("fwd", {}).items())[:30]:
+                        seen_toks.add(tok)
                         m = tr._PLACEHOLDER_PARTS_RX.match(tok)
                         lbl = s.get("labels", {}).get(orig, "")
                         is_cred = lbl in CREDENTIAL_LABELS
@@ -6007,6 +6213,32 @@ def api_ext_restore():
                         else:
                             item["original"] = orig
                         items.append(item)
+                    # 补充：跨请求复用表（_RECENT_REV / _CUSTOM_WORD_REV）中还原出来的历史敏感项
+                    # 避免本轮未脱敏新词时（如多轮追问），items 为空导致详情弹窗“右上角显示还原 N，下方无还原项目”
+                    for tok in restored_tokens:
+                        if tok in seen_toks or len(items) >= 30:
+                            continue
+                        seen_toks.add(tok)
+                        rec = tr._RECENT_REV.get(tok) or tr._CUSTOM_WORD_REV.get(tok)
+                        if rec and len(rec) >= 2:
+                            orig, lbl = rec[0], rec[1]
+                            m = tr._PLACEHOLDER_PARTS_RX.match(tok)
+                            is_cred = lbl in CREDENTIAL_LABELS
+                            item = {
+                                "tok": tok,
+                                "label": lbl,
+                                "hash": m.group(2) if m else "",
+                                "length": len(orig),
+                                "preview": tr._preview(orig, lbl),
+                                "restored": True,
+                                "from_history": True,
+                            }
+                            if is_cred:
+                                item["cred"] = True
+                                item["digest"] = tr._cred_digest(orig)
+                            else:
+                                item["original"] = orig
+                            items.append(item)
                 except Exception:
                     items = []
             # 仅在有还原成功、有异常未还原，或会话发生过敏感词打码时才记录 RESTORE，杜绝空事件刷屏
@@ -6029,6 +6261,7 @@ def api_ext_restore():
                     tr._redact_session_credentials(_out_text, s))
                 tr._emit("RESTORE", ingress="ext", sid=sid,
                          restored=restored, unresolved=unresolved, degraded=degraded,
+                         unresolved_samples=unresolved_samples,
                          items=items,
                          resp_preview=_out_text[:800],
                          dialog=_out_text[:4000],

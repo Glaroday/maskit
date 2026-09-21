@@ -42,11 +42,13 @@ const NOISE_TYPES = new Set(['SKIP', 'PASS', 'BYPASS', 'CANCEL', 'DNS_ERROR'])
  */
 export function mergeMaskRestore(events: readonly ShieldEvent[], opts: MergeOptions = {}): MergedEvent[] {
   const { filterType, hideNoise } = opts
-  const filtered = events.filter(
-    (e) =>
-      (filterType === undefined || filterType === FILTER_ALL || e.type === filterType) &&
-      (!hideNoise || !NOISE_TYPES.has(e.type)),
-  )
+  const filtered = events.filter((e) => {
+    if (hideNoise && NOISE_TYPES.has(e.type)) return false
+    if (filterType === undefined || filterType === FILTER_ALL) return true
+    if (filterType === 'EXT_ALL') return (e as { ingress?: string }).ingress === 'ext'
+    if (filterType === 'PASS_COMBINED') return e.type === 'PASS' || e.type === 'BYPASS' || e.type === 'SKIP'
+    return e.type === filterType
+  })
 
   const bySid = new Map<string, MergedEvent>()
   // 已成对（MASK+RESTORE 已合并）的 sid：再来的同类事件必须独立成行，绝不静默覆盖已成对的那行

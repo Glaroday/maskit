@@ -308,13 +308,15 @@ export function EventDetailDialog({
             )}
 
             {/* 脱敏/还原项目对照（明文 → 占位符 / 占位符 → 明文） */}
-            {event.items && event.items.length > 0 && (
+            {event.items && event.items.length > 0 ? (
               <div>
                 <h3 className="mb-2 text-[13px] font-semibold">
-                  {tf(event.type === 'RESTORE' ? 'detail.restoreItems' : 'detail.maskItems', { n: event.items.length })}
+                  {event.type === 'RESTORE' && (event.restored ?? 0) > 0
+                    ? tf('detail.restoreItemsWithTotal', { n: event.items.length, total: event.restored })
+                    : tf(event.type === 'RESTORE' ? 'detail.restoreItems' : 'detail.maskItems', { n: event.items.length })}
                 </h3>
                 <div className="space-y-2">
-                  {(event.items as { label: string; original?: string; preview?: string; tok?: string; hash?: string; length?: number; restored?: boolean }[]).map(
+                  {(event.items as { label: string; original?: string; preview?: string; tok?: string; hash?: string; length?: number; restored?: boolean; from_history?: boolean }[]).map(
                     (item, idx) => {
                       const isRestored = (event.type === 'RESTORE' && item.restored !== false) || item.restored === true
                       const notRestored = event.type === 'RESTORE' && item.restored === false
@@ -337,6 +339,11 @@ export function EventDetailDialog({
                               <Badge variant="outline" className="font-mono text-[11px]">
                                 {item.label}
                               </Badge>
+                              {item.from_history && (
+                                <Badge variant="secondary" className="text-[10px] font-normal text-muted-foreground">
+                                  {t('detail.fromHistory')}
+                                </Badge>
+                              )}
                             </div>
                             {item.original != null && <CopyBtn text={item.original} />}
                           </div>
@@ -377,7 +384,12 @@ export function EventDetailDialog({
                   )}
                 </div>
               </div>
-            )}
+            ) : event.type === 'RESTORE' && (event.restored ?? 0) > 0 ? (
+              <div className="rounded-lg border bg-muted/20 p-3 text-xs text-muted-foreground leading-relaxed">
+                <div className="font-medium text-foreground">{t('detail.noItemsTitle')}</div>
+                <p className="mt-1">{tf('detail.noItemsDesc', { n: event.restored })}</p>
+              </div>
+            ) : null}
 
             {/* 用户请求原文（dialog_req） */}
             {event.dialog_req && (

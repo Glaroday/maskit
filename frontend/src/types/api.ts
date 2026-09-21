@@ -298,6 +298,8 @@ export interface ShieldConfig {
   ext_block_when_engine_down?: boolean
   /** 扩展链路是否写入本地事件库与统计（默认 true）。只管落库，不管脱敏 */
   ext_record_events?: boolean
+  /** 扩展链路是否自动将老版 Office (.doc / .xls) 在内存转码为 .docx / .xlsx 脱敏发送（默认 true） */
+  ext_convert_legacy_office?: boolean
   target_domains?: string[]
   api_paths?: string[]
   wizard_done?: boolean

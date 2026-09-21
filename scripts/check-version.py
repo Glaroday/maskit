@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 
 
 def read_versions() -> dict[str, str]:
@@ -62,7 +62,7 @@ def check_tag(tag: str, version: str) -> list[str]:
     errors: list[str] = []
     normalized = tag[1:] if tag.startswith("v") else tag
     if not tag.startswith("v") or not SEMVER_RE.fullmatch(normalized):
-        errors.append(f"tag must match vX.Y.Z (got {tag!r})")
+        errors.append(f"tag must match vX.Y.Z[-prerelease] (got {tag!r})")
     elif normalized != version:
         errors.append(f"tag {tag} does not match source version {version}")
 
@@ -115,7 +115,7 @@ def main() -> int:
     )
     primary = [versions[key] for key in primary_keys]
     if any(not SEMVER_RE.fullmatch(v) for v in primary):
-        errors.append("one or more primary version fields are missing or not strict X.Y.Z")
+        errors.append("one or more primary version fields are missing or not valid semver (X.Y.Z[-prerelease])")
     if len(set(primary)) != 1:
         errors.append("panel.py / tauri.conf.json / Cargo.toml / package.json versions differ")
 

@@ -455,7 +455,22 @@ async function safeCall(path, body) {
   try {
     r = await callPanel(path, body);
   } catch (e) {
-    // 连接拒绝 / 超时 / DNS：全属 (B) 默认桶 → 进 60s 直通期
+    // ⚠️ 必须区分「引擎慢」与「引擎不在」。
+    //
+    // `downUntil` 是**全局** 60s 直通窗口，窗口内连 `restore` 也一律透传——而 restore 是
+    // **每 SSE chunk 一次**调用，于是一次超时就让**整条回复**（以及所有标签页）的后续
+    // chunk 全部丢掉还原，页面上一大段裸 `{{...}}`。真机表现就是「时好时坏、位置随机」。
+    //
+    // 超时（AbortController 触发）只证明「这一次调用慢」，不构成「引擎挂了」的证据：
+    // 引擎侧 `/api/ext/*` 走一把全局锁串行，多标签页并发或 NER 冷启动都可能超 15s。
+    // 这类情况只把**本次**按直通处理，不进窗口、不污染其他调用与其他流。
+    // 只有连接类错误（ECONNREFUSED / DNS 失败 / 端口没人监听）才进窗口——那才是「引擎不在」。
+    const aborted = !!(e && (e.name === 'AbortError' || /abort/i.test(String((e && e.message) || ''))));
+    if (aborted) {
+      await setStatus('passthrough', 'engine_timeout');
+      return { ok: false, blocking: await isBlockOnDown(), passthrough: true, error: 'engine_timeout' };
+    }
+    // 连接拒绝 / DNS：全属 (B) 默认桶 → 进 60s 直通期
     downUntil = Date.now() + DOWN_WINDOW_MS;
     await setStatus('down', 'engine_unreachable');
     return { ok: false, blocking: await isBlockOnDown(), passthrough: true, error: 'engine_unreachable' };
@@ -539,10 +554,11 @@ async function handleMask(payload, tabId, host) {
 }
 
 async function handleMaskFile(payload, tabId, host) {
-  const filename = payload && typeof payload.filename === 'string' ? payload.filename : '';
+  let filename = payload && typeof payload.filename === 'string' ? payload.filename.trim() : '';
   const base64 = payload && typeof payload.base64 === 'string' ? payload.base64 : '';
   const sid = payload && typeof payload.sid === 'string' ? payload.sid : '';
-  if (!filename || !base64) return { ok: false, passthrough: true };
+  if (!base64) return { ok: false, passthrough: true };
+  if (!filename) filename = 'attachment.xlsx';
 
   const cfg = await getConfig();
   // 总开关同 handleMask（审计 B3）：文档链路也一样，不能只在文本链路生效。
@@ -705,8 +721,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.action === 'restore') {
     // 校验 sid 属于该 tab（storage.session 异步读）
-    validateSid(msg.payload && msg.payload.sid, tabId).then((ok) => {
+    validateSid(msg.payload && msg.payload.sid, tabId).then(async (ok) => {
       if (!ok) {
+        // 签发表查不到（SW 冷启动读不到 session storage / 扩展更新把它清了 / 真的跨 tab）：
+        // 按安全门**不还原**、原样透传（绝不借全局复用表还原）。但这必须留痕——否则
+        // 页面上一大段裸 `{{...}}` 与「引擎坏了」在用户侧完全无法区分（真机排查时被误判过）。
+        // 只记 final 那一帧，避免每 chunk 一行把元数据缓冲刷掉。
+        if (msg.payload && msg.payload.final) {
+          await pushRecent({ host, path: 'restore', action: 'skip', count: 0, status: 'sid_denied' });
+        }
         sendResponse({ ok: false, text: (msg.payload && msg.payload.text) || '' });
         return;
       }
@@ -839,7 +862,56 @@ async function doSyncDynamicScripts() {
   } catch (e) {
     /* 配额/环境异常不该影响注册主流程 */
   }
+  // 重注册只对「之后新加载的页面」生效，已开着的标签页要补一次主动注入（理由见函数注释）。
+  await injectIntoOpenTabs(sites);
   return failures;
+}
+
+/**
+ * 主动注入**已经打开**的标签页。
+ *
+ * 为什么必须有（2026-09-20 真机）：manifest 里静态声明的 chatgpt.com / claude.ai，
+ * 在扩展被重新加载时 Chrome 会把 content script 自动重新注入到已开着的标签页；
+ * 而动态注册的站点（豆包 / DeepSeek 等用户自己加的）**不会** ——
+ * `registerContentScripts` 只对注册之后新加载的页面生效。
+ * 于是重载扩展后的真机表现是「ChatGPT / Claude 一切正常，豆包 / DeepSeek 一条记录都没有」，
+ * 用户看不出是注入没生效，只会以为整个扩展坏了。
+ * 这里补一次主动注入，把「请手动刷新页面」这一步消掉。
+ *
+ * 幂等：两个 bridge 脚本各自有 `window.__MASKIT_*__` 守卫，重复注入是空操作。
+ * 失败必须吞掉：chrome:// 页面、未授权的站点、已关闭的标签页都会抛，
+ * 它们不该让注册主流程失败。
+ */
+async function injectIntoOpenTabs(sites) {
+  if (!sites.length || !chrome.scripting || !chrome.tabs) return;
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (e) {
+    return;
+  }
+  for (const tab of tabs) {
+    if (!tab || !tab.id || !tab.url) continue;
+    let host = '';
+    try {
+      host = new URL(tab.url).hostname;
+    } catch (e) {
+      continue;                        // chrome://、about:blank、扩展页等无法解析的 URL
+    }
+    if (!siteCovers(host, sites)) continue;
+    // 顺序固定：isolated 先建好中继，main 再 hook（与 manifest 里的声明顺序一致）
+    for (const [file, world] of [['bridge-isolated.js', 'ISOLATED'], ['bridge-main.js', 'MAIN']]) {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          files: [file],
+          world,
+        });
+      } catch (e) {
+        /* 未授权 / 特殊页面：跳过该文件，不影响其他标签页 */
+      }
+    }
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {

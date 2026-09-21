@@ -19,7 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { Download, Trash2, RefreshCw, Search, HelpCircle, Loader2, X } from 'lucide-react'
+import { Download, Trash2, RefreshCw, Search, HelpCircle, Loader2, X, Globe, FileText } from 'lucide-react'
 import { getLogs, exportLogs, clearLogs } from '@/api/logs'
 import { getAuditEvents } from '@/api/audit'
 import { EventTypeIcon, EVENT_TYPE_META } from '@/components/events/EventTypeIcon'
@@ -104,6 +104,18 @@ interface AuditRow {
 }
 
 /** query cache 存的形状：累积列表 + 最新游标 + tail */
+/** 日志表格列宽定义。
+ *
+ * **表头与数据行必须共用这一份**：两处各写一遍数值时，改一处忘一处就会让表头与内容
+ * 逐列错位（此前就是这么漂移的）。同时给每个需要截断的 grid cell 都加 `min-w-0`
+ * —— grid item 默认 `min-width:auto`，不加的话 `truncate` 完全不生效，长值会被
+ * 行容器的 `overflow-hidden` **硬切断**（没有省略号，看着像文字被压重叠）。
+ */
+const LOG_GRID_COLS =
+  'grid-cols-[68px_88px_112px_108px_minmax(96px,1fr)_minmax(190px,1.4fr)_54px_58px_72px]'
+/** 表格最小宽度：上面这些列 + gap + 左右内边距能完整放下的下限；低于它由外层横向滚动接管。 */
+const LOG_MIN_W = 'min-w-[940px]'
+
 interface LogsCache {
   list: ShieldEvent[]
   tail: string[]
@@ -193,11 +205,11 @@ export default function LogsPage() {
         const resp = await getLogs({
           since,
           limit: 200,
-          type: filterType === FILTER_ALL ? undefined : filterType,
+          type: filterType === FILTER_ALL || filterType === 'EXT_ALL' || filterType === 'PASS_COMBINED' ? undefined : filterType,
           sensitive,
           q,
           fulltext,
-          ingress: ingress === INGRESS_ALL ? undefined : (ingress as 'proxy' | 'ext'),
+          ingress: filterType === 'EXT_ALL' ? 'ext' : ingress === INGRESS_ALL ? undefined : (ingress as 'proxy' | 'ext'),
           slim: true,
         }, signal)
         tail = resp.tail ?? tail
@@ -280,7 +292,12 @@ export default function LogsPage() {
   const merged = useMemo(() => {
     const noiseTypes = new Set(['SKIP', 'PASS', 'BYPASS', 'CANCEL', 'DNS_ERROR'])
     const audit: (AuditRow & { _audit: true })[] = auditRows
-      .filter((row) => filterType === FILTER_ALL || row.type === filterType)
+      .filter((row) => {
+        if (filterType === FILTER_ALL) return true
+        if (filterType === 'EXT_ALL') return (row as { ingress?: string }).ingress === 'ext'
+        if (filterType === 'PASS_COMBINED') return ['PASS', 'BYPASS', 'SKIP'].includes(row.type)
+        return row.type === filterType
+      })
       .filter((row) => !hideNoise || !noiseTypes.has(row.type))
       .map((row) => ({ ...row, _audit: true as const }))
     // 普通事件：MASK/RESTORE 合并与排序交给共享函数（与 Dashboard 最近日志同口径）
@@ -314,7 +331,7 @@ export default function LogsPage() {
     setExporting(true)
     try {
       const resp = await exportLogs({
-        type: filterType === FILTER_ALL ? undefined : filterType,
+        type: filterType === FILTER_ALL || filterType === 'EXT_ALL' || filterType === 'PASS_COMBINED' ? undefined : filterType,
         sensitive,
         q,
         fulltext,
@@ -432,30 +449,30 @@ export default function LogsPage() {
     if (masked || restored || unresolved || degraded) {
       return (
         <span
-          className="flex min-w-0 items-center gap-1.5 text-[11px]"
+          className="flex min-w-0 items-center gap-1.5 overflow-hidden text-[11px]"
           title={[itemsPreviewText, row.method, row.host, row.path].filter(Boolean).join(' · ')}
         >
-          {masked && <span className="text-blue-600 dark:text-blue-400">{t('logs.colMasked')} {row.count}</span>}
-          {restored && <span className="text-emerald-600 dark:text-emerald-400">{t('logs.colRestored')} {row.restored}</span>}
+          {masked && <span className="whitespace-nowrap shrink-0 text-blue-600 dark:text-blue-400">{t('logs.colMasked')} {row.count}</span>}
+          {restored && <span className="whitespace-nowrap shrink-0 text-emerald-600 dark:text-emerald-400">{t('logs.colRestored')} {row.restored}</span>}
           {itemLabels.length > 0 && (
-            <span className="flex items-center gap-1">
+            <span className="flex min-w-0 shrink items-center gap-1">
               {itemLabels.slice(0, 2).map((lb) => (
-                <span key={lb} className="rounded bg-muted px-1 py-0.2 font-mono text-[9px] text-muted-foreground">
+                <span key={lb} className="whitespace-nowrap rounded bg-muted px-1 py-0.2 font-mono text-[9px] text-muted-foreground">
                   {lb}
                 </span>
               ))}
               {itemLabels.length > 2 && (
-                <span className="text-[9px] text-muted-foreground">+{itemLabels.length - 2}</span>
+                <span className="whitespace-nowrap text-[9px] text-muted-foreground">+{itemLabels.length - 2}</span>
               )}
             </span>
           )}
           {unresolved && (
-            <span className="text-amber-600 dark:text-amber-400" title={t('logs.unresolvedHint')}>
+            <span className="whitespace-nowrap shrink-0 text-amber-600 dark:text-amber-400" title={t('logs.unresolvedHint')}>
               {t('logs.colUnresolved')} {row.unresolved}
             </span>
           )}
           {degraded && (
-            <span className="text-muted-foreground" title={t('logs.degradedHint')}>
+            <span className="whitespace-nowrap shrink-0 text-muted-foreground" title={t('logs.degradedHint')}>
               {t('logs.colDegraded')} {row.degraded}
             </span>
           )}
@@ -486,24 +503,21 @@ export default function LogsPage() {
       {/* 筛选栏 */}
       <div className="flex flex-wrap items-center gap-2">
         <Select value={filterType} onValueChange={(v) => { setFilterType(v); setPage(1) }}>
-          <SelectTrigger className="h-8 w-[140px] text-xs">
+          <SelectTrigger className="h-8 w-[156px] text-xs">
             <SelectValue placeholder={t('logs.filterAll')} />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value={FILTER_ALL}>{t('logs.filterAll')}</SelectItem>
+            <SelectItem value="EXT_ALL" className="font-medium text-blue-600 dark:text-blue-400">
+              <div className="flex items-center gap-1.5">
+                <Globe className="h-3.5 w-3.5" />
+                <span>{t('logs.filterExt')}</span>
+              </div>
+            </SelectItem>
             <SelectGroup>
               <SelectLabel>{t('logs.filterHandled')}</SelectLabel>
               <SelectItem value="MASK">{t('logs.filterMasked')}</SelectItem>
               <SelectItem value="RESTORE">{t('logs.filterRestored')}</SelectItem>
-            </SelectGroup>
-            <SelectGroup>
-              <SelectLabel>{t('logs.filterNotMasked')}</SelectLabel>
-              <SelectItem value="PASS">{t('logs.filterPass')}</SelectItem>
-              <SelectItem value="BYPASS">{t('logs.filterBypass')}</SelectItem>
-            </SelectGroup>
-            <SelectGroup>
-              <SelectLabel>{t('logs.filterMissed')}</SelectLabel>
-              <SelectItem value="SKIP">{t('logs.filterSkip')}</SelectItem>
             </SelectGroup>
             <SelectGroup>
               <SelectLabel>{t('logs.filterErrors')}</SelectLabel>
@@ -512,7 +526,14 @@ export default function LogsPage() {
               <SelectItem value="SCAN_WARN">{t('logs.filterScanWarn')}</SelectItem>
             </SelectGroup>
             <SelectGroup>
-              <SelectLabel>{t('logs.filterNonFault')}</SelectLabel>
+              <SelectLabel>{t('logs.filterPassedCombined')}</SelectLabel>
+              <SelectItem value="PASS_COMBINED">{t('logs.filterPassedAll')}</SelectItem>
+            </SelectGroup>
+            <SelectGroup>
+              <SelectLabel className="text-[10px] text-muted-foreground">{t('logs.filterAdvanced')}</SelectLabel>
+              <SelectItem value="PASS">{t('logs.filterPass')}</SelectItem>
+              <SelectItem value="BYPASS">{t('logs.filterBypass')}</SelectItem>
+              <SelectItem value="SKIP">{t('logs.filterSkip')}</SelectItem>
               <SelectItem value="CANCEL">{t('logs.filterCancel')}</SelectItem>
               <SelectItem value="DNS_ERROR">{t('logs.filterDns')}</SelectItem>
             </SelectGroup>
@@ -641,9 +662,14 @@ export default function LogsPage() {
         ref={scrollRef}
         className="min-h-0 flex-1 overflow-auto rounded-xl border bg-card shadow-[var(--shadow-card)]"
       >
-        <div className="min-w-[820px]">
-        {/* 表头（固定）：时间(两行 日期+时间) / 结果 / 入口 / 上游 / 模型(宽列) / 处理摘要(脱敏/还原) / 状态 / 耗时 / 费用 */}
-        <div className="sticky top-0 z-10 grid grid-cols-[68px_92px_54px_88px_minmax(180px,2fr)_minmax(130px,1fr)_54px_58px_64px] gap-2 border-b bg-card px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+        <div className={LOG_MIN_W}>
+        {/* 表头（固定）：时间(两行 日期+时间) / 结果 / 入口 / 上游 / 模型(收紧) / 处理摘要(脱敏/还原 宽列) / 状态 / 耗时 / 费用 */}
+        <div
+          className={cn(
+            'sticky top-0 z-10 grid gap-2 border-b bg-card px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground',
+            LOG_GRID_COLS,
+          )}
+        >
           <span>{t('logs.colTime')}</span>
           <span>{t('logs.colResult')}</span>
           <span>{t('logs.colIngress')}</span>
@@ -663,7 +689,8 @@ export default function LogsPage() {
               <div
                 key={`${row._audit ? 'a' : 'e'}-${row.seq}-${vi.index}`}
                 className={cn(
-                  'absolute left-0 top-0 grid w-full grid-cols-[68px_92px_54px_88px_minmax(180px,2fr)_minmax(130px,1fr)_54px_58px_64px] items-center gap-2 border-b px-3 text-[12px]',
+                  'absolute left-0 top-0 grid w-full items-center gap-2 overflow-hidden border-b px-3 text-[12px]',
+                  LOG_GRID_COLS,
                   'transition-colors hover:bg-muted/40',
                   row._audit && 'bg-amber-500/5 hover:bg-amber-500/10',
                 )}
@@ -671,34 +698,49 @@ export default function LogsPage() {
                 onClick={() => openDetail(row)}
               >
                 {/* 时间：上日期下时间（用户要求，一行放不下就两行） */}
-                <span className="flex flex-col leading-tight tabular-nums text-[11px] text-muted-foreground">
+                <span className="flex flex-col leading-tight tabular-nums text-[11px] text-muted-foreground shrink-0">
                   <span>{row.ts ? dayjs(row.ts * 1000).format('MM-DD') : '—'}</span>
                   <span className="opacity-70">{row.ts ? dayjs(row.ts * 1000).format('HH:mm:ss') : ''}</span>
                 </span>
                 {/* 结果 */}
-                <span className="flex items-center gap-1">
+                <span className="flex items-center gap-1 min-w-0">
                   <EventTypeIcon type={row.type} className="h-3.5 w-3.5 shrink-0" />
-                  <span className="text-[11px] font-medium">{t(EVENT_TYPE_META[row.type]?.labelKey ?? row.type)}</span>
+                  <span className="truncate text-[11px] font-medium">{t(EVENT_TYPE_META[row.type]?.labelKey ?? row.type)}</span>
                 </span>
-                {/* 入口：proxy=CLI 代理链路（老数据该列为空，按 proxy 解读）；ext=浏览器扩展。
-                    扩展事件的 host 是**页面域名**（chatgpt.com），与代理链路可能同值，
-                    所以「肉眼可辨」不成立 —— 必须显式标出来。 */}
-                <span className="truncate text-[10px] text-muted-foreground">
+                {/* 入口：proxy=CLI 代理链路；ext=浏览器扩展。如果是文档脱敏，同时显式标注 📄 文档脱敏 */}
+                <div className="flex flex-col justify-center min-w-0">
+                  {(row as { ingress?: string }).ingress === 'ext' ? (
+                    <div className="flex flex-col gap-0.5">
+                      <span className="inline-flex w-fit items-center gap-1 whitespace-nowrap rounded bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
+                        <Globe className="h-3 w-3 shrink-0" />
+                        <span>{t('logs.badgeExt')}</span>
+                      </span>
+                      {(!row._audit && (row.path === '/ext/mask-file' || (row.dialog && row.dialog.includes('文件脱敏')))) && (
+                        <span className="inline-flex w-fit items-center gap-0.5 whitespace-nowrap text-[9px] font-medium text-amber-600 dark:text-amber-400" title={(!row._audit && row.dialog) ? row.dialog : t('logs.badgeDoc')}>
+                          <FileText className="h-2.5 w-2.5 shrink-0" />
+                          <span>{t('logs.badgeDoc')}</span>
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <span className="min-w-0 truncate whitespace-nowrap text-[10px] text-muted-foreground">
+                      {t('logs.ingress.proxy')}
+                    </span>
+                  )}
+                </div>
+                {/* 上游：优先配置名 upstream，client_app（进程探测）仅作缺失回退；扩展行展示目标站点 host */}
+                <span className="min-w-0 truncate text-[11px] font-medium text-foreground/85" title={String(row.upstream || row.client_app || row.host || '')}>
                   {(row as { ingress?: string }).ingress === 'ext'
-                    ? t('logs.ingress.ext')
-                    : t('logs.ingress.proxy')}
+                    ? (row.host || 'Web AI')
+                    : String(row.upstream || row.client_app || '—')}
                 </span>
-                {/* 上游：优先配置名 upstream，client_app（进程探测）仅作缺失回退 */}
-                <span className="truncate text-[11px] text-muted-foreground" title={String(row.upstream || row.client_app || '')}>
-                  {String(row.upstream || row.client_app || '—')}
-                </span>
-                {/* 模型：模型名 + 流式标签，完整 host/path 放 title（悬停可见） */}
+                {/* 模型：模型名 + 流式标签，完整 host/path 放 title（悬停可见）；扩展行展示模型或 Web 对话 */}
                 <span
                   className="flex min-w-0 items-center gap-1.5"
                   title={`${row.host ?? ''}${row.path ?? ''}${row.model ? `\n${tf('logs.modelIn', { m: row.model })}` : ''}${(row as { _detailSeq?: number })._detailSeq ? `\n${tf('logs.restoredN', { n: row.restored ?? 0 })}` : ''}`}
                 >
                   <code className="truncate font-mono text-[11px]">
-                    {row.model || (row.upstream ? '—' : row.host) || '—'}
+                    {row.model || ((row as { ingress?: string }).ingress === 'ext' ? t('logs.webChat') : (row.upstream ? '—' : row.host) || '—')}
                   </code>
                   {row.stream_actual && (
                     <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 font-mono text-[9px] text-muted-foreground">
@@ -709,7 +751,7 @@ export default function LogsPage() {
                 {/* 处理摘要：脱敏/还原计数，审计行为信号名 + 严重度，无命中的行回退路径 */}
                 {renderSummary(row)}
                 {/* 状态：http_status 数字或 status 中文语义 */}
-                <span className="text-center">
+                <span className="min-w-0 text-center">
                   {row.http_status ? (
                     <Badge
                       variant="outline"
@@ -725,9 +767,16 @@ export default function LogsPage() {
                       {row.http_status}
                     </Badge>
                   ) : row.status ? (
-                    <span className="truncate text-[9px] text-muted-foreground" title={String(row.status)}>
+                    <span className="min-w-0 truncate text-[9px] text-muted-foreground" title={String(row.status)}>
                       {row.status === 'no_placeholder_in_response' ? t('logs.statusNoRestore') : row.status === 'no_sensitive_data' ? t('logs.statusNoSensitive') : String(row.status).slice(0, 6)}
                     </span>
+                  ) : (row as { ingress?: string }).ingress === 'ext' ? (
+                    <Badge
+                      variant="outline"
+                      className="border-emerald-500/30 bg-emerald-500/10 px-1 py-0 text-[9px] font-mono text-emerald-600 dark:text-emerald-400"
+                    >
+                      200
+                    </Badge>
                   ) : '—'}
                 </span>
                 {/* 耗时：合并行取整链路(RESTORE)，MASK 单行(未还原/阻断)取脱敏管线耗时 */}
@@ -738,7 +787,9 @@ export default function LogsPage() {
                 <span className="text-right tabular-nums text-[11px]">
                   {(row as { cost_usd?: number }).cost_usd != null && (row as { cost_usd?: number }).cost_usd! > 0
                     ? <span className="text-emerald-600 dark:text-emerald-400">${(row as { cost_usd?: number }).cost_usd!.toFixed(4)}</span>
-                    : <span className="text-muted-foreground/50">—</span>}
+                    : (row as { ingress?: string }).ingress === 'ext'
+                      ? <span className="text-[10px] text-muted-foreground/40 font-mono">{t('logs.free')}</span>
+                      : <span className="text-muted-foreground/50">—</span>}
                 </span>
               </div>
             )
