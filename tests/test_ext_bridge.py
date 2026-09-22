@@ -1254,7 +1254,7 @@ class ExtEventFieldParityTests(ExtBridgeTestCase):
 
 
 class BodyLimitGateTests(ExtBridgeTestCase):
-    """32MB 体积闸门必须是**对任意 framing 都生效**的硬闸（AGENTS 红线 2）。
+    """32MB 体积闸门必须是**对任意 framing 都生效**的硬闸（不可绕过的红线）。
 
     只判 `Content-Length` 是不够的：无该头时 `request.content_length` 是 None，
     `(None or 0) > LIMIT` 判成 False —— 闸门被整个绕过，而 `get_json` 仍会把流
@@ -1309,7 +1309,7 @@ class ConstantParityTests(unittest.TestCase):
     """同一个红线在两个模块里各有一个常量时，**必须有一条测试钉住它们相等**。
 
     `panel._EXT_MAX_BODY` 与 `transparent._MAX_REQUEST_BODY` 都是 32MB（超限一律
-    fail-closed 阻断，AGENTS 红线 2）。panel 端**故意不 import transparent** 取常量
+    fail-closed 阻断）。panel 端**故意不 import transparent** 取常量
     （panel 进程能否 import transparent 取决于解释器，见 panel.py 里的注释），所以
     数值只能各写一份——那就必须靠测试防漂移：改了一边忘了另一边，扩展链路与代理链路
     的体积红线就静默不一致了（示例后果：扩展能送 64MB 进 mask，代理链路 32MB 就 503）。

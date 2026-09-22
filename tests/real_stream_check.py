@@ -140,7 +140,7 @@ def main():
         conn.request("POST", api_path, body=payload, headers={
             "content-type": "application/json",
             "authorization": "Bearer " + API_KEY,
-            # Cloudflare 按 UA 拦 Python-urllib（AGENTS.md 约束 9）
+            # Cloudflare 按 UA 拦 Python-urllib，必须伪装成常见浏览器 UA
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "accept": "text/event-stream",
             # 故意声明支持压缩：验证引擎是否强制 identity 以保住流式

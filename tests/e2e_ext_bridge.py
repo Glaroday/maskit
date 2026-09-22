@@ -7,7 +7,7 @@
 ## 运行前提
 
 1. `pip install playwright && playwright install chromium`
-2. 引擎依赖已装（flask 等），且用**装了依赖的那个解释器**跑（见 AGENTS.md 的 3.13 说明）
+2. 引擎依赖已装（flask 等），且用**装了依赖的那个解释器**跑（本机是 Python 3.13）
 3. 无需图形会话：用 `channel="chromium"` + `headless=True`（**新 headless**，不是
    headless_shell）加载扩展，全程无窗口。
    ⚠️ 旧结论「扩展只能在有头 Chromium 里加载」已不成立（那是 Playwright 1.49 前的限制）：

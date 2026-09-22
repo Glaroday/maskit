@@ -5018,7 +5018,7 @@ class ToolCorrelationIdTests(unittest.TestCase):
         self.assertNotIn("ACMECORP", out["messages"][0]["content"])
 
     def test_business_object_id_still_scanned(self):
-        """豁免只放行关联 ID。业务对象里的 id 照常扫描——这是 AGENTS 约束 12 的验收点，
+        """豁免只放行关联 ID。业务对象里的 id 照常扫描——这是「按位置判定」的验收点，
         不能借着修 call_id 把整类 id 放过。"""
         out = self._mask({"input": {"customer": {
             "id": "ACMECORP", "call_id": "call_ACMECORP_1", "note": "ACMECORP"}}})
@@ -5181,7 +5181,7 @@ class LogDetailReadSideScrubTests(unittest.TestCase):
 
     这一组同时守死另一半：**普通 PII 的 original 必须保留**。
     详情弹窗的定位就是「脱敏 ↔ 原文对照」，把手机号一起打掉功能就没了
-    （AGENTS 约束 13：普通 PII 原文仍存本地事件库供详情弹窗对照）。
+    （普通 PII 原文仍存本地事件库供详情弹窗对照）。
     """
 
     def _legacy_row(self):
@@ -5280,7 +5280,7 @@ class LogDetailReadSideScrubTests(unittest.TestCase):
         `scheme://user:pass@host`，而还原后的回复里往往只有那个密码本身（模型看到的
         是占位符，它只可能复述值）。引擎本来就知道本会话原文（s["fwd"] 的 key），
         所以必须再做一次精确串替换，否则 resp_dialog / resp_preview 会把连接串密码
-        原样写进 SQLite（AGENTS 约束 6）。
+        原样写进 SQLite（凭据原文不得入库）。
         """
         sid = "cred-restore-scrub"
         tr._new_session(sid)

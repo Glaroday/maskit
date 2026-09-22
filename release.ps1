@@ -133,7 +133,7 @@ if (-not (Select-String -Path $changelogPath -Pattern $changelogHeading -SimpleM
     Write-Host ""
     Write-Host "CHANGELOG.md 里找不到章节: $changelogHeading" -ForegroundColor Red
     Write-Host "GitHub Release 的双语说明是从该章节提取的，缺失会让云端发版 job 失败。" -ForegroundColor Yellow
-    Write-Host "请按 AGENTS.md「CHANGELOG 维护工作流」补好后重跑：" -ForegroundColor Yellow
+    Write-Host "请先按下面的步骤补好 CHANGELOG 该版本章节后重跑：" -ForegroundColor Yellow
     Write-Host "    1) 把开发期间累积的 `## [Unreleased]` 条目改名为 $changelogHeading - <日期>" -ForegroundColor Yellow
     Write-Host "    2) 或直接新建该章节并写入中英双语条目" -ForegroundColor Yellow
     Write-Error "CHANGELOG 章节缺失，已中止发版（未产生任何 Git 提交或 Tag）。"

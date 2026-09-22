@@ -1157,10 +1157,10 @@ def _warmup_recent_from_db():
     解决：引擎发版升级、重启或进程崩溃后，客户端长对话里携带的历史占位符
     因内存表清空而 100% 还原不了。
 
-    与 AGENTS 约束 7 的关系：那条写的是「复用表不落盘是有意的」——指的是
+    与「复用表不落盘」那条取舍的关系：它指的是
     **不新增落盘**。这里读的是事件库里**本来就有**的 `items[].original`
-    （约束 5：用户明确要求日志含脱敏明文），不产生任何新的磁盘写入，
-    所以不与该取舍冲突。约束 7 里「引擎重启后历史占位符不可还原」那句
+    （日志含脱敏明文是产品既定行为），不产生任何新的磁盘写入，
+    所以不与该取舍冲突。「引擎重启后历史占位符不可还原」那句
     自 0.1.12 起不再成立，已同步改文档。
 
     安全保证：
@@ -1170,7 +1170,7 @@ def _warmup_recent_from_db():
     - **数据目录严格隔离**：设了 LLM_SHIELD_DATA_DIR 就只认该目录，
       库不存在就什么都不预热。0.1.12 曾在该目录无库时静默回落
       %APPDATA%\\Maskit，导致隔离测试实例把用户生产库的真实 PII
-      （实测 420 条，含身份证/银行卡/手机号）载入内存——违反 AGENTS 约束 23。
+      （实测 420 条，含身份证/银行卡/手机号）载入内存——违反「隔离实例绝不读生产库」这条约定。
     """
     try:
         import sqlite3
@@ -3780,7 +3780,7 @@ def _leaf_exempt(key, parent, in_business):
     - 业务区内一律不豁免（见 `_mask_tree` 的说明）。
     - 业务区外按「完整路径 + 协议位置」判定，禁止裸字段名豁免。
       只列关联 ID，不含 name/url/id 等——那些在业务对象里确实可能载有原文
-      （customer.id、正文里的 url），维持按位置判定（见 AGENTS 约束 12）。
+      （customer.id、正文里的 url），维持按位置判定。
     """
     if key in _MASK_CORRELATION_ID_KEYS:
         return True
@@ -6571,4 +6571,4 @@ def load(l):
 # import transparent 的进程都会去读事件库——包括 `python -m unittest discover`。
 # 实测隔离数据目录下裸 import 就载入了生产库 420 条真实映射
 # （EMAIL 99 / IP_PRIVATE 81 / PHONE 36 / CARD 13 / IDCARD 11）。
-# 单测不该读生产数据（AGENTS 约束 23），import 也不该有 I/O 副作用。
+# 单测不该读生产数据，import 也不该有 I/O 副作用。

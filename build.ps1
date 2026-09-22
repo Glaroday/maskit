@@ -402,7 +402,7 @@ function Start-WithoutSigningEnvironment {
 #
 # .NET 的 ProcessStartInfo.EnvironmentVariables 允许空值项，实测子进程能收到
 # `TAURI_SIGNING_PRIVATE_KEY_PASSWORD=`，于是不再走 prompt。
-# AGENTS.md 里曾写「$env:X = "" 仍会把空串传给子进程」，那条结论是错的，已更正。
+# 注意：曾记下「$env:X = "" 仍会把空串传给子进程」，那条结论是错的，已更正。
 function Invoke-TauriBuild {
     param([string]$Cli, [string]$WorkDir, [string]$KeyContent, [string]$KeyPassword)
     $psi = New-Object System.Diagnostics.ProcessStartInfo

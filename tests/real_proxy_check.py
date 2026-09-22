@@ -135,7 +135,7 @@ def setup():
     tmpdir = tempfile.mkdtemp(prefix="llm-shield-test-")
     cfg_path = Path(tmpdir) / "config.json"
     shutil.copy2(ROOT / "engine" / "config.example.json", cfg_path)
-    # 端口隔离（AGENTS 红线：绝不占用用户正在服务的 5801 / 187xx）。
+    # 端口隔离（红线：绝不占用用户正在服务的 5801 / 187xx）。
     # 拷来的 config.json 里是常规端口，必须改写成独占端口，否则 start_proxy
     # 会去绑用户实例正在监听的端口 —— 要么抢占、要么把他的代理判成"端口被占用"。
     # 原来这里还有一句无条件的 POST /api/proxy/stop 到 5801，那是**用户的面板**：

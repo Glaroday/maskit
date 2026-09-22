@@ -120,7 +120,7 @@ _STACK_FRAME_RE = re.compile(
     r"|\bgoroutine\s+\d+\s*\["
 )
 
-# 已删除的枚举表（见 AGENTS「审计不硬编码」）：
+# 已删除的枚举表（审计信号靠结构特征识别，不硬编码网关内部字段名）：
 #   LITELLM_INTERNAL_MARKERS / PII_ECHO_MARKERS —— 单个网关的内部字段名枚举，
 #   换不成形状也代表不了别的网关。它们真正要防的「错误体里带出敏感内容」
 #   已由上面的凭据/域名/主目录规则覆盖，留着只是徒增一张永远补不完的表。
@@ -1036,7 +1036,7 @@ def aggregate_passive(findings_lists):
 # S9 危险命令：**结构可判**的形态才保留（删根/擦盘/格式化/删库/资源滥用），
 # 命令词表型（curl|sh、npm i -g 等）已随「审计不硬编码」删除——客户端执行前有确认，
 # 且意图判定不可靠。**severity 恒 LOW**（只记不报）：形态检测客观，意图判定不是。
-# 每条结构 (regex, kind, desc)——不含严重度：S9 永不高报，见 AGENTS「审计信号不硬编码」。
+# 每条结构 (regex, kind, desc)——不含严重度：S9 永不高报（形态可判，意图不可判）。
 _DANGER_PATTERNS = [
     # 删根 / 删盘符 / 删家目录：rm -rf / 、rm -rf /* 、rm -fr ~ 、rm -rf C:\
     (re.compile(r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:/|/\*|~|~/\*|[A-Za-z]:[\\/]?)(?:\s|$|;|&|\|)"),
@@ -1163,7 +1163,7 @@ def scan_dangerous_action(text, request_text=None):
 
 # ========== 隔离性硬保证：永不抛异常 ==========
 #
-# AGENTS.md 把「永不抛异常（失败返回空列表）」列为本模块的硬约束，但原来只靠
+# 本模块的硬约束是「永不抛异常（失败返回空列表）」，但原来只靠
 # 每个函数自己小心 + 一条测了 None 和错类型标量的单测。实测（2026-08-17 外部审计）
 # 传入任意对象时 scan_sse_anomaly / dedupe_findings / scan_response_poison /
 # scan_cross_request_pollution / scan_tool_call_rewrite / aggregate_passive 全部抛
