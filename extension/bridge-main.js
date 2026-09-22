@@ -50,6 +50,14 @@
         }, timeoutMs);
         pending.set(nonce, { resolve, timer });
         window.postMessage({ type: 'MASKIT_BRIDGE_REQ', nonce, action, payload }, location.origin);
+      }).then((result) => {
+        // 【桥健康度记账】唯一能观测「扩展是否还在」的信号就是这里：重载/更新扩展会销毁
+        // 本页的 content script 上下文，ISOLATED 侧与 SW 都换了新的 —— MAIN 侧再
+        // postMessage 就没人应答，一路超时返回 null。连续多次拿不到结果就认定桥断了
+        // （处置见 restoreNativeAndStop）。拿 callback 包在这里而不是两个 resolve 处，
+        // 是为了让超时与正常响应两条分支天然共用一条记账路径。
+        noteBridgeCall(result != null);
+        return result;
       });
     },
     notify(action, payload) {
@@ -1448,5 +1456,54 @@
   const XHR_RESTORE_HOSTS = /(^|\.)deepseek\.com$/i;
   if (XHR_RESTORE_HOSTS.test(location.hostname)) {
     window.XMLHttpRequest = MaskitXHR;
+  }
+
+  // ─── 桥失联 → 恢复原生（2026-09-21）────────────────────────────────────
+  //
+  // 【为什么需要】重载/更新扩展会**销毁已打开页面**里的 content script 上下文，
+  // 新脚本只在下次导航时注入。而旧页面里的 fetch/XHR 仍被本脚本 patch 着，它们要
+  // 调的后台（ISOLATED 侧与 SW）已经换新 —— 于是请求卡住或抛异常，页面进入「半死」
+  // 状态：既不脱敏，也不能正常用。这比单纯「不脱敏」更糟（实测 ChatGPT/Claude 会这样）。
+  //
+  // 【怎么判断】扩展失联后 MAIN 侧的 postMessage 不再有人应答，bridge.call 必然
+  // 一路超时返回 null。连续 BRIDGE_DOWN_STREAK 次拿不到结果就认定桥断了。阈值取 4
+  // 而不是 1~2：mask 走 6s 超时且引擎侧有全局锁，偶发慢响应不该被当成失联。
+  //
+  // 【恢复成什么】恢复**原生** fetch/XHR，并从此不再干预本页。这与 SECURITY.md 里
+  // 「(B) 直通 = 未脱敏」是同一个取向：项目红线是「绝不断网」，引擎/桥不可用时明文
+  // 直连是刻意的默认。恢复原生只是把这种退化变得**干净、可预期**，并让用户知道
+  // 「本页需要刷新」——而不是留一堆半死的 patch。
+  //
+  // ⚠️ 只动「注入与失联处置」，不碰任何打码/还原逻辑。
+  const BRIDGE_DOWN_STREAK = 4;
+  let bridgeDownStreak = 0;
+  let nativeRestored = false;
+
+  function restoreNativeAndStop(reason) {
+    if (nativeRestored) return;
+    nativeRestored = true;
+    // 判断条件用「引用是否已变」而不是记一个标志位：页面可能自己包装过 fetch
+    // （Sentry 这类 SDK 就会），那种包装是基于我们的版本的，一起换回原生会让它失效。
+    // 两弊相权取其轻：半死的页面比「页面包装被拆掉」严重得多，而且下面 console 会
+    // 明确提示「请刷新页面」。
+    try {
+      if (window.fetch !== origFetch) window.fetch = origFetch;
+    } catch (_e) { /* 页面冻结了 window，放弃恢复 */ }
+    try {
+      if (window.XMLHttpRequest === MaskitXHR) window.XMLHttpRequest = OrigXHR;
+    } catch (_e) { /* 同上 */ }
+    try {
+      console.warn('[Maskit] 与扩展后端失联（' + reason + '），已恢复原生网络行为：'
+        + '本页将不再脱敏，请**刷新页面**以重新启用保护。');
+    } catch (_e) { /* console 被页面接管 */ }
+  }
+
+  function noteBridgeCall(ok) {
+    if (ok) { bridgeDownStreak = 0; return; }
+    if (nativeRestored) return;
+    bridgeDownStreak += 1;
+    if (bridgeDownStreak >= BRIDGE_DOWN_STREAK) {
+      restoreNativeAndStop(bridgeDownStreak + ' 次调用无响应');
+    }
   }
 })();

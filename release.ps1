@@ -190,10 +190,22 @@ foreach ($f in $newFiles) {
 }
 
 # 提交
-$commitMsg = "chore(release): 发布 v$targetVer"
-git commit -m $commitMsg
-Assert-LastExit "git commit"
-Write-Host "已提交: $commitMsg" -ForegroundColor Green
+#
+# ⚠️ 必须先判断有没有暂存内容。当版本号**已被提前改成目标值**时（典型场景：先按
+# CHANGELOG 定好 0.4.0 再发版），`build.ps1` 执行的是 `0.4.0 -> 0.4.0` 替换，
+# 文件内容一字不变，`git add -u` 自然暂存不到任何东西。此时无条件 commit 会以
+# “nothing to commit” 返回非零，被 Assert-LastExit 中止——而且是**在完整构建
+# （前端 + PyInstaller + Tauri，约 10 分钟）跑完之后**才炸，白跑一次打包。
+# “没有内容可提交”本身就是合法状态，跳过 commit 直接打 Tag 即可。
+$staged = @(git diff --cached --name-only)
+if ($staged.Count -gt 0) {
+  $commitMsg = "chore(release): 发布 v$targetVer"
+  git commit -m $commitMsg
+  Assert-LastExit "git commit"
+  Write-Host "已提交: $commitMsg" -ForegroundColor Green
+} else {
+  Write-Host "无文件改动需要提交（版本号已是 v$targetVer），跳过 commit，直接打 Tag。" -ForegroundColor Yellow
+}
 
 # 推送主分支
 Write-Host "正在推送分支到 origin $currentBranch..." -ForegroundColor Cyan

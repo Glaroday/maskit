@@ -16,6 +16,60 @@ import sys
 from pathlib import Path
 
 
+def _release_notes(tag: str, changelog_path: Path | None = None) -> str:
+    """从 CHANGELOG 的对应版本章节生成**简短**中英双语更新说明。
+
+    为什么不用整章：更新器弹窗只有几行高度，0.4.0 的章节有 2509 字节双语条目，
+    全部塞进去用户得滚半天才看完，反而没人读。所以只取「新增/修复/优化」的条数做
+    摘要，细节留给 Release 页（那里的 body 由 render-release-notes.py 切出全文）。
+
+    找不到章节/文件时（例如刚建的仓库或手工打的 tag）回退到通用文案 ——
+    说明文案不完整可以接受，但绝不能因此让发版流程失败。
+    """
+    fallback = f"Data Maskit {tag} 发布更新。"
+    try:
+        # 默认从仓库根的 CHANGELOG 读；参数用于单测注入临时文件。
+        changelog = changelog_path or (Path(__file__).resolve().parent.parent / "CHANGELOG.md")
+        text = changelog.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+
+    import re as _re
+    ver = tag.lstrip("v")
+    sec = _re.search(
+        rf"^##\s*\[{_re.escape(ver)}\][^\n]*\n(.*?)(?=^##\s*\[|\Z)",
+        text, _re.S | _re.M,
+    )
+    if not sec:
+        return fallback
+    body = sec.group(1)
+
+    # 分节标题要**中英都能认**：CHANGELOG 用的是「### 新增 / Added」这种双语标题，
+    # 但只带英文（### Added）或只带中文的写法也可能出现，因此两者任意命中即可。
+    # 英文侧用词干（add / fix / chang）而不是全词：标题里可能是 Fixed 也可能是
+    # Fixes、Changed 或 Changes，写死全词会整节漏算（漏一节只是摘要少一项，
+    # 但那是静默的错数字，比报错更难发现）。
+    labels = (("新增", "add", "Added"), ("修复", "fix", "Fixed"), ("优化", "chang", "Changed"))
+    parts_cn: list[str] = []
+    parts_en: list[str] = []
+    for cn, en_kw, en_out in labels:
+        m = _re.search(
+            rf"^###[^\n]*(?:{cn}|{en_kw})[^\n]*\n(.*?)(?=^###|\Z)",
+            body, _re.S | _re.M | _re.I,
+        )
+        if not m:
+            continue
+        n = len(_re.findall(r"^- ", m.group(1), _re.M))
+        if n:
+            parts_cn.append(f"{cn} {n} 项")
+            parts_en.append(f"{n} {en_out.lower()}")
+    if not parts_cn:
+        return fallback
+
+    return (f"Data Maskit {tag}：{'、'.join(parts_cn)}。详见 Release 页。\n"
+            f"Data Maskit {tag}: {', '.join(parts_en)}. See the release page for details.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="生成 latest.json 更新元数据")
     parser.add_argument("dir", help="包含安装包及 .sig 文件的目录")
@@ -82,7 +136,7 @@ def main():
 
     data = {
         "version": tag,
-        "notes": f"Data Maskit {tag} 发布更新。",
+        "notes": _release_notes(tag),
         "pub_date": pub_date,
         "platforms": platforms,
     }
