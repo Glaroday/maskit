@@ -62,20 +62,20 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 ## ✨ Highlights & Feature Overview
 
 ### 🛡️ 1. Deep Masking with Multi-turn Consistency
-- **20+ Built-in Scanner Rules**: API Keys/Tokens, PEM keys, DB connection strings, phone numbers, ID cards, emails, credit cards, private IPv4/IPv6, USCC unified social credit codes, and more;
+- **21 Built-in Scanner Rules (7 on by default)**: core privacy and credential rules (API key, bank card, DB connection string, email, ID card, landline, phone) are enabled out of the box; the other 14 (PEM private keys, JWT, tokens, secrets, cloud AccessKeys, private/public IPs, IPv6, MAC, license plates, USCC, HK/Macau travel permits, IBAN, and more) stay off so rare high-false-positive rules cannot derail the model's reasoning about your code and config, and can be enabled per rule in Settings;
 - **Custom Wordlists & Regex**: Categorized custom dictionary for names, codenames, and proprietary business terms; full regex support with resident deterministic placeholders;
 - **Sliding-window Placeholder Reuse**: Placeholders remain consistent across long conversations. "Alice" is assigned the exact same token in turn 1 and turn 20, preserving model reasoning consistency.
 
 ### 🤖 2. Local AI Entity Recognition (NER Semantic Model)
 - **Unstructured Free-Text Protection**: Built-in lightweight local ONNX model detects Chinese person names (NAME), organizations (ORG), and detailed physical addresses (ADDR) where regex rules fall short;
 - **Clean Original Extraction + Monotonic OffsetMap**: Extracts entities from the clean original context and translates coordinates back to the mutated text via a monotonic `OffsetMap`, completely eliminating plaintext fragment leakage caused by context truncation;
-- **100% Offline Local Inference**: Runs entirely inside your local process without any external network calls; toggleable in Settings.
+- **100% Offline Local Inference**: Runs entirely inside your local process without any external network calls; **off by default** (regex rules already cover the common cases) and can be enabled with one click in Settings.
 
 ### 🌐 3. Browser Extension Ecosystem (Web AI Privacy)
-- **Seamless Web AI Protection**: Dedicated Chrome & Edge MV3 extension for **ChatGPT, Claude, Kimi, Doubao, Qwen**, and other web AI platforms with 18+ preset sites with one-click authorization;
+- **Seamless Web AI Protection**: A Chrome & Edge MV3 extension. **ChatGPT, Claude, and DeepSeek are individually verified and pre-authorized out of the box — no manual site adding required** (you still need to enable the extension bridge and paste the access token in Settings); 14 more common AI sites (Kimi, Qwen, Tencent Yuanbao, ChatGLM, ERNIE Bot, Gemini, Grok, Perplexity, Copilot, and more) can be added with one click from Settings, unverified ones are clearly labeled, and custom sites are supported;
 - **Dual-Channel Interception (Fetch + XHR Engines)**: Intercepts standard Fetch as well as low-level `XMLHttpRequest` requests and streaming responses (XHR response restoration currently covers DeepSeek web only); other sites keep native behavior untouched;
-- **Direct Document & Attachment Masking**: Automatically parses and masks Word (`.docx` / `.doc`), Excel (`.xlsx` / `.xls`), and PowerPoint (`.pptx`) files locally before upload to cloud models;
-- **Local Masking + Typewriter Stream Restoration**: Prompts and attachments are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI with multi-turn session consistency.
+- **Direct Document & Attachment Masking (ChatGPT / Claude)**: Word (`.docx` / `.doc`), Excel (`.xlsx` / `.xls`), and PowerPoint (`.pptx`) files are parsed and masked locally before upload to cloud models; **on sites not yet supported (e.g. DeepSeek) the uploaded file itself is not masked** (passed through as-is), and the extension shows an explicit "attachment not masked" notice — do not send confidential files to those sites;
+- **Local Masking + Typewriter Stream Restoration**: Prompts are masked locally before departure, and model responses are restored in real-time typewriter stream right inside the web chat UI with multi-turn session consistency.
 
 ### ⚡ 4. Millisecond SSE Stream Takeover (Native Typewriter Flow)
 - Intercepts `text/event-stream` chunk by chunk with incremental restoration;
@@ -164,11 +164,12 @@ Web-based AI platforms cannot configure an API Base URL. Use Maskit's browser ex
 
 1. **Install Extension**: Download `Maskit_<version>_extension.zip` from [Releases](https://github.com/xiaYuTian11/maskit/releases/latest) and extract it. In Chrome/Edge, open `chrome://extensions` → toggle **Developer mode** → click **Load unpacked** and select the extracted folder (source users can directly load the `extension/` directory);
 2. **Connect to Engine**: In Maskit desktop dashboard `Settings → Browser Extension`, enable the extension bridge and copy your **Access Token** into the extension's settings popup;
-3. **Enable Sites**: Toggle target platforms (e.g. `chatgpt.com`, `claude.ai`, with 18+ preset sites supported and custom URL support).
+3. **Enable Sites**: `chatgpt.com`, `claude.ai`, and `deepseek.com` are pre-authorized out of the box; the other 14 preset sites can be granted with one click in the extension settings (unverified ones are labeled), and custom sites are supported.
 
 > 💡 **Status & Troubleshooting**:
-> - **File & Attachment Masking**: The extension supports direct attachment uploads and Office document masking (`.docx` / `.xlsx` / `.pptx` and transcoded `.doc` / `.xls`), eliminating manual scrubbing;
-> - Extension icon popup clearly displays current state: Green (Protected), Yellow (Engine offline, passthrough), Red (Invalid token or bridge disabled);
+> - **File & Attachment Masking**: Web-attachment uploads and Office document masking (`.docx` / `.xlsx` / `.pptx` and transcoded `.doc` / `.xls`) are adapted for ChatGPT / Claude and need no manual scrubbing; on sites not yet adapted (e.g. DeepSeek) the uploaded file itself is not masked and the extension shows a popup notice;
+> - Extension icon popup clearly displays current state: Green (Protected), Yellow (**engine offline — plaintext passthrough: not masked, but still connected**), Red (invalid token or bridge disabled — **also passthrough, not masked**);
+> - **When the engine is unreachable or the token is invalid, the extension passes traffic through unmasked by default** (the "never disconnect" trade-off); enable "Block when engine unavailable" in Settings if you would rather see requests fail than leave them unmasked;
 > - Extension events are logged in the dashboard's "Event Logs" and can be filtered by ingress (Proxy Link vs Browser Extension).
 
 ---

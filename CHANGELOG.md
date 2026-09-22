@@ -2,6 +2,12 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [Unreleased]
+
+### 优化 / Changed
+- 文档：修正对外能力表述——扩展站点支持改为「ChatGPT / Claude / DeepSeek 三站已实测」，附件脱敏补充「未适配站点文件本体不脱敏并弹窗提示」，规则库写明「21 类中默认开启 7 类」，NER 标注默认关闭，并说明「引擎不可用时明文直通＝不脱敏」。
+  *Docs: corrected capability claims — extension site support now states the three verified sites, attachment masking notes unmasked files on unsupported sites with a popup warning, the rule library states that 7 of 21 rules are on by default, NER is marked off by default, and "engine down = unmasked passthrough" is documented.*
+
 ## [0.4.0] - 2026-09-21
 
 ### 新增 / Added
@@ -546,6 +552,7 @@ Release v0.2.6: Fix CI unit test deadlock, credential header clobbering (401 err
 - Docker 镜像（amd64 / arm64）内嵌 Web 控制台，远程访问需 `MASKIT_PANEL_TOKEN`。
 - 中英文界面一键切换、深浅主题。
 
+[0.4.0]: https://github.com/xiaYuTian11/maskit/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/xiaYuTian11/maskit/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/xiaYuTian11/maskit/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/xiaYuTian11/maskit/compare/v0.2.12...v0.3.0
