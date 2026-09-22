@@ -77,9 +77,14 @@ src-tauri/resources/engine/
 # Local / IDE
 # 本机工作产物与个性化规则
 #
-# ⚠️ AGENTS.md / CLAUDE.md **不能**忽略：它们是项目的工程规范基准（判据见 AGENTS.md §6.1），
-# 克隆体上缺了它们等于整套 red line 整体丢失；CLAUDE.md 只是指向 AGENTS.md 的一行入口。
-# 二者曾于本机被误加入本忽略清单，恢复 git 跟踪时请确认它们在 `git ls-files` 里。
+# AGENTS.md / CLAUDE.md 不入库（所有者决策）：工程红线、验证流程与发版规范属本机开发约定，
+# 不随开源代码分发。两者已 `git rm --cached` 出库，本机文件保留。
+#
+# ⚠️ 本节原先写的是「**不能**忽略」，并记录过一次「误加入本忽略清单」的纠正 —— 那条结论已被
+# 本决策取代。不要再按旧结论把 AGENTS.md / CLAUDE.md 恢复跟踪；工程约束以代码注释、测试与
+# scripts/verify-all.py 为准，不再依赖这两份文件在库内存在。
+AGENTS.md
+CLAUDE.md
 PROMOTION_GUIDE.md
 .vscode/
 .idea/
