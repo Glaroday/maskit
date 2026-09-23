@@ -102,11 +102,19 @@ $cargoPath = "src-tauri\Cargo.toml"
 $cargoLockPath = "src-tauri\Cargo.lock"
 $pkgJsonPath = "frontend\package.json"
 $pkgLockPath = "frontend\package-lock.json"
-$verLine = Select-String -Path $panelPath -Pattern "__version__ = '(\d+)\.(\d+)\.(\d+)'" | Select-Object -First 1
+# 版本号唯一正则：**必须放行 prerelease 后缀**（X.Y.Z-beta.N）。
+# 原先 12 处各写一遍 `\d+\.\d+\.\d+`（且都带闭合引号），传入 prerelease 时读回校验
+# 一律取不到值 → 误判「版本分叉」中止打包，排查方向还会被报错文案带向「哪个文件没同步」
+# （2026-09-21 实测）。统一到此处后，写入、读回、比较三处口径必然一致。
+$verRe = '(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)'
+$verLine = Select-String -Path $panelPath -Pattern "__version__ = '$verRe'" | Select-Object -First 1
 if (-not $verLine) { Write-Error "$panelPath 里找不到 __version__"; exit 1 }
-$m = [regex]::Match($verLine.Line, "__version__ = '(\d+)\.(\d+)\.(\d+)'")
-$major, $minor, $patch = [int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value
-$origVer = "$major.$minor.$patch"
+$m = [regex]::Match($verLine.Line, "__version__ = '$verRe'")
+$origVer = $m.Groups[1].Value
+# 自动 patch+1 只从数字主体算：prerelease 后缀不参与运算，否则 `0.5.0-beta.1`
+# 会被当成 `0.5.0` 再 +1 → 静默跳到 `0.5.1`，预期外的跳版比报错更难查。
+$baseParts = ($origVer -replace '-.*$', '') -split '\.'
+$major, $minor, $patch = [int]$baseParts[0], [int]$baseParts[1], [int]$baseParts[2]
 
 # 在任何写入前保存版本文件的原始字节。失败回滚不能依赖正则猜测旧值：
 # package-lock 里同一个版本字符串可能出现数百次，误替换或漏恢复都会让工作区
@@ -115,6 +123,15 @@ $versionBackups = @{}
 foreach ($versionPath in @($panelPath, $confPath, $cargoPath, $cargoLockPath, $pkgJsonPath, $pkgLockPath)) {
     $resolvedVersionPath = (Resolve-Path $versionPath -ErrorAction Stop).Path
     $versionBackups[$resolvedVersionPath] = [IO.File]::ReadAllBytes($resolvedVersionPath)
+}
+
+# 回滚函数必须定义在**首次可能失败**的版本校验之前：PowerShell 按顺序执行定义，
+# 把 function 写在后面、却在前面调用会直接报「未识别命令」，回滚路径形同虚设。
+function Restore-Version {
+    foreach ($entry in $versionBackups.GetEnumerator()) {
+        [IO.File]::WriteAllBytes($entry.Key, [byte[]]$entry.Value)
+    }
+    Write-Host "打包失败，已恢复所有版本文件（含 package-lock）" -ForegroundColor Yellow
 }
 
 if ($Version -and $Version.StartsWith("v", [StringComparison]::OrdinalIgnoreCase)) {
@@ -140,17 +157,17 @@ if ($existingTag.Count -gt 0) {
 # 2. 写回 panel.py（唯一来源）+ 同步 tauri.conf.json / Cargo.toml 的 version
 $panelSrc = (Get-Content $panelPath -Raw -Encoding UTF8) -replace "__version__ = '$origVer'", "__version__ = '$newVer'"
 [IO.File]::WriteAllText((Resolve-Path $panelPath), $panelSrc, (New-Object Text.UTF8Encoding $false))
-$confSrc = (Get-Content $confPath -Raw -Encoding UTF8) -replace '"version": "\d+\.\d+\.\d+"', "`"version`": `"$newVer`""
+$confSrc = (Get-Content $confPath -Raw -Encoding UTF8) -replace ('"version": "' + $verRe + '"'), "`"version`": `"$newVer`""
 [IO.File]::WriteAllText((Resolve-Path $confPath), $confSrc, (New-Object Text.UTF8Encoding $false))
 # 只替第一处 version（[package] 段）：依赖项的 version 不能动，所以限定行首锚点。
-$cargoSrc = (Get-Content $cargoPath -Raw -Encoding UTF8) -replace '(?m)^version = "\d+\.\d+\.\d+"', "version = `"$newVer`""
+$cargoSrc = (Get-Content $cargoPath -Raw -Encoding UTF8) -replace ('(?m)^version = "' + $verRe + '"'), "version = `"$newVer`""
 [IO.File]::WriteAllText((Resolve-Path $cargoPath), $cargoSrc, (New-Object Text.UTF8Encoding $false))
 # Cargo.lock 的根 package 版本不会在每次早期失败前自动更新；显式同步，确保
 # 版本检查和 release tag 在未运行 cargo build 的情况下也保持一致。
 $cargoLockSrc = Get-Content $cargoLockPath -Raw -Encoding UTF8
 $cargoLockSrc = [regex]::Replace(
     $cargoLockSrc,
-    '(?ms)(\[\[package\]\]\s*\r?\nname = "maskit"\s*\r?\nversion = )"\d+\.\d+\.\d+"',
+    ('(?ms)(\[\[package\]\]\s*\r?\nname = "maskit"\s*\r?\nversion = )"' + $verRe + '"'),
     "`${1}`"$newVer`"",
     1
 )
@@ -158,11 +175,11 @@ $cargoLockSrc = [regex]::Replace(
 # frontend/package.json + package-lock.json 顶层 version（关于页/npm 元数据；只替顶层第一处）
 foreach ($pkgPath in @($pkgJsonPath, $pkgLockPath)) {
     $pkgSrc = Get-Content $pkgPath -Raw -Encoding UTF8
-    $pkgSrc = [regex]::new('"version": "\d+\.\d+\.\d+"').Replace($pkgSrc, "`"version`": `"$newVer`"", 2)
+    $pkgSrc = [regex]::new('"version": "' + $verRe + '"').Replace($pkgSrc, "`"version`": `"$newVer`"", 2)
     [IO.File]::WriteAllText((Resolve-Path $pkgPath), $pkgSrc, (New-Object Text.UTF8Encoding $false))
 }
 $check = Select-String -Path $panelPath -Pattern "__version__ = '$newVer'"
-if (-not $check) { Write-Error "版本写回失败"; exit 1 }
+if (-not $check) { Restore-Version; Write-Error "版本写回失败"; exit 1 }
 
 # package-lock 必须同时更新根对象和 packages[""]，否则 npm ci 会继续使用旧元数据。
 try {
@@ -177,28 +194,28 @@ try {
         throw "package.json / package-lock.json 根版本或名称不一致"
     }
 } catch {
-    Write-Error "package-lock 一致性校验失败: $($_.Exception.Message)"; exit 1
+    $lockMsg = $_.Exception.Message
+    Restore-Version
+    Write-Error "package-lock 一致性校验失败: $lockMsg"; exit 1
 }
 
 # 2b. 三方版本硬校验：任何一处对不上立即失败，绝不打出版本分叉的包。
-$vPanel = ([regex]::Match((Get-Content $panelPath -Raw -Encoding UTF8), "__version__ = '(\d+\.\d+\.\d+)'")).Groups[1].Value
-$vConf  = ([regex]::Match((Get-Content $confPath -Raw -Encoding UTF8), '"version": "(\d+\.\d+\.\d+)"')).Groups[1].Value
-$vCargo = ([regex]::Match((Get-Content $cargoPath -Raw -Encoding UTF8), '(?m)^version = "(\d+\.\d+\.\d+)"')).Groups[1].Value
-$vPkg   = ([regex]::Match((Get-Content "frontend\package.json" -Raw -Encoding UTF8), '"version": "(\d+\.\d+\.\d+)"')).Groups[1].Value
-$vCargoLock = ([regex]::Match((Get-Content "src-tauri\Cargo.lock" -Raw -Encoding UTF8), '(?ms)^\[\[package\]\]\s*\nname = "maskit"\s*\nversion = "(\d+\.\d+\.\d+)"')).Groups[1].Value
+# 读回口径与上面写入口径同为 $verRe（含可选 prerelease 后缀），否则 `-beta.N` 会读回空值。
+$vPanel = ([regex]::Match((Get-Content $panelPath -Raw -Encoding UTF8), "__version__ = '$verRe'")).Groups[1].Value
+$vConf  = ([regex]::Match((Get-Content $confPath -Raw -Encoding UTF8), ('"version": "' + $verRe + '"'))).Groups[1].Value
+$vCargo = ([regex]::Match((Get-Content $cargoPath -Raw -Encoding UTF8), ('(?m)^version = "' + $verRe + '"'))).Groups[1].Value
+$vPkg   = ([regex]::Match((Get-Content $pkgJsonPath -Raw -Encoding UTF8), ('"version": "' + $verRe + '"'))).Groups[1].Value
+$vCargoLock = ([regex]::Match((Get-Content $cargoLockPath -Raw -Encoding UTF8), ('(?ms)^\[\[package\]\]\s*\nname = "maskit"\s*\nversion = "' + $verRe + '"'))).Groups[1].Value
 if (($vPanel -ne $newVer) -or ($vConf -ne $newVer) -or ($vCargo -ne $newVer) -or ($vPkg -ne $newVer) -or ($vCargoLock -ne $newVer)) {
     Write-Host "版本不一致：panel=$vPanel tauri.conf=$vConf Cargo=$vCargo Cargo.lock=$vCargoLock package.json=$vPkg 期望=$newVer" -ForegroundColor Red
+    # 顺序不能反：$ErrorActionPreference="Stop" 下 `Write-Error` 会**当场终止脚本**，
+    # 写在它后面的 Restore-Version 是死代码（2026-09-22 实测：加了却一行都没跑，
+    # 6 个版本文件全部留脏）。本文件其余 22 个失败点都是 `Restore-Version; Write-Error`。
+    Restore-Version
     Write-Error "版本分叉，打包中止"
     exit 1
 }
 Write-Host "版本一致性校验通过: panel/tauri.conf/Cargo/package.json 均为 $newVer" -ForegroundColor Green
-
-function Restore-Version {
-    foreach ($entry in $versionBackups.GetEnumerator()) {
-        [IO.File]::WriteAllBytes($entry.Key, [byte[]]$entry.Value)
-    }
-    Write-Host "打包失败，已恢复所有版本文件（含 package-lock）" -ForegroundColor Yellow
-}
 
 # 3. Python 语法 + 单测（不碰运行中进程）
 # 解释器必须显式指定：裸 `python` 会解析到系统 PATH 上的任意版本（实测 3.14，

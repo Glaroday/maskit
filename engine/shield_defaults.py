@@ -96,6 +96,129 @@ DEFAULT_PATHS = [
 
 DEFAULT_TTL = 600
 DEFAULT_SECRET_PREFIXES = ["sk-", "ah-"]
+
+# ========== 命令拦截（config.command_block）内置危害命令清单 ==========
+#
+# 与 `audit_signals._DANGER_PATTERNS`（S9）的关系：那份是**只记录**的审计信号（恒 LOW），
+# 这份是**可改写/可阻断**的用户可配置清单。两者判据同源（结构可判、意图不可判），
+# 但清单必须分开维护：审计判定不该被用户配置改写；而拦截清单必须「开箱即用 + 可读可改 +
+# 删除不复活」（用户 2026-09-22 的明确要求）。
+#
+# 选条标准与 S9 同哲学：只认「几乎不可能是正常操作」的高置信形态，宁可漏不可扰——
+# 拦截（改写/阻断）比只记录贵得多，挡错一次用户就把整个功能关掉，等于零。
+# 因此默认**不含**「无 WHERE 的 DELETE / UPDATE」：该判据历史上把中文散文
+# 「update 改为显式 set」误报成 SQL（见 audit_signals 的注释），而 DDL（DROP/TRUNCATE）
+# 在工具参数通道里几乎没有正常的日常形态。
+#
+# 这里的 regex 是**字符串**（要能序列化进 config.json 供用户改），运行时由
+# transparent 编译；编译失败/超时/嵌套量词的条目会被拒绝（见 _normalize_command_block）。
+# 由 `tests/test_command_block.py` 守死「每条至少命中一个真实危害形态、且不误伤日常命令」。
+BUILTIN_COMMAND_BLOCK_PATTERNS = [
+    {
+        "id": "builtin-rm-root",
+        "label": "递归删除根目录",
+        "regex": r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:/|/\*)(?:\s|$|;|&|\|)",
+        "enabled": True,
+        "builtin": True,
+    },
+    {
+        "id": "builtin-rm-home",
+        "label": "递归删除家目录",
+        # 家目录形态：`~` / `~/` / `~/*`（尾部靠 lookahead 收口，避免把 `~/project` 这类
+        # 定向删除也算进来——那是日常操作，拦它等于制造误伤）
+        "regex": r"(?i)\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+~(?:/\*?)?(?=\s|$|;|&|\|)",
+        "enabled": True,
+        "builtin": True,
+    },
+    {
+        "id": "builtin-del-win",
+        "label": "Windows 全盘删除",
+        # del/erase 带 /s /q 删到盘符根，以及 PowerShell Remove-Item -Recurse -Force 盘符
+        "regex": (r"(?i)(?:^|[\s;&|])(?:del|erase)\s+/[sq]\b[^\n]{0,40}[A-Za-z]:[\\/]?(?:\s|$)"
+                  r"|\bRemove-Item\b[^\n]{0,60}-Recurse\b[^\n]{0,40}-Force\b[^\n]{0,20}[A-Za-z]:\\(?:\s|$|\")"),
+        "enabled": True,
+        "builtin": True,
+    },
+    {
+        "id": "builtin-format",
+        "label": "格式化磁盘/块设备",
+        "regex": r"(?i)(?:\bformat\s+[A-Za-z]:|\bmkfs(?:\.\w+)?\s+/dev/)",
+        "enabled": True,
+        "builtin": True,
+    },
+    {
+        "id": "builtin-drop-db",
+        "label": "删除数据库/表",
+        # ⚠️ DDL 判据在**正文**里会命中「讲解 DROP DATABASE 为什么危险」这类句子。
+        # 这正是 channels 默认只含 `tool`、`text` 必须显式 opt-in 的原因（§6.2）：
+        # 工具参数通道里的 DROP 是真的要执行，正文里的往往是讨论。
+        "regex": (r"(?i)(?:\bdrop\s+(?:database|schema)\b|\bdrop\s+table\b"
+                  r"|\btruncate\s+table\b)"),
+        "enabled": True,
+        "builtin": True,
+    },
+    {
+        "id": "builtin-dd",
+        "label": "dd 直写块设备",
+        "regex": r"(?i)\bdd\s+[^\n]{0,60}\bof=/dev/(?:sd[a-z]|nvme\d|disk\d)",
+        "enabled": True,
+        "builtin": True,
+    },
+    {
+        "id": "builtin-forkbomb",
+        "label": "fork 炸弹",
+        "regex": r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;\s*:",
+        "enabled": True,
+        "builtin": True,
+    },
+]
+
+# ========== 命令拦截正则的校验（panel 保存时 + transparent 加载时共用） ==========
+# 三条 ReDoS 约束里的前两条放这里（第三条是运行时的单次匹配耗时上限，在 transparent 侧）：
+#   ① 长度上限——超长正则本身就是指数回溯的载体；
+#   ② 拒绝嵌套量词——**只认真正的灾难性形态**：量化直接作用在「单原子且该原子自带量词」
+#      的组上（`(a+)+` / `(\w*)*` / `(x?)+` / `(\w+){2,}`）。
+#      不能用宽松的「括号里含量词 + 括号外还有量词」——实测会把内置 rm 规则
+#      `(?:-[a-z]*[rf][a-z]*\s+)+` 误判（它每轮至少消费「-」与空白两个字符，线性）。
+# 项目已吃过亏：PEM 惰性量词 O(n²)，12KB 就要 3.4 秒，足以打满事件循环
+# （实测数据见 audit_signals.py 顶部注释）。两处各写一份校验必然漂移，故共用本函数。
+CMD_REGEX_MAX_LEN = 300
+# 单个「可量化原子」：转义序列 / 字符类 / 任意字符 / 子组 / 单字符
+_CMD_ATOM = r"(?:\\[A-Za-z0-9]+|\[[^\]]*\]|\.|\([^()]*\)|[A-Za-z0-9_])"
+_CMD_QUANT = r"(?:[*+?]|\{\d+,?\d*\})"
+_CMD_NESTED_QUANT_RE = re.compile(
+    r"\(" r"(?:\?:)?" + _CMD_ATOM + _CMD_QUANT + r"\)\s*" + _CMD_QUANT
+)
+
+
+def validate_command_regex(src):
+    """校验一条命令拦截/白名单正则，返回 (是否可用, 原因)。
+
+    非法时原因要能直接给用户看（会进 config 的 warnings / 引擎日志）。
+    """
+    src = str(src or "")
+    if not src.strip():
+        return False, "空正则"
+    if len(src) > CMD_REGEX_MAX_LEN:
+        return False, f"过长（上限 {CMD_REGEX_MAX_LEN} 字符）"
+    if _CMD_NESTED_QUANT_RE.search(src):
+        return False, "含嵌套量词（易触发灾难性回溯）"
+    try:
+        re.compile(src)
+    except re.error as e:
+        return False, f"正则非法（{e}）"
+    return True, ""
+
+
+# 命令拦截的默认开关（与 config.command_block 的缺省语义一致）。
+# mode=observe：只记录、不改写、不阻断（响应字节零变化）——用户要求的默认态。
+DEFAULT_COMMAND_BLOCK = {
+    "mode": "observe",
+    "patterns": BUILTIN_COMMAND_BLOCK_PATTERNS,
+    "allow_patterns": [],
+    "channels": ["tool"],
+}
+
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 DEFAULT_LISTEN_PORT = 5802
 

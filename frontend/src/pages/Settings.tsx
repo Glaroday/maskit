@@ -718,7 +718,9 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
   const auditProgress = auditTotal > 0 ? Math.min(100, Math.round((auditDone / auditTotal) * 100)) : 0
 
   const runAuditMutation = useMutation({
-    mutationFn: (opts: { upstream_name: string; model: string; profile: string }) => runAudit(opts),
+    mutationFn: (opts: { upstream_name: string; model: string; profile: string }) =>
+      // W1-4：同审计中心，允许后端临时启用探针并在结束后自动恢复原值
+      runAudit({ ...opts, allow_temp_probes: true }),
     onSuccess: (r) => {
       if (!r.ok) {
         toast(r.error || t('settings.toast.auditStartFail'), 'error')
@@ -2562,6 +2564,12 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
               {tf('settings.confirm.auditDesc', { name: auditUpstream || t('settings.advanced.selectedUpstream') })}
             </DialogDescription>
           </DialogHeader>
+          {/* 主动探针关闭时明示「临时启用 + 自动恢复」（W1-4）：与审计中心同一口径 */}
+          {!auditCfg.active_probes && (
+            <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-500">
+              {t('settings.confirm.auditTempProbes')}
+            </p>
+          )}
           <DialogFooter>
             <Button size="sm" variant="outline" onClick={() => setConfirmAudit(false)}>{t('common.cancel')}</Button>
             <Button size="sm" variant="destructive" onClick={() => {

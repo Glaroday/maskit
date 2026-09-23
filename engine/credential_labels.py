@@ -23,3 +23,32 @@ CREDENTIAL_LABELS = frozenset({
     "CONNSTR",
     "PRIVATE_KEY",
 })
+
+# ========== 凭据**回流**检测的种类（audit_signals 的 `_CREDENTIAL_PATTERNS`） ==========
+# 与上面的 CREDENTIAL_LABELS 不是一回事：那份是**脱敏侧**的标签（打码时用的业务标签），
+# 这份是**审计侧**凭据回流规则匹配到的 kind 名，两者口径不同、不可合并。
+# 放这里的理由与 CREDENTIAL_LABELS 相同：`audit_signals` 按这份名单产出
+# `kind = "credential_echo:<kind>"`、证据 = `<kind> len=… sha256=…`；
+# `event_store` 读侧要对**证据前缀**做降噪谓词
+# （见 `_DEPRECATED_AUDIT_EVIDENCE_PREFIXES`），各写一遍必然漂移
+# （历史事故正是这样发生）。由
+# `tests/test_audit.py::test_credential_echo_kinds_stay_in_sync` 守死与规则表一致。
+CREDENTIAL_ECHO_KINDS = (
+    "github_token",
+    "google_api_key",
+    "aliyun_ak",
+    "tencent_ak",
+    "slack_token",
+    "stripe_key",
+    "aws_ak",
+    "jwt",
+)
+
+# ========== W1-1 凭据回流的分档标记 ==========
+# 规则无法区分「真实凭据」与「教学示例」（编程助手在代码块里写 .env 模板/CI 密钥
+# 是家常便饭），故按**客观结构**（是否代码块内 + 值的熵）分档，并在证据尾部打标记：
+#   · 代码块内 或 低熵 → LOW  + CREDENTIAL_ECHO_SAMPLE_MARKER（默认门槛下不入库）
+#   · 其余（非代码块 + 高熵） → MEDIUM + CREDENTIAL_ECHO_REAL_MARKER
+# CREDENTIAL_ECHO_REAL_MARKER 同时是读侧降噪的**保护标记**：带它的事件绝不允许被历史噪音谓词隐藏。
+CREDENTIAL_ECHO_SAMPLE_MARKER = "[示例形态]"
+CREDENTIAL_ECHO_REAL_MARKER = "[疑似真实凭据]"

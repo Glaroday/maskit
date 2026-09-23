@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from contextlib import closing
 from credential_labels import CREDENTIAL_LABELS
+from credential_labels import (CREDENTIAL_ECHO_KINDS, CREDENTIAL_ECHO_REAL_MARKER,
+                               CREDENTIAL_ECHO_SAMPLE_MARKER)
 
 
 ROOT = Path(__file__).parent.resolve()
@@ -934,15 +936,46 @@ _DEPRECATED_AUDIT_EVIDENCE_PREFIXES = (
     ("identity_swap", "identity_claim:%"),
     ("sse_anomaly", "%"),
     ("canary_leak", "%"),
+    # 凭据回流的历史噪音（W1-2，2026-09-22 审批）：W1-1 上线前，credential_echo 一律
+    # MEDIUM 且无形态标记，把「AI 在代码块里写 .env / CI 密钥示例」报成「响应投毒」。
+    # 谓词命中整类 `credential_echo:<kind>` 证据，只隐藏**旧的无标记存量**：
+    # W1-1 之外的两种新记录都带标记（`[示例形态]` / `[疑似真实凭据]`），
+    # 由下面 `_audit_visibility_filter` 的 NOT LIKE 保护子句守死。
+    #
+    # ⚠️ 前缀必须与 **evidence 列的真实形态**一致：落库的是
+    # `<kind> len=<n> sha256=<摘要>`（`audit_signals._redact_evidence` 的产物）。
+    # `credential_echo:` 只出现在扫描结果 dict 的 `kind` 字段上，而 `audit_events`
+    # 表**没有 kind 列**（见本模块建表语句）——按它写前缀会恒不匹配、降噪静默空转，
+    # 用户视角是「升级了，但历史噪音一条都没少」。
+    # 由 `tests/test_audit.py::CredentialEchoReadSideFilterTests` 拿引擎真实产出守死。
+    *(("response_poison", f"{kind} len=%") for kind in CREDENTIAL_ECHO_KINDS),
 )
+
+# 读侧降噪的**保护标记**：带任一标记的证据都是本版规则主动产出的、档位正确的新记录，
+# 任何已撤销判定谓词都不允许隐藏它。两个标记各有分工：
+#   · CREDENTIAL_ECHO_REAL_MARKER —— 非代码块 + 高熵的**真阳性**（隐藏它是安全事故）；
+#   · CREDENTIAL_ECHO_SAMPLE_MARKER —— 代码块内/低熵的**示例形态**（LOW）。它虽属噪音类，
+#     但隐藏它就违背了分档设计自己的承诺「门槛调到 LOW 仍可查，不丢可查性」
+#     （见 audit_signals.scan_response_poison 的分档注释）——用户主动调低门槛后
+#     一条都看不到，是静默失效。降噪对象应该是**旧的无标记存量**，不是新写的正确记录。
+# 谓词全部是 LIKE 前缀匹配，无法表达「以某某结尾」，所以保护必须在 SQL 里
+# 显式写出（而不是靠证据形态碰巧不匹配）。
+_AUDIT_NEVER_HIDE_MARKERS = (CREDENTIAL_ECHO_REAL_MARKER, CREDENTIAL_ECHO_SAMPLE_MARKER)
 
 
 def _audit_visibility_filter():
     """返回审计历史读侧过滤 SQL 子句与参数（不删除数据库记录）。"""
     clauses, params = [], []
+    marker_like = [f"%{m}%" for m in _AUDIT_NEVER_HIDE_MARKERS]
     for signal_type, evidence_pattern in _DEPRECATED_AUDIT_EVIDENCE_PREFIXES:
-        clauses.append("NOT (signal_type = ? AND COALESCE(evidence, '') LIKE ?)")
-        params.extend([signal_type, evidence_pattern])
+        clause = "NOT (signal_type = ? AND COALESCE(evidence, '') LIKE ?"
+        args = [signal_type, evidence_pattern]
+        for like in marker_like:
+            clause += " AND COALESCE(evidence, '') NOT LIKE ?"
+            args.append(like)
+        clause += ")"
+        clauses.append(clause)
+        params.extend(args)
     return clauses, params
 
 

@@ -98,7 +98,9 @@ if ($LASTEXITCODE -ne 0) {
 
 # 读取构建出的最新版本号
 $panelPath = "engine\panel.py"
-$verLine = Select-String -Path $panelPath -Pattern "__version__ = '(\d+\.\d+\.\d+)'" | Select-Object -First 1
+# 正则必须放行 prerelease（X.Y.Z-beta.N），与 build.ps1 的 $verRe 同口径：
+# 这里读不出值会直接中止发版（即使包已经打好了）。
+$verLine = Select-String -Path $panelPath -Pattern "__version__ = '(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)'" | Select-Object -First 1
 if (-not $verLine) { Write-Error "无法读取构建后的版本号"; exit 1 }
 $targetVer = $verLine.Matches[0].Groups[1].Value
 $tag = "v$targetVer"
@@ -106,6 +108,9 @@ $tag = "v$targetVer"
 Write-Host "`n[3/4] 构建成功！目标版本: $targetVer (Tag: $tag)" -ForegroundColor Green
 
 $nsisPath = "src-tauri\target\release\bundle\nsis\Maskit_${targetVer}_x64-setup.exe"
+# 注：prerelease 产物命名已实测（2026-09-22）：0.5.0-beta.1 的产物为
+# bundle/nsis/Maskit_0.5.0-beta.1_x64-setup.exe，`-` 原样保留，并同时产出 .sig 更新签名
+# （即 Tauri 打包器未对 `-` 做净化）。此处找不到文件只是跳过打印体积，不中止发版。
 if (Test-Path $nsisPath) {
     $nsisSize = [math]::Round((Get-Item $nsisPath).Length / 1MB, 1)
     $pkgType = if ($nsisSize -gt 60) { "全功能一体包 (All-in-One)" } else { "轻量规则包" }

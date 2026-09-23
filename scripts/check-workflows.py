@@ -9,6 +9,9 @@ workflow 写坏只会在「推送后 Actions 页报错」才被发现，最坏�
 2. 每个 job 必须有 `runs-on`；每个 step 必须**恰好**有 `uses` 或 `run` 之一；
 3. 显式 `shell: bash` / `sh` 的步骤，把 `run` 抽出来跑 `bash -n`。
    只查显式 bash：`shell: pwsh` 的步骤拿 bash 语法去验必然误报（已实测）。
+4. **预发布判定口径**：tag 里出现 `-` 即预发布，三处（`release.yml` 的
+   `is_prerelease`、同文件 docker job 的 `latest` enable、`docker-publish.yml` 的
+   `latest` enable）必须同口径，且不得退回枚举后缀。
 
 bash 的定位：Windows 上 PATH 里的 `bash` 常常是 WSL 垫片（`C:\\Windows\\System32\\bash.exe`），
 根本跑不起来，所以用 `MASKIT_BASH` 指定；找不到可用 bash 就跳过第 3 项并打印警告——
@@ -122,6 +125,52 @@ def _check_gate_parity(errors):
         errors.append(f"门禁漂移：scripts/verify-all.py 有而 ci.yml 没有 -> [{cwd}] {cmd}")
 
 
+# 预发布判定口径守卫（2026-09-22）：**tag 里出现 `-` 即预发布**。
+#
+# 为什么需要这条：版本工具链接受任意后缀（`bump-version.py 1.2.3-dev` 实测返回
+# Success 并改写 6 处版本文件），而原先三处判定都是「枚举 -beta/-alpha/-rc」。
+# 后果是 `v1.2.3-dev` 走进正式版分支：Release 不标 Pre-release、**生成并上传
+# latest.json**（全体现网客户端把非正式构建当正式更新拉走，不可逆），且
+# `ghcr.io/...:latest` 被非正式构建覆盖。这条守卫把「枚举法回归」挡在 PR 阶段。
+#
+# 判据是「必须出现的片段」而不是解析表达式：metadata-action 的 tags 是多行字符串，
+# 真要求值得起一个 GitHub 环境，静态断言足够拦住回归。
+_PRERELEASE_GATE_REQUIRED = {
+    "release.yml": (
+        '== *"-"*',                        # is_prerelease 的 bash 判据
+        "!contains(github.ref_name, '-')",  # docker job 的 latest 别名
+    ),
+    "docker-publish.yml": (
+        "!contains(inputs.tag, '-')",       # 手动发布路径的 latest 别名
+    ),
+}
+# 只拦**带引号的枚举**，两种引号都算：`release.yml` 的 is_prerelease 用双引号
+# （`*"-beta"*`）、docker 的 enable 表达式用单引号（`'-beta'`），都得拦住；
+# 而注释里写「不要枚举 -beta/-alpha/-rc」是说明，没带引号，不该被误报。
+_PRERELEASE_GATE_FORBIDDEN = tuple(
+    f"{q}-{s}{q}" for q in ("'", '"') for s in ("beta", "alpha", "rc"))
+
+
+def _check_prerelease_gate(errors):
+    """三处预发布判定必须同口径，且不得退回枚举后缀。"""
+    for fname, needles in _PRERELEASE_GATE_REQUIRED.items():
+        path = WORKFLOWS / fname
+        if not path.exists():
+            errors.append(f"预发布口径守卫：找不到 {fname}")
+            continue
+        text = path.read_text(encoding="utf-8")
+        for needle in needles:
+            if needle not in text:
+                errors.append(
+                    f"预发布口径守卫：{fname} 缺少判据 {needle!r}"
+                    "（口径=tag 含 `-` 即预发布，见 AGENTS.md）")
+        for bad in _PRERELEASE_GATE_FORBIDDEN:
+            if bad in text:
+                errors.append(
+                    f"预发布口径守卫：{fname} 出现枚举后缀 {bad}"
+                    "，会漏判 vX.Y.Z-dev 这类 tag（当正式版发布 + 产出 latest.json）")
+
+
 def _find_bash():
     """返回一个真能用的 bash；Windows 上要绕开 WSL 垫片。"""
     override = os.environ.get("MASKIT_BASH")
@@ -183,6 +232,7 @@ def main():
 
     print(f"check-workflows: 共 {len(files)} 个 workflow，bash 步骤校验 {shell_checked} 个")
     _check_gate_parity(errors)
+    _check_prerelease_gate(errors)
     if errors:
         print("\n".join(f"check-workflows: FAIL {e}" for e in errors))
         return 1

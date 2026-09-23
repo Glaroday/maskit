@@ -129,6 +129,50 @@ class ChatMlTeachingNoFalsePositiveTests(unittest.TestCase):
         self.assertFalse(sig._marker_is_turn_anchored(inline, m2.start()))
 
 
+class CredentialExampleNoNoiseTests(unittest.TestCase):
+    """W1-1：代码块/低熵的凭据**示例值**不得报 MEDIUM+（默认门槛下不可见）。
+
+    误报源（2026-09-22 截图）：编程助手在代码块里写 `.env` 模板、CI 密钥示例，
+    被 MEDIUM 报成「响应投毒」。这里锁两头——
+    示例形态降为 LOW（不可见），而非代码块的高熵真阳性仍是 MEDIUM（可见）。
+    """
+
+    # 高熵样本：`ghp_` + 32 位混合串（熵 5.0 bit/char，高于降噪阈值 3.0）。
+    # **必须运行时拼接**：完整 `ghp_xxx` 字面体会被 scripts/audit-public-release.py
+    # 拦下（它也是 GitHub Secret Scanning 的形态）——测试里只留「一眼可见是伪造」的
+    # 形态，真令牌永远不会进公开历史。
+    REAL_TOKEN = "ghp_" + "aB3xK9mQ2pL7zR4tY6wN1vC8sD5fG0hJ"
+
+    def test_code_block_example_token_never_medium_plus(self):
+        samples = [
+            # .env / CI 密钥模板（最典型的教学写法）
+            ("在 CI 里这样配置：\n```yaml\nenv:\n  GH_TOKEN: " + self.REAL_TOKEN + "\n```\n"),
+            # 行内反引号的短示例值
+            "把 `ghp_" + "a" * 30 + "` 换成你自己的令牌即可。",
+            # 非 ASCII 语言环境下的同样形态
+            "在 `.env` 里填写令牌：\n```\nAPI_TOKEN="
+            + self.REAL_TOKEN.replace("aB3x", "zQ8v") + "\n```\n",
+        ]
+        for text in samples:
+            with self.subTest(text=text[:40]):
+                findings = [f for f in sig.scan_response_poison(text)
+                            if f["kind"].startswith("credential_echo:")]
+                self.assertTrue(findings, f"示例形态必须仍被检出（不丢可查性）：{text[:60]!r}")
+                for f in findings:
+                    self.assertNotIn(
+                        f["severity"], (sig.CRITICAL, sig.HIGH, sig.MEDIUM),
+                        f"代码块/低熵示例值误报: {f['kind']} {f['evidence'][:60]!r}",
+                    )
+
+    def test_real_credential_echo_still_medium(self):
+        """反向锁：降噪**不能**把真正的凭据回流一起放过。"""
+        text = "上游回显了你的令牌 " + self.REAL_TOKEN + "，请立即轮换。"
+        findings = [f for f in sig.scan_response_poison(text)
+                    if f["kind"].startswith("credential_echo:")]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], sig.MEDIUM)
+
+
 class AttackDetectionTests(unittest.TestCase):
     """真攻击载荷不得被降噪误删。"""
 

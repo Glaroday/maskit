@@ -51,7 +51,9 @@ from shield_defaults import (
     DEFAULT_UPSTREAMS,
     DEFAULT_BUILTIN_RULES,
     DEFAULT_EGRESS_PROXY,
+    DEFAULT_COMMAND_BLOCK,
     BUILTIN_RULE_META,
+    validate_command_regex,
     parse_egress_proxy,
     OPENROUTER_MODELS_URL,
     PRICE_SYNC_INTERVAL_DAYS,
@@ -3497,6 +3499,10 @@ def default_config():
             "active_probes": False,
             "severity_floor": "MEDIUM",
             "auto_report": False,
+            # 审计的**响应级**熔断（默认关）：CRITICAL 时把本次响应换成 503。
+            # 必须出现在本函数里——它是「合法键」的唯一真相来源，_config_patch_node
+            # 用 `key/path 不存在` 拒绝未知字段；漏了它前端那个开关存不下去。
+            "fail_closed": False,
             "signals": {
                 "error_leak": True,
                 "identity_swap": True,
@@ -3507,6 +3513,10 @@ def default_config():
                 "dangerous_action": True,
             },
         },
+        # 命令拦截（W2-3）：默认 observe（只记录）+ 仅工具参数通道。
+        # 内置危害命令作为**可读可改的默认值**随包分发，用户可在界面新增/修改/
+        # 停用/删除（删除不复活，见 _normalize_command_block 的种子语义）。
+        "command_block": copy.deepcopy(DEFAULT_COMMAND_BLOCK),
     }
 
 
@@ -3899,6 +3909,7 @@ def normalize_config(raw, warnings=None):
         "wizard_done": bool(raw.get("wizard_done", False)),
         "meta": raw.get("meta") if isinstance(raw.get("meta"), dict) else {},
         "audit": _normalize_audit(raw.get("audit")),
+        "command_block": _normalize_command_block(raw.get("command_block"), warn),
     }
 
 
@@ -3964,8 +3975,100 @@ def _normalize_audit(raw):
         "active_probes": bool(raw.get("active_probes", False)),
         "severity_floor": floor,
         "auto_report": bool(raw.get("auto_report", False)),
+        # 审计的响应级熔断（与脱敏主线的同名 fail_closed 不是一回事，见 transparent.py 注释）
+        "fail_closed": bool(raw.get("fail_closed", False)),
         "signals": signals,
     }
+
+
+# ========== 命令拦截（config.command_block）规范化 ==========
+# 正则合法性交给 shield_defaults.validate_command_regex（**唯一校验源**：
+# panel 保存时与 transparent 加载时都调它；两处各写一份必然漂移）。
+CMD_MODES = ("observe", "rewrite", "block")
+CMD_CHANNELS = ("tool", "text")
+
+
+def _normalize_cmd_pattern(raw, warn):
+    """规范化单条命令拦截规则；非法（正则编译不过 / 超长 / 嵌套量词）返回 None。
+
+    非法条目**丢弃并告警，不静默**：warnings 会回传给前端提示，用户能知道
+    「我加的那条为什么没生效」。
+    """
+    if not isinstance(raw, dict):
+        return None
+    rx_src = str(raw.get("regex") or "")
+    if not rx_src.strip():
+        return None
+    label = str(raw.get("label") or "").strip()[:60]
+    pid = str(raw.get("id") or "").strip()[:60]
+    name = label or pid or rx_src[:24]
+    ok, why = validate_command_regex(rx_src)
+    if not ok:
+        warn.append(f"命令拦截规则「{name}」{why}，已忽略")
+        return None
+    if not pid:
+        # 用户新增时未带 id：按正则内容派生，**稳定且可复现**（不能用 hash()——
+        # PYTHONHASHSEED 随进程变化，会把 id 改来改去）
+        pid = "user-" + hashlib.sha1(rx_src.encode("utf-8")).hexdigest()[:10]
+    return {
+        "id": pid,
+        "label": label,
+        "regex": rx_src,
+        "enabled": bool(raw.get("enabled", True)),
+        "builtin": bool(raw.get("builtin", False)),
+    }
+
+
+def _normalize_command_block(raw, warn):
+    """规范化 command_block 段。
+
+    **种子语义（关键，用户 2026-09-22 明确要求「删除不复活」）**：
+    只在 `patterns` 键**缺失**（或类型不对）时灌内置种子；键已存在时哪怕值是
+    `[]` 也一律原样尊重。否则用户删掉的条目会被 `default_config()` 每次加载重新灌回，
+    「删不掉」比不提供更糟。这是项目既有范式（transparent.py 的 stream_exclude_hosts
+    同款约定：键存在但为空 = 用户显式清空，必须原样生效）。
+    """
+    base = default_config()["command_block"]
+    if not isinstance(raw, dict):
+        # 整段缺失=第一次运行 → 灌种子（开箱即用）
+        return copy.deepcopy(base)
+    mode = str(raw.get("mode") or "observe").strip().lower()
+    if mode not in CMD_MODES:
+        warn.append(f"命令拦截模式「{mode}」未知，已回落 observe（只记录）")
+        mode = "observe"
+    raw_patterns = raw.get("patterns")
+    if not isinstance(raw_patterns, list):
+        patterns = copy.deepcopy(base["patterns"])
+    else:
+        patterns = []
+        seen = set()
+        for item in raw_patterns:
+            norm = _normalize_cmd_pattern(item, warn)
+            if norm is None:
+                continue
+            if norm["id"] in seen:
+                # id 撞车：补后缀而不是丢条目，否则用户新增的第二条会静默消失
+                norm["id"] = f"{norm['id']}-{len(seen)}"
+            seen.add(norm["id"])
+            patterns.append(norm)
+    allow = []
+    for item in (raw.get("allow_patterns") or []):
+        src = str(item or "").strip()
+        if not src:
+            continue
+        ok, why = validate_command_regex(src)
+        if not ok:
+            warn.append(f"命令白名单「{src[:24]}」{why}，已忽略")
+            continue
+        allow.append(src)
+    raw_channels = raw.get("channels")
+    channels = [c for c in (raw_channels or []) if c in CMD_CHANNELS] if isinstance(raw_channels, list) else []
+    if not channels:
+        # 缺省只拦工具参数通道：正文里 AI 常**讲解**命令（「切勿运行 rm -rf /」），
+        # 启用 text 必须由用户显式选择，不能被缺省值悄悄带上（§6.5）。
+        channels = list(base["channels"])
+    return {"mode": mode, "patterns": patterns,
+            "allow_patterns": allow, "channels": channels}
 
 
 def _sync_runtime_config(cfg):
@@ -4848,6 +4951,9 @@ audit_job = {
     "cancel": False,
     "result": None,
     "error": "",
+    # W1-4：本次扫描是否临时改动过 audit.active_probes；非 None = 结束后要恢复的值。
+    # 必须进 _audit_scan_worker 的 finally 消费（异常/取消路径同样要恢复）。
+    "restore_active_probes": None,
 }
 # 审计启动互斥锁（审计 AUDIT-002）：并发请求同时过 running 检查会启动两轮付费探针
 _audit_start_lock = threading.Lock()
@@ -5042,7 +5148,14 @@ def api_prices_list():
 @app.get("/api/audit/job")
 def api_audit_job():
     """轮询扫描进度。前端据此显示进度与结果，刷新页面也能接回。"""
-    return jsonify({k: v for k, v in audit_job.items() if k != "cancel"})
+    return jsonify(_public_audit_job())
+
+
+def _public_audit_job():
+    """对外可见的 job 状态：`cancel` 是服务端标志，`restore_active_probes`
+    是 W1-4 的内部恢复账目（已弹走），都不属于前端契约。"""
+    return {k: v for k, v in audit_job.items()
+            if k not in ("cancel", "restore_active_probes")}
 
 
 @app.post("/api/audit/cancel")
@@ -5067,7 +5180,7 @@ def api_audit_run():
     # 否则两个并发请求可能同时通过检查、启动两轮付费探针。
     with _audit_start_lock:
         if audit_job["running"]:
-            return jsonify({"ok": False, "error": "已有扫描在运行", "job": {k: v for k, v in audit_job.items() if k != "cancel"}}), 409
+            return jsonify({"ok": False, "error": "已有扫描在运行", "job": _public_audit_job()}), 409
         upstream_name = str(data.get("upstream_name") or "").strip()
         model = str(data.get("model") or "claude-3-5-sonnet").strip()
         profile = str(data.get("profile") or "general").strip()
@@ -5079,7 +5192,17 @@ def api_audit_run():
         # 为真时才评估跨请求污染（D1/S7），关着的时候 D1 恒判「无异常」。
         # 与其给出一个从未执行的检查的「通过」，不如先拒绝并告诉用户怎么开。
         audit_cfg = cfg.get("audit") if isinstance(cfg.get("audit"), dict) else {}
-        if not audit_cfg.get("active_probes"):
+        # 主动探针开关必须为真，否则整轮扫描是「花钱买一份假报告」：
+        # 探针会真的发出请求并消耗 token，但 transparent 只在 AUDIT_ACTIVE_PROBES
+        # 为真时才评估跨请求污染（D1/S7），关着的时候 D1 恒判「无异常」。
+        # 与其给出一个从未执行的检查的「通过」，不如先拒绝并告诉用户怎么开。
+        #
+        # W1-4：关状态下 UI 不再吃 400 —— 前端确认弹窗里写明「将临时启用 +
+        # 运行结束后自动恢复」，确认后带 `allow_temp_probes=true` 发起。
+        # **不携带该标志的调用方（脚本/旧客户端）仍按原逻辑 400**：
+        # 这是有意的兼容策略，不静默改变第三方调用者的行为。
+        need_temp_enable = not audit_cfg.get("active_probes")
+        if need_temp_enable and not data.get("allow_temp_probes"):
             return jsonify({
                 "ok": False,
                 "error": "主动探针未启用（设置 → 安全审计 → 主动探针）。"
@@ -5097,9 +5220,18 @@ def api_audit_run():
             return jsonify({"ok": False, "error": "代理未运行，先启动代理"}), 400
         if not int(target.get("port") or 0):
             return jsonify({"ok": False, "error": "upstream 端口非法"}), 400
+        # 临时启用必须在**全部校验通过之后**才写盘：任一 400 提前返回时
+        # 配置都不能留下 active_probes=true 的脏状态。
+        restore_to = None
+        if need_temp_enable:
+            restore_to = False
+            _set_audit_active_probes(True)
+            _emit_log("[panel] 主动探针已临时启用（扫描结束后自动恢复为关闭）")
         audit_job.update({
             "running": True, "started_at": time.time(), "done": 0, "total": 0,
             "phase": "准备探针", "cancel": False, "result": None, "error": "",
+            # W1-4：待恢复的原值（None = 本次没动过该开关，finis 时无需处理）
+            "restore_active_probes": restore_to,
         })
         threading.Thread(
             target=_audit_scan_worker,
@@ -5107,6 +5239,20 @@ def api_audit_run():
             daemon=True,
         ).start()
     return jsonify({"ok": True, "started": True})
+
+
+def _set_audit_active_probes(value):
+    """把 `audit.active_probes` 写盘（只动这一个字段，不整表覆盖）。
+
+    W1-4 的两处调用：临时启用前置 true；扫描结束的 `finally` 里恢复原值。
+    必须走整份配置的读写改写（而不是写单字段文件），因为 transparent 的热重载
+    按 config.json 的 mtime 触发，且 `save_config` 会做归一化与备份。
+    """
+    cfg = load_config()
+    audit = dict(cfg.get("audit") or {})
+    audit["active_probes"] = bool(value)
+    cfg["audit"] = audit
+    save_config(cfg)
 
 
 def _audit_scan_worker(target, upstream_name, model, profile, cfg):
@@ -5118,6 +5264,19 @@ def _audit_scan_worker(target, upstream_name, model, profile, cfg):
         audit_job["error"] = _safe_public_text(e, 300)
         _emit_log(f"[audit] 扫描失败: {_safe_public_text(e, 200)}")
     finally:
+        # W1-4：临时启用的探针开关必须恢复原值。放 finally 才能兼顾
+        # 「正常跑完 / 抛异常 / 用户中途取消」三条路径（前端恢复会被刷新/关页漏掉）。
+        restore = audit_job.pop("restore_active_probes", None)
+        if restore is not None:
+            try:
+                cur = (load_config().get("audit") or {}).get("active_probes")
+                # 只有「仍是我们临时置为 true 的那份」才恢复：用户在扫描期间手改了
+                # 该开关时以用户为准，不静默覆盖用户的安全设置。
+                if cur is True:
+                    _set_audit_active_probes(restore)
+                    _emit_log("[panel] 主动探针开关已恢复为扫描前的原值")
+            except Exception as e:
+                _emit_log(f"[panel] 恢复主动探针开关失败: {_safe_public_text(e, 200)}")
         audit_job["running"] = False
         audit_job["phase"] = "已完成" if not audit_job["error"] else "失败"
 

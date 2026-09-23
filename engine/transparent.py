@@ -35,7 +35,9 @@ from shield_defaults import (
     DEFAULT_TTL,
     DEFAULT_UPSTREAMS,
     DEFAULT_BUILTIN_RULES,
+    DEFAULT_COMMAND_BLOCK,
     KNOWN_PUBLIC_DNS,
+    validate_command_regex,
     parse_egress_proxy,
     extract_usage as _extract_usage,
 )
@@ -368,9 +370,55 @@ DEFAULT_AUDIT_SIGNALS = {
     "dangerous_action": True,  # S9 模型下发破坏性命令（只告警，不阻断）
 }
 AUDIT_SIGNALS = dict(DEFAULT_AUDIT_SIGNALS)
-# 审计严重信号触发时自动停用该 upstream（默认关，用户自选）。
-# 检测到 CRITICAL（如跨请求污染=relay 存了并复述了前序数据）时阻断后续请求（审计规则专项 P2）。
+# 审计严重信号触发时的**响应级**熔断（默认关，用户自选；前端「审计阻断」开关）。
+# 触发条件：某条 finding 的 severity >= CRITICAL（当前只有 S1 error_leak 的四类会到 CRITICAL）。
+# 行为（D1 纠偏，2026-09-22）：**只把本次响应改成 503**，
+#   ① 不写任何配置、**不会自动停用 upstream**（旧注释说「停用该 upstream」，与实现不符）；
+#   ② 发生在**响应阶段**，请求体早已发往上游 → **不能阻止数据外泄**，
+#      只能阻止已污染的响应内容进入客户端；
+#   ③ 与脱敏主线的同名 `fail_closed`（请求级，默认 true，见 _read_settings 里的两条注释）
+#      是**两层不同的东西**，不要混读。
 AUDIT_FAIL_CLOSED = False
+# 恒落库的信号：不受 `severity_floor` 拦截（W2-1 G1 契约 / Q6「默认就做审计记录」）。
+# S9 dangerous_action 信 LOW，而全局默认 floor=MEDIUM——没有这条例外，
+# 「默认只记录、不改写、不阻断」的承诺在默认配置下根本不成立（LOW 连写都不写，
+# 「高风险操作时间线」会是空壳）。**只改成落库、不改档位**：severity 仍 LOW，
+# 因此首页/统计页的告警数（只数 HIGH/CRITICAL）不受影响。
+AUDIT_ALWAYS_RECORD = frozenset({"dangerous_action"})
+# ========== 命令拦截（config.command_block）运行时状态 ==========
+# 结构：{"mode": "observe"|"rewrite"|"block", "channels": set, "patterns": [(id,label,rx)],
+#        "allow": [rx], "disabled": set(id)}
+# 与审计 S9（只记录、恒 LOW）是**两套**东西：S9 的判据不被用户配置改写；这里可读可改
+# （用户要求「开箱即用 + 可改 + 删除不复活」）。由 `_read_settings` 热重载刷新。
+COMMAND_BLOCK = {
+    "mode": "observe",
+    "channels": {"tool"},
+    "patterns": [],
+    "allow": [],
+    "disabled": set(),
+}
+# 命令拦截的扫描上限与防 ReDoS 预算：
+#   · CMD_SCAN_MAX：单次只扫前 N 字节。人写的命令不会藏在 8KB 之后，
+#     而把不设限的文本喂给用户正则就是把事件循环交给对方。
+#   · CMD_MATCH_BUDGET_MS：单条规则单次匹配耗时上限，超限即**停用该条**并告警。
+#     ⚠️ 诚实说明：Python 的 `re` 无法中途打断，所以这是「下次不再付这个代价」，
+#     不是「这次不卡」。真正的第一道防线是 panel 侧的长度上限 + 嵌套量词拒绝
+#     （见 panel._normalize_command_block），这里只是运行时的例外兜底。
+CMD_SCAN_MAX = 8192
+CMD_MATCH_BUDGET_MS = 60
+# 改写文本（W2-2）。**固定字符串，绝不拼入任何变量**：
+#   · 它会被插进工具参数（可执行面），拼入被拦命令原文等于用我们自己的改写文本
+#     把命令重新引入——原文里的 `'` 一闭一开就能构造出 `echo '…' ; <危险命令> #`，
+#     即「我方的改写反而成了注入的载体」。
+#   · 固定形态也是无害 no-op：真被当 shell 跑，只往 stdout 打一行说明；
+#     Agent 能读到这句「已阻止」，从而不再重试同一条命令。
+#   · **刻意不带命令名/规则名**（方案初稿曾写 `（rm -rf /）`）：① 任何拼接都可能带进原文里的引号
+#     而破坏 no-op 形态；② 这个常量对**全部 7 条内置规则**都一样生效，写具体命令名反而不如实。
+#     命中详情走时间线 evidence 与 UI，不进 shell 字符串。
+CMD_BLOCK_NOTICE = "echo '[Maskit] 已阻止高危删除命令，本条为占位说明，未执行任何操作'"
+# 有界前瞻缓冲的尾巴上限（chunk 1-8）：命令可能被切成 `rm -r` + `f /`，
+# 必须把「可能是模式前缀」的尾巴暂留到下一块。只取模式源长度上界截断（≤ 本值）。
+CMD_HOLD_MAX = 64
 # AI 实体识别开关（默认关闭，需用户显式开启，避免概率模型干扰确定性规则）
 NER_ENABLED = False
 # 主动探针注入的 canary nonce 注册表（跨请求污染检测用）
@@ -3362,6 +3410,378 @@ def restore(text, sid, channel="", escape=False, final=False):
     return out
 
 
+# ===== 命令拦截：探测 / 改写 / 阻断（W2-1 ~ W2-4） =====
+#
+# 挂在**槽位层**而不是审计层：审计层（_audit_response）在流结束后才跑，那时
+# 内容已经发给客户端了，除了 503 什么都做不了；而槽位层是逐 chunk 的，
+# 能在下发前就地替换。四个挂点：`_restore_sse_data`、`_restore_ndjson_line`
+# 的槽位循环，以及非流式的 `_restore_tree`（通道由 JSON 键名判定）与
+# 收尾的 `_flush_pending`（前瞻缓冲不吞字）。
+#
+# ⚠️ 未覆盖的链路（如实声明，免得后来者以为全覆盖）：
+#   · `_restore_ext_sse_event` 的豆包私有信封分支（直接调 restore，不走槽位）；
+#   · panel 侧 `/api/ext/restore` 的扩展非流式还原（另一份实现，不 import 本模块）。
+#   两条都是扩展链路，且豆包站点本身已因附件链路差异从推荐列表移除（W3-3 专项）。
+#
+# 思考通道**恒排除**：模型在思考里权衡「要不要 rm -rf /」不是下发命令；
+# 正文通道可选 opt-in（AI 讲命令是家常便饭），默认只拦工具参数通道。
+_CMD_REASON_MARKERS = (".reason", ".reason2", ".think", "thinking", "reasoning")
+_CMD_TOOL_MARKERS = (".tool", ".fcall", ".pj", ".args", "arguments", "partial_json")
+# 嵌套量词/长度的唯一校验源在 shield_defaults（panel 保存时也调它）
+_CMD_LOGGED = set()
+
+
+def _cmd_log_once(msg):
+    """同一条告警只记一次（热重载/每个 chunk 重复记会把日志刷爆）。"""
+    if msg in _CMD_LOGGED:
+        return
+    _CMD_LOGGED.add(msg)
+    try:
+        _log(msg)
+    except Exception:
+        pass
+
+
+def _cmd_channel_kind(channel):
+    """槽位通道名 / JSON 键名 → 命令拦截通道：`tool` / `text` / `reason`。
+
+    未命中任何标记的通道**归到 `text`**（注释里写死口径，免得后人猜）：本函数的输入只有
+    两类——槽位名（`c0.content` / `c0.tool0` / `a0.pj` / `o.message.content` …）与 JSON 键名
+    （`content` / `arguments` / `thinking` …），落到这里的就是模型正文。
+    `raw` / `ext:` 这类非槽位通道**到不了这里**（命令拦截的 4 个调用点全部按槽位/键名传入：
+    `_restore_sse_data` / `_restore_ndjson_line` / `_restore_tree` / `_flush_pending`）；
+    豆包私有信封内层 `text` 即使经 `_flush_pending` 走到这里，它本身就是模型正文，
+    判为 `text` 也是对的。所以默认值**既不改成 `tool`、也不排除**。
+    """
+    ch = str(channel or "").lower()
+    if any(m in ch for m in _CMD_REASON_MARKERS):
+        return "reason"
+    if any(m in ch for m in _CMD_TOOL_MARKERS):
+        return "tool"
+    return "text"
+
+
+def _parse_command_block(raw):
+    """把 config.command_block 解析成运行时结构（编译正则 + 边界校验）。
+
+    panel 保存时已校验一次；这里是**第二道**（config.json 可被人手改，绕过 UI）。
+    非法条目丢弃并记日志，不影响其余规则——一条坏正则不能让整个功能瘫。
+    """
+    out = {"mode": "observe", "channels": {"tool"}, "patterns": [], "allow": [],
+           "disabled": set()}
+    if not isinstance(raw, dict):
+        raw = DEFAULT_COMMAND_BLOCK
+    mode = str(raw.get("mode") or "observe").strip().lower()
+    out["mode"] = mode if mode in ("observe", "rewrite", "block") else "observe"
+    chans = raw.get("channels")
+    chans = [c for c in chans if c in ("tool", "text")] if isinstance(chans, list) else []
+    out["channels"] = set(chans) or {"tool"}
+    items = raw.get("patterns")
+    if not isinstance(items, list):
+        items = DEFAULT_COMMAND_BLOCK["patterns"]
+    for item in items:
+        if not isinstance(item, dict) or not item.get("enabled", True):
+            continue
+        src = str(item.get("regex") or "")
+        pid = str(item.get("id") or "")
+        label = str(item.get("label") or "")
+        ok, why = validate_command_regex(src)
+        if not ok:
+            _cmd_log_once(f"[cmd-block] 规则 {pid or src[:20]} {why}，已忽略")
+            continue
+        out["patterns"].append((pid, label, re.compile(src)))
+    allow_src = raw.get("allow_patterns")
+    for src in (allow_src if isinstance(allow_src, list) else []):
+        src = str(src or "")
+        ok, why = validate_command_regex(src)
+        if not ok:
+            if src:
+                _cmd_log_once(f"[cmd-block] 白名单「{src[:20]}」{why}，已忽略")
+            continue
+        out["allow"].append(re.compile(src))
+    return out
+
+
+def _cmd_hold_len():
+    """有界前瞻缓冲的尾巴长度（只在 rewrite/block 模式用）。
+
+    上界取「最长启用模式源长度 − 1」，再截到 CMD_HOLD_MAX：命令被 TCP 切开的
+    跨度过不了这个量级，而无限拖尾会把流式体验拖坏。
+    """
+    pats = COMMAND_BLOCK.get("patterns") or []
+    if not pats:
+        return 0
+    longest = max((len(rx.pattern) for _pid, _lb, rx in pats), default=0)
+    return max(0, min(longest - 1, CMD_HOLD_MAX))
+
+
+def _cmd_find(text):
+    """在 text 里找第一条命中的启用规则；命中白名单视为未命中。
+
+    返回 (命中文本, 规则 id, 规则 label) 或 None。**只读**，不改 text。
+    单次匹配耗时超预算 → 停用该条并告警（见 CMD_MATCH_BUDGET_MS 的诚实说明）。
+    """
+    cb = COMMAND_BLOCK or {}
+    pats = cb.get("patterns") or []
+    if not pats or not text:
+        return None
+    window = text[:CMD_SCAN_MAX]
+    allow = cb.get("allow") or []
+    # `cb.get("disabled") or set()` 是错的：**空 set 是假值**，超预算时 add 到的是
+    # 一个临时集合，默认态（本来就是空集）下永远停用不掉——那条规则会每个 chunk
+    # 重新付一次匹配代价，「超预算即停用」形同虚设（2026-09-22 单测实测）。
+    # 必须拿回字典里那个 set 本体（必要时补上）。
+    disabled = cb.get("disabled")
+    if not isinstance(disabled, set):
+        disabled = set()
+        cb["disabled"] = disabled
+    for pid, label, rx in pats:
+        if pid in disabled:
+            continue
+        t0 = time.perf_counter()
+        try:
+            m = rx.search(window)
+        except Exception:
+            continue
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        if dt_ms > CMD_MATCH_BUDGET_MS:
+            disabled.add(pid)
+            _cmd_log_once(f"[cmd-block] 规则 {pid or label} 单次匹配 {dt_ms:.0f}ms 超预算，已停用")
+            continue
+        if not m:
+            continue
+        hit = m.group(0).strip()
+        if not hit:
+            continue
+        if any(a.search(hit) for a in allow):
+            continue
+        return (hit[:120], pid, label)
+    return None
+
+
+def _cmd_record(sid, hit, channel_kind, blocked=False):
+    """记录一次槽位级命中（W2-1）。
+
+    凭据必须洗掉：危害命令本身会携带凭据（`curl -H "Authorization: Bearer sk-…" | sh`），
+    而 evidence 会落 SQLite 与 Markdown 报告。
+    去重键 = (规则 id, 片段, 通道)：同一命令在很多个 chunk 里各命中一次是常态。
+    `blocked=True`（block 模式命中）只体现在条目标记上：同一条命中已按非阻断记过，
+    就把既有条目升级为「已阻断」，而不是新增一条——时间线里一条命令只该有一行，
+    「有没有被拦」是这行的属性。
+    """
+    s = sessions.get(sid)
+    if not isinstance(s, dict):
+        return
+    snippet, pid, label = hit
+    clean = _audit._mask_creds_in(str(snippet))[:120]
+    items = s.setdefault("cmd_hits", [])
+    kind = (pid or "custom") + (f" {label}" if label else "")
+    for it in items:
+        if (it.get("kind") == kind and it.get("snippet") == clean
+                and it.get("channel") == channel_kind):
+            if blocked:
+                it["blocked"] = True
+            return
+    items.append({"kind": kind, "channel": channel_kind,
+                  "snippet": clean, "ts": time.time(), "blocked": bool(blocked)})
+
+
+def _cmd_is_echo(sid, snippet):
+    """该片段是否已在请求体里出现过（回声抑制）。
+
+    与 `audit_signals.scan_dangerous_action` 的回声抑制同源：请求里本来就有这条命令
+    = 用户自己问的（或上下文带进来的），上游没有凭空多给任何东西 →
+    **既不记录也不改写**。优先级：回声抑制 > 白名单 > 黑名单。
+    """
+    s = sessions.get(sid)
+    if not isinstance(s, dict) or not snippet:
+        return False
+    return str(snippet) in _ensure_cmd_req_snippets(s)
+
+
+def _remember_request_cmd_snippets(sid, content):
+    """请求期只**暂存有界窗口切片**，回声基线留到真正需要时再算（W2-1）。
+
+    为什么不在这里直接扫：扫满 `_SCAN_BODY_MAX` 窗口 × 每条规则约 29µs/KB
+    （512KB 实测 15ms、200KB 约 3ms），而这里在**每个请求**上都会执行 ——
+    观测量级与既有 `mask()` 主链路同阶（512KB 时约占其 4 成），等于给默认档位
+    白加一笔延迟，而绝大多数请求根本不会命中任何命令。
+    改法：请求期只留切片（不解析、不驻留整份请求体——上限 32MB 不能进会话），
+    首次真要判定回声时由 `_ensure_cmd_req_snippets` 扫一次即丢。
+    """
+    try:
+        s = sessions.get(sid)
+        if not isinstance(s, dict) or not content:
+            return
+        pats = (COMMAND_BLOCK or {}).get("patterns") or []
+        if not pats:
+            return
+        s["cmd_req_window"] = content[:_SCAN_BODY_MAX]
+    except Exception:
+        # 回声基线建不起来不能影响请求（最坏是少一层抑制，多记一条而已）
+        pass
+
+
+def _ensure_cmd_req_snippets(s):
+    """惰性构建回声基线（只算一次，算完丢窗口）。
+
+    语义与「请求期先扫好」完全等价：窗口是同一段字节、规则是同一批规则，
+    差别只在**算的时机**（从每请求挪到首次真命中）。返回集合恒非 None，
+    以便用 `cmd_req_snippets` 是否存在区分「没算过」与「算过但为空」。
+    """
+    cached = s.get("cmd_req_snippets")
+    if cached is not None:
+        return cached
+    found = set()
+    win = s.pop("cmd_req_window", None)
+    if win:
+        try:
+            text = win.decode("utf-8", errors="replace")
+            for _pid, _label, rx in ((COMMAND_BLOCK or {}).get("patterns") or []):
+                try:
+                    for m in rx.finditer(text):
+                        g = m.group(0).strip()
+                        if g:
+                            found.add(g[:120])
+                except Exception:
+                    continue
+        except Exception:
+            found = set()
+    s["cmd_req_snippets"] = found
+    return found
+
+
+def _cmd_process(text, channel, sid, escape=False, final=False):
+    """命令拦截统一入口：探测 + 按 mode 改写/阻断。返回（可能）改写后的文本。
+
+    调用点（设计 §2.5 的 3 处槽位循环 + 非流式 `restore_final`）均已把**还原后**
+    的文本交给它——占位符状态下路径是假的，判不准也没意义。
+
+    mode 语义：
+      · observe：只探测、只记录，**逐字节原样返回**（也不做前瞻缓冲——缓冲会把
+        尾字符延后到下一块，一旦流被切断就可能丢字，而「响应字节零变化」是
+        这个默认档位的硬承诺）；
+      · rewrite：就地替换为 `CMD_BLOCK_NOTICE`（无害 no-op），保持流式不中断；
+      · block：命中即停（本会话剩余内容不再下发），非流式整包换 503。
+
+    ⚠️ 边界（诚实声明）：observe 不做缓冲 → 跨 chunk 切开的命令可能漏检（只少不多）；
+    rewrite/block 的有界前瞻把最后 hold 个字符暂留到下一块，流末由 `final=True`
+    或 `_cmd_flush_frames` 补发，**不吞字**。
+    `escape` 参数保留只是因为调用点按槽位属性传入：改写文本是不可配置的固定常量
+    （`CMD_BLOCK_NOTICE`），JSON 转义只处理双引号与反斜杠这两个字符，而它两者都不含
+    （内含的单引号在 JSON 里无需转义），故不参与计算。若将来改成可配置文本，此处必须重新评估。
+    """
+    cb = COMMAND_BLOCK or {}
+    mode = cb.get("mode") or "observe"
+    if not isinstance(text, str):
+        return text
+    # 空文本**不能**直接早返回：final=True 时它正是「把缓冲一次性吐出来」的信号
+    # （收尾帧的文本常常是空的，缓冲里却还压着上一块的尾巴）。
+    if not text and not final:
+        return text
+    s = sessions.get(sid)
+    if not isinstance(s, dict):
+        return text
+    kind = _cmd_channel_kind(channel)
+    patterns = cb.get("patterns") or []
+    # 思考通道：既不记录（设计决定：思考里的权衡不是下发命令）也不改写，
+    # 但要留下「这里出现过」的片段——供 _audit_response 把全量 S9 扫描里
+    # 同片段的误报压掉（§6.4 记录的既有污染：S9 扫的是混了思考块的全量文本）。
+    if kind == "reason":
+        if patterns:
+            h = _cmd_find(text)
+            if h:
+                s.setdefault("cmd_reason_snippets", set()).add(h[0])
+        return text
+    if kind not in (cb.get("channels") or {"tool"}):
+        return text
+    if not patterns:
+        return text
+    if s.get("cmd_blocked"):
+        # block 模式已命中：本会话剩余内容不再下发（回复被截断是「阻断」的可见形态）
+        return ""
+    if mode == "observe":
+        hit = _cmd_find(text)
+        if hit and not _cmd_is_echo(sid, hit[0]):
+            _cmd_record(sid, hit, kind)
+        return text
+    # rewrite / block：先把上一条尾巴拼回来再判定（命令可能被 chunk 切开，
+    # 如 `rm -r` + `f /`——只看本块永远漏拦）
+    pend = s.setdefault("cmd_pend", {})
+    combined = pend.pop(channel, "") + text
+    keep = ""
+    hold = _cmd_hold_len()
+    if hold > 0 and not final:
+        if len(combined) <= hold:
+            pend[channel] = combined
+            return ""
+        keep = combined[-hold:]
+        combined = combined[:-hold]
+    hit = _cmd_find(combined)
+    if hit and _cmd_is_echo(sid, hit[0]):
+        # 回声抑制：用户自己问过的命令，既不改写也不记录
+        hit = None
+    if hit:
+        blocked = mode == "block"
+        _cmd_record(sid, hit, kind, blocked=blocked)
+        if blocked:
+            s["cmd_blocked"] = True
+            _log_cmd_block(channel, hit)
+            return ""
+        result = _cmd_rewrite_text(combined)
+    else:
+        result = combined
+    if keep:
+        pend[channel] = keep
+    return result
+
+
+def _cmd_rewrite_text(text):
+    """把 text 里的命令片段换成无害 no-op 说明（W2-2）。
+
+    逐条规则替换（不是只换第一条）：一次工具调用里可能含多条危害命令。
+    用 lambda 而不是把文本当替换模板——`re.sub` 的替换串会解释反向引用（如 `\\1`、`\\g<0>`）
+    这类反向引用，而规则本身可含捕获组，用字面量替换不会有这个问题。
+    """
+    out = text
+    # 取字典里的 set 本体。**不要写 `or set()`**：空 set 是假值，那个写法会现场造一个临时集合——
+    # 此处只读虽无后果，但同一个写法在 `_cmd_find` 里曾让「超预算即停用」静默失效（那条要 add），
+    # 两处保持同一形态，避免后来者照抄走错的那一版。
+    disabled = COMMAND_BLOCK.get("disabled")
+    if not isinstance(disabled, set):
+        disabled = set()
+    for pid, _label, rx in (COMMAND_BLOCK.get("patterns") or []):
+        if pid in disabled:
+            continue
+        try:
+            out = rx.sub(lambda _m: CMD_BLOCK_NOTICE, out)
+        except Exception:
+            continue
+    return out
+
+
+def _log_cmd_block(channel, hit):
+    """block 模式留痕：**只写日志**，不写 BLOCK 主事件（W2-4）。
+
+    为什么不用 BLOCK 事件：`event_store` 的口径里 BLOCK 同时计入 `requests` 与
+    `alerts`（见 event_store.py 的 `_ev("BLOCK")` 两处聚合），而 BLOCK 原本描述的
+    是「请求压根没出去」的 fail-closed 场景（未脱敏不出网、体积闸）。响应侧命令阻断
+    发生在请求**已脱敏发出之后**，再补一条 BLOCK 会把同一个请求计两次，首页「请求数」
+    与「告警数」同时虚高。留痕统一走槽位级审计信号（`dangerous_action`，evidence 带
+    `[已阻断]` 标记），与 observe/rewrite 同口径；时间线视图本就按 floor=LOW 单独取数，
+    阻断照样看得见。
+
+    与既有的 `audit_critical_signal` 阻断（审计 fail-closed）**故意不同**：那条是
+    CRITICAL 级（上游确凿窃取数据）才触发，稀发且必须上首页告警，因此它发 BLOCK；
+    命令阻断是用户自己开的日常机制，命中即上报会把首页告警刷成噪音。
+    两条路径的差异是故意的，不是漏改。
+    """
+    _pid, label, _snippet = (list(hit) + ["", "", ""])[:3]
+    _cmd_log_once(
+        f"[cmd-block] block 模式命中 {_pid or label}（通道={_cmd_channel_kind(channel)}），"
+        "已停止下发该会话剩余内容")
+
+
 def restore_final(text, sid, escape=False):
     return restore(text, sid, escape=escape, final=True)
 
@@ -3490,7 +3910,11 @@ def _restore_tree(obj, sid, key=None, depth=0):
         _count_unresolved(sid, 1)
         return obj
     if isinstance(obj, str):
-        return restore_final(obj, sid, escape=key in _JSON_STR_KEYS)
+        restored = restore_final(obj, sid, escape=key in _JSON_STR_KEYS)
+        # 命令拦截的**非流式**挂点：通道由 JSON 键名判定（arguments/partial_json → tool），
+        # 整包文本都在手里，故 final=True（无需前瞻缓冲）。
+        return _cmd_process(restored, key or "", sid,
+                            escape=key in _JSON_STR_KEYS, final=True)
     if isinstance(obj, list):
         return [_restore_tree(v, sid, key, depth + 1) for v in obj]
     if isinstance(obj, dict):
@@ -4167,6 +4591,40 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
         if AUDIT_SIGNALS.get("dangerous_action") and scan_text:
             findings.extend(_audit.scan_dangerous_action(scan_text, scan_req_text))
 
+        # W2-1 / G1 契约：把**槽位级**命中（带通道来源）与全量 S9 扫描的结果合并。
+        #   · 改写模式下命令已被就地替换，全量扫描看不见它们 → 槽位级是唯一来源；
+        #   · 非改写模式下两者可能命中同一条命令，此处**以槽位级为准**（它带通道信息），
+        #     并从全量结果里摘掉同片段的那条，避免一条命令写两条事件；
+        #   · 思考通道的命中**不产生条目**（设计决定：模型在思考里权衡「要不要 rm -rf /」
+        #     不是下发命令），但它能压掉全量扫描的对应误报——S9 扫的是混了思考块的
+        #     全量拼接文本，这正是 §6.4 记录的既有污染。
+        s_cmd = sessions.get(sid) or {}
+        slot_hits = s_cmd.get("cmd_hits") or []
+        reason_snips = s_cmd.get("cmd_reason_snippets") or ()
+        if slot_hits or reason_snips:
+            slot_snips = [h.get("snippet") for h in slot_hits if h.get("snippet")]
+            kept = []
+            for f in findings:
+                if f.get("signal") != "dangerous_action":
+                    kept.append(f)
+                    continue
+                ev = str(f.get("evidence", ""))
+                if any(sn in ev for sn in slot_snips) or any(sn in ev for sn in reason_snips):
+                    continue
+                kept.append(f)
+            findings = kept
+        for h in slot_hits:
+            findings.append({
+                "signal": "dangerous_action",
+                # 与 S9 同档：只记不报（恒 LOW，不改档位）。真正“拦住”的是命令拦截本身，
+                # 审计只是留痕。
+                "severity": _audit.LOW,
+                "evidence": (f"{h.get('snippet', '')} [通道={h.get('channel', '')}]"
+                             f" [kind={h.get('kind', '')}]"
+                             + (" [已阻断]" if h.get("blocked") else "")),
+                "kind": str(h.get("kind") or "dangerous_action"),
+            })
+
         # S2 identity_swap + S4 sse_anomaly：需解析 body
         if body_text and ("json" in ct or "event-stream" in ct):
             # 单次解析产出 (text_chunks, model_field, events) — 避免三重解析
@@ -4218,7 +4676,13 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
         floor = AUDIT_SEVERITY_FLOOR or "MEDIUM"
         probe_id = flow.metadata.get("probe_id")
         for f in findings:
-            if not _audit.severity_ge(f.get("severity", _audit.LOW), floor):
+            sev = f.get("severity", _audit.LOW)
+            # W2-1 G1：按信号的落库门槛例外。危险动作恒落库（档位仍 LOW），
+            # 否则「默认只记录」在默认 floor=MEDIUM 下是空话。
+            # 不打扰由三层各自保证：① 告警计数只数 HIGH/CRITICAL；
+            # ② 默认事件列表按用户档位 floor 查询（前端传 floor）；
+            # ③ 只在视图级 floor=LOW 的时间线（W2-5）里可见。
+            if not (_audit.severity_ge(sev, floor) or f.get("signal") in AUDIT_ALWAYS_RECORD):
                 continue
             enqueue_audit_event({
                 **common,
@@ -4227,8 +4691,11 @@ def _audit_response(flow, sid, host, method, path, source, streamed_text=None):
                 "evidence": f.get("evidence", ""),
                 "probe_id": probe_id,
             })
-            # 审计信号 fail-closed（默认关）：CRITICAL 信号触发时自动停用该 upstream
-            # 产品定位是脱敏代理，检测到上游确凿在窃取数据却继续放行逻辑上不自洽（审计规则专项 P2）
+            # 审计信号 fail-closed（默认关）：CRITICAL 信号触发时把**本次响应**换成 503。
+            # 产品定位是脱敏代理，检测到上游确凿在窃取数据却继续把污染内容交给客户端
+            # 逻辑上不自洽（审计规则专项 P2）。
+            # ⚠️ 边界（D1 纠偏）：仅替换本次响应，不写配置、不停用 upstream；且
+            # 阻断发生在响应阶段——请求早已出网，这层**不防数据外泄**，只防客户端被污染。
             if AUDIT_FAIL_CLOSED and _audit.severity_ge(f.get("severity", _audit.LOW), _audit.CRITICAL):
                 # 阻断必须留痕：BLOCK 主事件计入首页 alerts（BLOCK 口径），
                 # 此前该路径只有一行 _log，用户盯着 Dashboard 的告警数完全看不到。
@@ -4763,6 +5230,11 @@ def request(flow: http.HTTPFlow):
     sid = uuid.uuid4().hex[:16]
     _new_session(sid, source=source)
     flow.metadata["session_id"] = sid
+    # 命令拦截的回声抑制基线（W2-1）：请求体里已经出现的危险命令说明是用户自己
+    # 问的（或上下文带进来的），上游没凭空多给东西 → 既不记录也不改写。
+    # 必须在**脱敏之前**算（raw_content 还是客户端原文）：脱敏后路径/域名都变成
+    # 占位符，判不准也没意义。注意 `raw_content` 在命令拦截未启用时不会扫。
+    _remember_request_cmd_snippets(sid, raw_content)
     # 2.0 审计：从请求 header 读 probe_id + canaries（panel 主动探针注入），读完即 strip 不转发上游
     probe_id = flow.request.headers.get("x-shield-probe-id", "") or ""
     if probe_id:
@@ -5067,6 +5539,18 @@ def response(flow: http.HTTPFlow):
               upstream=s_err.get("upstream_name") or flow.metadata.get("shield_upstream") or "",
               model=s_err.get("model") or flow.metadata.get("shield_model") or "",
               **source)
+    # W2-4：block 模式的**非流式**收敛——整包换成结构化错误。
+    # 流式路径无法回收已下发的字节，那条路径靠槽位置空截断下发（见 _cmd_process）；
+    # 两条路径的边界在设置页写清楚，不用「已阻断」这种模糊说法掩盖差异。
+    if ok and (sessions.get(sid) or {}).get("cmd_blocked"):
+        flow.response = http.Response.make(
+            503,
+            json.dumps({"error": {"code": "shield_command_blocked",
+                                   "reason": "dangerous_command_in_response"}},
+                       ensure_ascii=False).encode("utf-8"),
+            {"content-type": "application/json"},
+        )
+        ok = False
     if ok and DEBUG:
         _debug(f"RESPONSE {host}{path.split('?')[0]} -- 还原后(返回客户端)", sid,
                flow.response.content.decode("utf-8", errors="replace"))
@@ -5347,11 +5831,19 @@ def _restore_sse_data(data, sid, final=False, final_prefixes=()):
         s = sessions.get(sid) or {}
         for channel, text, setter, escape in slots:
             channel_final = final or final_prefixes is None or channel.startswith(final_prefixes)
-            setter(restore(text, sid, channel=channel, escape=escape, final=channel_final))
-        # 只有真的留下半截占位符时才记模板（收尾补发用），正常路径零额外序列化
+            restored = restore(text, sid, channel=channel, escape=escape, final=channel_final)
+            # 命令拦截（W2-1/2/4）挂在**还原后**的文本上：占位符状态下路径/主机名
+            # 都是假的，判不准也没意义。observe 模式下它逐字节原样返回。
+            restored = _cmd_process(restored, channel, sid, escape=escape, final=channel_final)
+            setter(restored)
+        # 只有真的留下半截占位符或命令前瞻缓冲时才记模板（收尾补发用），正常路径零额外序列化。
+        # 命令缓冲也必须记：否则收尾补发无模板可克隆，只能退到 `_wrap_bare_flush` 的
+        # 裸文本外壳——SSE 里那是一条**非法 JSON** 的 data 行，严格客户端（以及本仓库的
+        # 冒烟脚本）整条丢弃，表现为「改写后正文凭空消失」（2026-09-22 冒烟实测）。
         pend = s.get("pending") or {}
+        cmdp = s.get("cmd_pend") or {}
         for channel, _t, _s, escape in slots:
-            if pend.get(channel):
+            if pend.get(channel) or cmdp.get(channel):
                 s.setdefault("flush_tmpl", {})[channel] = json.dumps(data, ensure_ascii=False)
         return
     # 非增量事件（message_start / content_block_start / response.completed …）是完整快照，整树还原
@@ -5432,6 +5924,47 @@ def _wrap_bare_flush(text, framing):
         return ""
 
 
+def _cmd_flush_frames(sid, channel_prefixes, framing):
+    """流末把命令拦截的前瞻缓冲补发出去（**不吞字**），返回已封装的帧列表。
+
+    为什么必须补发：rewrite/block 模式会把每块末尾 hold 个字符暂留到下一块判命令，
+    流结束时最后那一段从没被处理过——不补就是静默吞字。
+    顺序：命令缓冲装的是本次流末尾**更靠前**的文本（占位符截留的尾巴在后），
+    所以调用方必须先吐本函数的帧，再吐 `pending` 的帧。
+    block 模式下已命中的会话不再补发（回复已阻断）。
+    """
+    s = sessions.get(sid)
+    if not isinstance(s, dict):
+        return []
+    pend = s.get("cmd_pend")
+    if not isinstance(pend, dict) or not pend:
+        return []
+    if s.get("cmd_blocked"):
+        pend.clear()
+        return []
+    tmpl_all = s.get("flush_tmpl") or {}
+    builder = _build_flush_line if framing == "ndjson" else _build_flush_event
+    out = []
+    for channel in list(pend.keys()):
+        if channel_prefixes is not None and not channel.startswith(channel_prefixes):
+            continue
+        leftover = pend.pop(channel, "") or ""
+        if not leftover:
+            continue
+        # 走**统一入口**而不是直接 rewrite：缓冲里可能压着一条从没被扫过的命令，
+        # 补发时必须一并做探测与留痕——rewrite 模式下槽位级命中是这条信号落库的
+        # 唯一来源，漏在这里就是「改了但没记」。
+        restored = _cmd_process(leftover, channel, sid, final=True)
+        if not restored:
+            continue
+        tmpl_json = tmpl_all.get(channel, "")
+        evt = builder(tmpl_json, channel, restored) if tmpl_json else ""
+        # 无模板时不能裸拼文本（SSE 里裸文本没有 data: 前缀，严格解析器整行忽略），
+        # 与 _flush_pending 同一口径：退到最小合法外壳。
+        out.append(evt if evt else _wrap_bare_flush(restored, framing))
+    return out
+
+
 def _flush_pending(sid, channel_prefixes=None, framing="sse"):
     """把各通道滞留的半截占位符补发出去，返回待追加的流文本。
 
@@ -5439,15 +5972,24 @@ def _flush_pending(sid, channel_prefixes=None, framing="sse"):
     否则客户端收到的补发帧里是未还原的占位符。
     framing 决定补发帧的封装形态：SSE 要克隆完整事件（客户端 SDK 会校验字段），
     NDJSON 只要一行 JSON。
+
+    先吐命令拦截的前瞻缓冲（本轮末尾更靠前的文本），再吐占位符截留的尾巴。
     """
     s = sessions.get(sid)
     if not s:
         return ""
+    out = _cmd_flush_frames(sid, channel_prefixes, framing)
     pend = s.get("pending")
     if not isinstance(pend, dict) or not pend:
+        return "".join(out)
+    if s.get("cmd_blocked"):
+        # block 模式已命中的会话：回复已阻断，**连占位符半截缓冲也不再补发**。
+        # 不拦这里就会出现「已停止下发」之后又补一帧残片 —— `_cmd_flush_frames`
+        # 有同样的守卫，两条补发路径的口径必须一致。
+        pend.clear()
+        (s.get("flush_tmpl") or {}).clear()
         return ""
     tmpl = s.get("flush_tmpl") or {}
-    out = []
     for channel, leftover in list(pend.items()):
         if channel_prefixes is not None and not channel.startswith(channel_prefixes):
             continue
@@ -5520,11 +6062,15 @@ def _restore_ndjson_line(line, sid, final=False):
         if slots:
             s = sessions.get(sid) or {}
             for channel, text, setter, escape in slots:
-                setter(restore(text, sid, channel=channel, escape=escape, final=final))
-            # 只有真的留下半截占位符时才记模板（收尾补发用），正常路径零额外序列化
+                restored = restore(text, sid, channel=channel, escape=escape, final=final)
+                # 命令拦截：同 SSE 槽位路径（NDJSON 的增量文本也会被切成多块）
+                restored = _cmd_process(restored, channel, sid, escape=escape, final=final)
+                setter(restored)
+            # 只有真的留下半截占位符或命令前瞻缓冲时才记模板（收尾补发用），正常路径零额外序列化
             pend = s.get("pending") or {}
+            cmdp = s.get("cmd_pend") or {}
             for channel, _t, _s2, _e in slots:
-                if pend.get(channel):
+                if pend.get(channel) or cmdp.get(channel):
                     s.setdefault("flush_tmpl", {})[channel] = json.dumps(obj, ensure_ascii=False)
             return json.dumps(obj, ensure_ascii=False)
         return json.dumps(_restore_tree(obj, sid), ensure_ascii=False)
@@ -6424,6 +6970,12 @@ def _read_settings():
         "egress_proxy": egress,
         "capture_mode": capture_mode,
         "filter_enabled": cfg.get("filter_enabled", True),
+        # ⚠️ 两层「fail_closed」不要混读（缺陷 D2）：
+        #   · 本条：**脱敏主线**的请求级熔断（默认 true）——脱敏管线自身异常时宁可 503
+        #     也不放明文出网，是「绝不满放」那条安全红线。
+        #   · "audit_fail_closed"（本函数下方几行）：**审计**的响应级熔断（默认 false）——
+        #     仅把已污染的响应换成 503，不改写任何配置。
+        # 同名不同层，前端文案已分别标注「脱敏失败熔断（请求级）」与「审计阻断（响应级）」。
         "fail_closed": bool(cfg.get("fail_closed", True)),
         # 敏感词统计是否记录明文（默认开——打码 preview 排出来的榜没有信息量）
         "record_plaintext_words": bool(cfg.get("record_plaintext_words", True)),
@@ -6446,6 +6998,9 @@ def _read_settings():
             for k, dflt in DEFAULT_AUDIT_SIGNALS.items()
         },
         "ner_enabled": bool(cfg.get("ner_enabled", False)),
+        # 命令拦截（W2-3）：解析 + 编译在 _read_settings 里做（热重载时一次），
+        # 而不是每个 chunk 都编译。非法条目在此丢弃并记日志。
+        "command_block": _parse_command_block(cfg.get("command_block")),
         # 整词匹配词表：UI「整词匹配」开关写入 config.sensitive_word_whole。
         # 曾漏返回该键，_maybe_reload 读到 None 后回落空集，开关全程无效。
         "sensitive_word_whole": {
@@ -6463,6 +7018,7 @@ def _maybe_reload(force=False):
     global AUDIT_ENABLED, AUDIT_PASSIVE, AUDIT_ACTIVE_PROBES, AUDIT_SEVERITY_FLOOR, AUDIT_SIGNALS
     global FAIL_CLOSED, RESPONSE_SCAN, STREAM_RESPONSE, STREAM_EXCLUDE_HOSTS
     global SENSITIVE_DISABLED, SENSITIVE_WORD_DISABLED, SENSITIVE_WORD_WHOLE, BUILTIN_RULES, EGRESS_PROXY
+    global COMMAND_BLOCK
     try:
         mt = _DATA_ROOT.joinpath("config.json").stat().st_mtime
     except Exception:
@@ -6509,6 +7065,9 @@ def _maybe_reload(force=False):
     global AUDIT_FAIL_CLOSED
     AUDIT_FAIL_CLOSED = bool(s.get("audit_fail_closed", False))
     AUDIT_SIGNALS = s["audit_signals"]
+    # 命令拦截：整段替换（含编译好的正则）——不能就地改，否则已停用的条目
+    # 会在下一轮热重载里「复活」（_parse_command_block 每次返回全新结构）
+    COMMAND_BLOCK = s.get("command_block") or _parse_command_block(None)
     global NER_ENABLED
     NER_ENABLED = bool(s.get("ner_enabled", False))
     UPSTREAMS = s["upstreams"]

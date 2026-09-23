@@ -34,7 +34,10 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=${{ inputs.tag }}
-            type=raw,value=latest
+            # `latest` 别名只给正式版：输入的 tag 里出现 `-` 即视为预发布，不覆盖 latest。
+            # 与 release.yml 的 is_prerelease 同口径（tag 含 `-` 即预发布）；否则手动发布一个
+            # beta 镜像会把 `ghcr.io/...:latest` 换成非正式构建，NAS/团队用户 pull latest 直接吃到。
+            type=raw,value=latest,enable=${{ !contains(inputs.tag, '-') }}
       - name: Fetch NER model for All-in-One Docker image
         shell: bash
         run: |

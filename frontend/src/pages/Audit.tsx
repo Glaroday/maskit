@@ -15,7 +15,7 @@ import { useVisibility } from '@/lib/useVisibility'
  * （见 `windowFull`），否则等于把「我没看到」当成「不存在」。
  */
 const AUDIT_WINDOW = 500
-import { Trash2, Radar, ShieldCheck, Info, Play, Loader2, X, FileText, HelpCircle, Activity, RefreshCw } from 'lucide-react'
+import { Trash2, Radar, ShieldCheck, Info, Play, Loader2, X, FileText, HelpCircle, Activity, RefreshCw, Ban, Plus } from 'lucide-react'
 import {
   getAuditEvents,
   clearAudit,
@@ -57,6 +57,17 @@ import { toast } from '@/lib/toast'
 import dayjs from 'dayjs'
 import { useI18n } from '@/lib/i18n'
 
+/** 命令拦截规则条目（与引擎 `config.command_block.patterns` 同形）。
+ * `builtin` 只用于界面标注「内置」；**删除靠数组本身**（服务端只在 patterns 键缺失时
+ * 灌种子，所以删掉的内置条目不会复活）。 */
+type CmdPattern = {
+  id?: string
+  label: string
+  regex: string
+  enabled: boolean
+  builtin?: boolean
+}
+
 export default function AuditPage() {
   const { t, tf } = useI18n()
   const queryClient = useQueryClient()
@@ -68,7 +79,7 @@ export default function AuditPage() {
   const auditSignals = (auditCfg.signals as Record<string, boolean>) ?? {}
   const upstreams = useMemo(() => cfg?.upstreams ?? [], [cfg])
   const [detailEvent, setDetailEvent] = useState<AuditEvent | null>(null)
-  const [auditSubTab, setAuditSubTab] = useState<'events' | 'probe'>('events')
+  const [auditSubTab, setAuditSubTab] = useState<'events' | 'timeline' | 'probe'>('events')
 
   // 主动探针任务状态与控制
   const [auditUpstream, setAuditUpstream] = useState('')
@@ -92,7 +103,10 @@ export default function AuditPage() {
   const auditProgress = auditTotal > 0 ? Math.min(100, Math.round((auditDone / auditTotal) * 100)) : 0
 
   const runAuditMutation = useMutation({
-    mutationFn: (opts: { upstream_name: string; model: string; profile: string }) => runAudit(opts),
+    mutationFn: (opts: { upstream_name: string; model: string; profile: string }) =>
+      // W1-4：允许后端临时启用探针并在结束后自动恢复原值。用户已在确认弹窗
+      // （probesOn 为 false 时会多出一行明示）里看到并同意这一步。
+      runAudit({ ...opts, allow_temp_probes: true }),
     onSuccess: (r) => {
       if (!r.ok) {
         toast(r.error || t('settings.toast.auditStartFail'), 'error')
@@ -138,6 +152,80 @@ export default function AuditPage() {
     } catch (e) { toast(tf('common.saveFailWith', { e: String(e) }), 'error') }
   }
 
+  // ===== 命令拦截（W2-3）=====
+  // 列表类字段（patterns / allow_patterns）走 `set` 整数组写入：服务端
+  // `_normalize_command_block` 会逐条校验（非法正则丢弃 + warnings 回传），
+  // 前端只负责组装数组。单个字段的开关走同一套 patch，避免整对象覆盖。
+  const cmdBlock = (cfg?.command_block as Record<string, unknown>) ?? {}
+  const cmdMode = String(cmdBlock.mode ?? 'observe')
+  const cmdPatterns = (cmdBlock.patterns as CmdPattern[] | undefined) ?? []
+  const cmdChannels = (cmdBlock.channels as string[] | undefined) ?? ['tool']
+  const cmdAllow = (cmdBlock.allow_patterns as string[] | undefined) ?? []
+  const [cmdDraft, setCmdDraft] = useState<{ id: string; label: string; regex: string; builtin: boolean } | null>(null)
+  const [cmdError, setCmdError] = useState('')
+  const [cmdAllowDraft, setCmdAllowDraft] = useState('')
+
+  const saveCmdBlock = async (patch: Omit<ConfigPatch, 'key'>) => {
+    if (!cfg) return
+    try {
+      const r = await patchConfig({ key: 'command_block', ...patch })
+      if (!r.ok) toast(r.error || t('common.saveFail'), 'error')
+      // 被丢弃的条目（非法/超长/嵌套量词）在后端以 warnings 回传，不静默
+      for (const w of r.warnings ?? []) toast(w, 'error')
+      queryClient.invalidateQueries({ queryKey: ['config'] })
+    } catch (e) { toast(tf('common.saveFailWith', { e: String(e) }), 'error') }
+  }
+  const saveCmdPatterns = (next: CmdPattern[]) =>
+    saveCmdBlock({ op: 'set', path: ['patterns'], value: next })
+  const toggleCmdChannel = (ch: string, on: boolean) => {
+    const next = on ? [...new Set([...cmdChannels, ch])] : cmdChannels.filter((c) => c !== ch)
+    // 至少留一个通道，否则功能静默失效（用户会以为「开了却没用」）
+    if (!next.length) return
+    saveCmdBlock({ op: 'set', path: ['channels'], value: next })
+  }
+  const submitCmdDraft = () => {
+    if (!cmdDraft) return
+    const regex = cmdDraft.regex.trim()
+    if (!regex) return
+    try {
+      // eslint-disable-next-line no-new
+      new RegExp(regex)
+    } catch {
+      setCmdError(t('audit.cmd.regexInvalid'))
+      return
+    }
+    setCmdError('')
+    const id = cmdDraft.id || `user-${Math.random().toString(36).slice(2, 12)}`
+    const entry: CmdPattern = { id, label: cmdDraft.label.trim(), regex, enabled: true, builtin: cmdDraft.builtin }
+    const idx = cmdPatterns.findIndex((p) => p.id === id)
+    const next = idx >= 0 ? cmdPatterns.map((p, i) => (i === idx ? { ...p, ...entry } : p)) : [...cmdPatterns, entry]
+    setCmdDraft(null)
+    void saveCmdPatterns(next)
+  }
+
+  // 审计档位预设（W1-5）：三档**只写既有字段**（fail_closed + severity_floor），
+  // 不新增 audit.mode——那会与这两个字段形成第二套真值来源（设计 C3）。
+  // 档位是“当前字段组合的读法”，而不是独立存储的状态；所以预设值由字段反推，
+  // 不另存一份（否则 UI 与引擎会各自说一套话）。
+  const auditFloor = String(auditCfg.severity_floor ?? 'MEDIUM')
+  const auditBlockOn = !!auditCfg.fail_closed
+  const auditPreset = auditBlockOn ? 'strict' : (auditFloor === 'LOW' ? 'verbose' : 'pure')
+  const PRESETS: Record<string, { fail_closed: boolean; severity_floor: string }> = {
+    pure: { fail_closed: false, severity_floor: 'MEDIUM' },
+    verbose: { fail_closed: false, severity_floor: 'LOW' },
+    strict: { fail_closed: true, severity_floor: 'MEDIUM' },
+  }
+  const applyPreset = async (p: string) => {
+    const v = PRESETS[p]
+    if (!cfg || !v) return
+    try {
+      // merge 一次只写两个字段：分两次 set 会出现“中途失败 → 档位卡在中间态”
+      const r = await patchConfig({ key: 'audit', op: 'merge', path: [], value: v })
+      if (!r.ok) toast(r.error || t('common.saveFail'), 'error')
+      queryClient.invalidateQueries({ queryKey: ['config'] })
+    } catch (e) { toast(tf('common.saveFailWith', { e: String(e) }), 'error') }
+  }
+
   // 审计事件列表
   //
   // `isError` 必须显式取出来用：后端 5xx / 引擎没起来时 `data` 是 undefined，
@@ -151,10 +239,27 @@ export default function AuditPage() {
     error: eventsErrorObj,
     refetch: refetchEvents,
   } = useQuery({
-    queryKey: ['auditEvents'],
-    queryFn: () => getAuditEvents(0, AUDIT_WINDOW),
+    queryKey: ['auditEvents', auditFloor],
+    // 服务端按**用户档位**过滤（W2-5）：S9 危险动作是「恒落库」的（见引擎
+    // AUDIT_ALWAYS_RECORD），它不带这个 floor 就会在默认视图里冒出来。
+    // 时间线视图自己传 floor=LOW，两者互不影响。
+    queryFn: () => getAuditEvents(0, AUDIT_WINDOW, { floor: auditFloor }),
     refetchInterval: hidden ? false : 3000,
   })
+
+  // 高风险操作时间线（W2-5）：**视图级**放宽到 LOW，且只看 S9 危险动作。
+  // 不新建页面/表，也不改默认视图的查询——切回默认视图事件数不增加。
+  const {
+    data: timelineData,
+    isLoading: timelineLoading,
+    isError: timelineError,
+  } = useQuery({
+    queryKey: ['auditTimeline'],
+    queryFn: () => getAuditEvents(0, AUDIT_WINDOW, { floor: 'LOW', signal: 'dangerous_action' }),
+    refetchInterval: hidden ? false : 5000,
+    enabled: auditSubTab === 'timeline',
+  })
+  const timelineEvents = useMemo(() => timelineData?.events ?? [], [timelineData])
 
   const events = useMemo(() => eventsData?.events ?? [], [eventsData])
 
@@ -224,9 +329,10 @@ export default function AuditPage() {
       </div>
 
       {/* 二级选项卡切换：事件日志 vs 审计探针与规则 */}
-      <Tabs value={auditSubTab} onValueChange={(v) => setAuditSubTab(v as 'events' | 'probe')} className="w-full">
+      <Tabs value={auditSubTab} onValueChange={(v) => setAuditSubTab(v as 'events' | 'timeline' | 'probe')} className="w-full">
         <TabsList>
           <TabsTrigger value="events">{t('audit.tab.events')}</TabsTrigger>
+          <TabsTrigger value="timeline">{t('audit.tab.timeline')}</TabsTrigger>
           <TabsTrigger value="probe">{t('audit.tab.probe')}</TabsTrigger>
         </TabsList>
 
@@ -342,8 +448,37 @@ export default function AuditPage() {
             ))}
           </div>
 
-          {/* 高级：自动报告 + 严重度门槛 */}
+          {/* 高级：档位预设 + 自动报告 + 严重度门槛 + 审计阻断开关 */}
           <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[13px] font-medium">{t('audit.preset')}</span>
+                <Select value={auditPreset} onValueChange={applyPreset}>
+                  <SelectTrigger className="h-8 w-44 text-xs"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="pure">{t('audit.presetPure')}</SelectItem>
+                    <SelectItem value="verbose">{t('audit.presetVerbose')}</SelectItem>
+                    <SelectItem value="strict">{t('audit.presetStrict')}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {auditPreset === 'pure' ? t('audit.presetPureDesc')
+                  : auditPreset === 'verbose' ? t('audit.presetVerboseDesc')
+                  : t('audit.presetStrictDesc')}
+              </p>
+              {/* 承诺文案由 fail_closed **实时推导**，不硬编码（否则会与行为脱节） */}
+              <p className={cn('mt-1.5 text-[11px] font-medium', auditBlockOn ? 'text-amber-600 dark:text-amber-500' : 'text-emerald-600 dark:text-emerald-400')}>
+                {auditBlockOn ? t('audit.promiseBlockCritical') : t('audit.promiseNoBlock')}
+              </p>
+            </div>
+            <div className="rounded-lg border bg-muted/30 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[13px] font-medium">{t('audit.blockSwitch')}</span>
+                <Switch checked={auditBlockOn} onCheckedChange={(v) => saveAudit({ op: 'set', path: ['fail_closed'], value: v })} className="scale-90" />
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">{t('audit.blockSwitchDesc')}</p>
+            </div>
             <label className="flex cursor-pointer select-none flex-col justify-between rounded-lg border bg-muted/30 p-3 transition-colors hover:border-primary/40">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[13px] font-medium">{t('audit.autoReport')}</span>
@@ -354,7 +489,7 @@ export default function AuditPage() {
             <div className="rounded-lg border bg-muted/30 p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[13px] font-medium">{t('audit.severityFloor')}</span>
-                <Select value={String(auditCfg.severity_floor ?? 'MEDIUM')} onValueChange={(v) => saveAudit({ op: 'set', path: ['severity_floor'], value: v })}>
+                <Select value={auditFloor} onValueChange={(v) => saveAudit({ op: 'set', path: ['severity_floor'], value: v })}>
                   <SelectTrigger className="h-8 w-44 text-xs"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="LOW">{t('audit.severityLow')}</SelectItem>
@@ -404,6 +539,142 @@ export default function AuditPage() {
           </div>
         </CardContent>
       </Card>
+          {/* ===== 命令拦截（W2-3）：模式 / 通道 / 规则 / 白名单 + 残留风险 ===== */}
+          <Card className="border bg-card shadow-[var(--shadow-card)]">
+            <CardHeader className="flex-row items-center gap-2 space-y-0">
+              <Ban className="h-5 w-5 text-primary" />
+              <div>
+                <CardTitle className="text-sm font-semibold">{t('audit.cmd.title')}</CardTitle>
+                <p className="mt-0.5 text-xs text-muted-foreground">{t('audit.cmd.desc')}</p>
+              </div>
+              <Badge variant="outline" className="ml-auto shrink-0 text-xs">
+                {cmdMode === 'observe' ? t('audit.cmd.modeObserve')
+                  : cmdMode === 'rewrite' ? t('audit.cmd.modeRewrite') : t('audit.cmd.modeBlock')}
+              </Badge>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="rounded-lg border bg-muted/30 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[13px] font-medium">{t('audit.cmd.mode')}</span>
+                    <Select value={cmdMode} onValueChange={(v) => saveCmdBlock({ op: 'set', path: ['mode'], value: v })}>
+                      <SelectTrigger className="h-8 w-40 text-xs"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="observe">{t('audit.cmd.modeObserve')}</SelectItem>
+                        <SelectItem value="rewrite">{t('audit.cmd.modeRewrite')}</SelectItem>
+                        <SelectItem value="block">{t('audit.cmd.modeBlock')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {/* 模式后果写清楚（含 block 在流式/非流式下的差异）——UI 承诺必须等于行为 */}
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    {cmdMode === 'observe' ? t('audit.cmd.modeObserveDesc')
+                      : cmdMode === 'rewrite' ? t('audit.cmd.modeRewriteDesc') : t('audit.cmd.modeBlockDesc')}
+                  </p>
+                </div>
+                <div className="rounded-lg border bg-muted/30 p-3">
+                  <div className="text-[13px] font-medium">{t('audit.cmd.channels')}</div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-4">
+                    {([['tool', t('audit.cmd.channelTool')], ['text', t('audit.cmd.channelText')]] as [string, string][]).map(([ch, label]) => (
+                      <label key={ch} className="flex cursor-pointer items-center gap-2 text-xs">
+                        <Switch checked={cmdChannels.includes(ch)} onCheckedChange={(v) => toggleCmdChannel(ch, v)} className="scale-90" />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                  {cmdChannels.includes('text') && (
+                    <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-500">{t('audit.cmd.channelTextWarn')}</p>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{t('audit.cmd.patterns')}</span>
+                  <span className="text-[11px] text-muted-foreground">{t('audit.cmd.ruleHint')}</span>
+                  <Button
+                    size="sm" variant="outline" className="ml-auto h-7 gap-1 text-xs"
+                    onClick={() => { setCmdError(''); setCmdDraft({ id: '', label: '', regex: '', builtin: false }) }}
+                  >
+                    <Plus className="h-3.5 w-3.5" />{t('audit.cmd.addRule')}
+                  </Button>
+                </div>
+                <div className="space-y-1.5">
+                  {cmdPatterns.length === 0 && (
+                    <p className="rounded-lg border border-dashed py-4 text-center text-xs text-muted-foreground">
+                      {t('audit.cmd.deletedHint')}
+                    </p>
+                  )}
+                  {cmdPatterns.map((p) => (
+                    <div key={p.id ?? p.regex} className="flex items-start gap-2 rounded-lg border bg-muted/20 p-2">
+                      <Switch
+                        checked={!!p.enabled} className="mt-0.5 scale-75"
+                        onCheckedChange={(v) => saveCmdPatterns(cmdPatterns.map((x) => (x.id === p.id ? { ...x, enabled: v } : x)))}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs font-medium">{p.label || p.id}</span>
+                          {p.builtin && <Badge variant="outline" className="text-[10px]">{t('audit.cmd.builtin')}</Badge>}
+                        </div>
+                        <code className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground" title={p.regex}>{p.regex}</code>
+                      </div>
+                      <Button
+                        size="sm" variant="ghost" className="h-6 shrink-0 px-1.5 text-[11px]"
+                        onClick={() => { setCmdError(''); setCmdDraft({ id: p.id ?? '', label: p.label, regex: p.regex, builtin: !!p.builtin }) }}
+                      >{t('audit.cmd.edit')}</Button>
+                      <Button
+                        size="sm" variant="ghost" className="h-6 shrink-0 px-1.5 text-[11px] text-destructive hover:text-destructive"
+                        onClick={() => saveCmdPatterns(cmdPatterns.filter((x) => x.id !== p.id))}
+                      >{t('audit.cmd.delete')}</Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{t('audit.cmd.allow')}</span>
+                  <span className="text-[11px] text-muted-foreground">{t('audit.cmd.allowHint')}</span>
+                </div>
+                <div className="space-y-1.5">
+                  {cmdAllow.map((rx, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        className="h-8 font-mono text-xs" defaultValue={rx}
+                        onBlur={(e) => {
+                          const v = e.target.value.trim()
+                          if (v === rx) return
+                          const next = cmdAllow.map((x, j) => (j === i ? v : x)).filter(Boolean)
+                          void saveCmdBlock({ op: 'set', path: ['allow_patterns'], value: next })
+                        }}
+                      />
+                      <Button
+                        size="sm" variant="ghost" className="h-7 shrink-0 px-2 text-[11px] text-destructive hover:text-destructive"
+                        onClick={() => saveCmdBlock({ op: 'set', path: ['allow_patterns'], value: cmdAllow.filter((_, j) => j !== i) })}
+                      >{t('audit.cmd.delete')}</Button>
+                    </div>
+                  ))}
+                  <div className="flex items-center gap-2">
+                    <Input
+                      className="h-8 font-mono text-xs" value={cmdAllowDraft}
+                      placeholder={t('audit.cmd.allowPh')}
+                      onChange={(e) => setCmdAllowDraft(e.target.value)}
+                    />
+                    <Button
+                      size="sm" variant="outline" className="h-7 shrink-0 gap-1 text-xs"
+                      disabled={!cmdAllowDraft.trim()}
+                      onClick={() => {
+                        void saveCmdBlock({ op: 'list_add', path: ['allow_patterns'], value: [cmdAllowDraft.trim()] })
+                        setCmdAllowDraft('')
+                      }}
+                    ><Plus className="h-3.5 w-3.5" />{t('audit.cmd.addAllow')}</Button>
+                  </div>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-muted-foreground">{t('audit.cmd.risk')}</p>
+            </CardContent>
+          </Card>
         </TabsContent>
 
         <TabsContent value="events" className="space-y-4 pt-2">
@@ -582,6 +853,66 @@ export default function AuditPage() {
         </CardContent>
       </Card>
         </TabsContent>
+
+        <TabsContent value="timeline" className="space-y-4 pt-2">
+          {/* 高风险操作时间线（W2-5）：**视图级**放宽 to floor=LOW，且只看 S9 危险动作。
+              不新建页面/表；默认事件视图仍按用户档位过滤，切回来事件数不增加。 */}
+          <div className="flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-2.5 text-xs text-muted-foreground">
+            <Info className="h-4 w-4 shrink-0 text-amber-500" />
+            <span>{t('audit.timelineHint')}</span>
+          </div>
+          <Card className="border bg-card shadow-[var(--shadow-card)]">
+            <CardContent className="p-4">
+              <div className="mb-3 flex items-center gap-2">
+                <Radar className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-semibold">{t('audit.timelineTitle')}</span>
+                <Badge variant="outline" className="ml-auto text-xs">
+                  {timelineData?.count ?? 0} {t('audit.countSuffix')}
+                </Badge>
+              </div>
+              {timelineLoading && timelineEvents.length === 0 ? (
+                <div className="space-y-2">
+                  {[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}
+                </div>
+              ) : timelineError ? (
+                /* 读失败与「零发现」必须视觉可分（同审计 L6 的口径） */
+                <div className="py-10 text-center text-xs text-muted-foreground">
+                  <HelpCircle className="mx-auto mb-2 h-6 w-6 text-destructive/70" />
+                  {t('audit.loadFailTitle')}
+                </div>
+              ) : timelineEvents.length === 0 ? (
+                <div className="py-10 text-center text-xs text-muted-foreground">
+                  <Radar className="mx-auto mb-3 h-8 w-8 text-muted-foreground/50" />
+                  {t('audit.timelineEmpty')}
+                </div>
+              ) : (
+                <ol className="relative space-y-3 border-l border-border pl-4">
+                  {timelineEvents.map((ev) => {
+                    const sev = severityMeta(ev.severity)
+                    return (
+                      <li
+                        key={ev.seq}
+                        className="relative cursor-pointer"
+                        onClick={() => setDetailEvent(ev)}
+                        title={t('common.viewDetail')}
+                      >
+                        <span className="absolute -left-[21px] top-1.5 h-2 w-2 rounded-full bg-amber-500" />
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Badge variant="outline" className={cn('rounded-full text-[11px]', sev.cls)}>{t(sev.labelKey)}</Badge>
+                          <span className="text-xs text-muted-foreground">{dayjs(ev.ts * 1000).format('MM-DD HH:mm:ss')}</span>
+                          {ev.host ? <span className="text-xs text-muted-foreground">{ev.host}</span> : null}
+                        </div>
+                        <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-muted/60 p-2 font-mono text-[11px] leading-relaxed text-foreground">
+                          {ev.evidence || '—'}
+                        </pre>
+                      </li>
+                    )
+                  })}
+                </ol>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
       </Tabs>
 
       {/* 审计事件详情弹窗（共用组件：审计中心与日志页同款） */}
@@ -610,6 +941,41 @@ export default function AuditPage() {
         </DialogContent>
       </Dialog>
 
+      {/* 命令拦截规则新增/修改弹窗（W2-3） */}
+      <Dialog open={cmdDraft !== null} onOpenChange={(v) => { if (!v) { setCmdDraft(null); setCmdError('') } }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{cmdDraft?.id ? t('audit.cmd.editRule') : t('audit.cmd.addRule')}</DialogTitle>
+            <DialogDescription>{t('audit.cmd.ruleHint')}</DialogDescription>
+          </DialogHeader>
+          {cmdDraft && (
+            <div className="space-y-3">
+              <div>
+                <Label className="text-xs">{t('audit.cmd.label')}</Label>
+                <Input
+                  className="mt-1 h-8 text-xs" value={cmdDraft.label}
+                  placeholder={t('audit.cmd.labelPh')}
+                  onChange={(e) => setCmdDraft({ ...cmdDraft, label: e.target.value })}
+                />
+              </div>
+              <div>
+                <Label className="text-xs">{t('audit.cmd.regex')}</Label>
+                <Input
+                  className="mt-1 h-8 font-mono text-xs" value={cmdDraft.regex}
+                  placeholder={"rm\\s+-rf\\s+/"}
+                  onChange={(e) => { setCmdError(''); setCmdDraft({ ...cmdDraft, regex: e.target.value }) }}
+                />
+              </div>
+              {cmdError && <p className="text-[11px] text-destructive">{cmdError}</p>}
+            </div>
+          )}
+          <DialogFooter>
+            <Button size="sm" variant="outline" onClick={() => { setCmdDraft(null); setCmdError('') }}>{t('common.cancel')}</Button>
+            <Button size="sm" onClick={submitCmdDraft} disabled={!cmdDraft?.regex.trim()}>{t('common.save')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* 主动审计确认弹窗 */}
       <Dialog open={confirmAudit} onOpenChange={setConfirmAudit}>
         <DialogContent className="max-w-md">
@@ -619,6 +985,13 @@ export default function AuditPage() {
               {tf('settings.confirm.auditDesc', { name: auditUpstream || t('settings.advanced.selectedUpstream') })}
             </DialogDescription>
           </DialogHeader>
+          {/* 主动探针关闭时要说清后果（W1-4）：否则用户只会在跑完才发现
+              「我的安全设置被改了」——临时改也必须是明示的。 */}
+          {!auditCfg.active_probes && (
+            <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-500">
+              {t('settings.confirm.auditTempProbes')}
+            </p>
+          )}
           <DialogFooter>
             <Button size="sm" variant="outline" onClick={() => setConfirmAudit(false)}>{t('common.cancel')}</Button>
             <Button size="sm" variant="destructive" onClick={() => {

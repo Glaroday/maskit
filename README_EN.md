@@ -88,6 +88,8 @@ When using **Cursor, Claude Code, Codex, Pi, OpenCode, ChatGPT, or any AI coding
 ### 📊 6. Real-time Logs, Security Audit & Cost Tracking
 - Inspect full request/response diffs with one-click highlight mode;
 - **Passive Security Audit & Prompt Injection Detection**: Monitors upstream model responses and detects prompt extraction attempts, credential exfiltration instructions, and destructive command patterns;
+- **Dangerous Command Interception (opt-in, record-only by default)**: Flags model-issued commands such as `rm -rf /`, `mkfs`, `DROP DATABASE` and fork bombs into the Risky-action timeline. By default it neither rewrites nor blocks (zero byte change); you can switch to "rewrite with a harmless notice" or "block", and define custom rules plus an allow list. **Literal shapes only** (`a=rm; $a`, or writing the command into a script, will slip through) — a safety net, not a vault.
+- **Command interception scope (stated as-is)**: detection only looks at the **tool-argument channel** — the arguments of `Write`/`Edit` (i.e. the content about to be written to a file) are on that channel too, so writing `DROP TABLE users` into a `.sql` migration matches as well; browser-extension traffic (ChatGPT / Claude web) does **not** go through command interception; in "block" mode only the **selected channels** stop streaming (unselected channels keep flowing) and non-streaming responses are replaced with a 503.
 - Live token usage & model pricing cost estimation.
 
 ---

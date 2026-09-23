@@ -54,7 +54,126 @@ function Stop-RunningApp {
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
     }
-    Start-Sleep -Seconds 1
+    [void](Wait-AppExited)
+}
+
+# ── 替换阶段的安全底座（2026-09-22 停机事故修复）─────────────────────────
+# 事故复盘：Stop-RunningApp 只 `Start-Sleep -Seconds 1` 就去 `Remove-Item -Recurse`
+# 引擎目录，Windows 上 exe 句柄往往还没释放 → 删除抛错（$ErrorActionPreference="Stop"）
+# → 脚本在「替换」中途中止；而 Start-App 是脚本**最后一行**，中止后再没执行
+# → 客户端与引擎被留在停机状态（实测约 16 分钟不可用，用户视角就是「程序炸了」）。
+# 三处加固，缺一不可：
+#   ① 等进程**真的退出**（Stop-Process 返回 ≠ 句柄已释放）——Wait-AppExited；
+#   ② 删除/覆盖**退避重试**（占用是暂时态）——Remove-PathWithRetry / Copy-FileWithRetry；
+#   ③ 替换段包在 try/finally 里：**失败也一定把客户端拉回来**，并尽力回滚备份
+#      ——Invoke-SwapGuarded；同时把「先删后拷」改成「先落到旁边暂存再换名就位」，
+#      让「安装目录里没有引擎」的窗口缩短成一次重命名，拷贝失败时旧引擎还在。
+
+# 等 Maskit 相关进程真正退出；返回是否在超时前全部退出。
+function Wait-AppExited {
+    param([int]$TimeoutSec = 20)
+    $names = @("Maskit", "MaskitEngine", "LLMShield", "llm-shield", "LLMShieldEngine")
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $alive = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
+        $md = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -eq "mitmdump.exe" -and $_.CommandLine -like "*transparent.py*" })
+        if ($alive.Count -eq 0 -and $md.Count -eq 0) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    Write-Warning "等待进程退出超时（$TimeoutSec 秒）；继续尝试替换（可能因句柄未释放而失败）"
+    return $false
+}
+
+# 删除目录/文件：被占用的句柄是**暂时态**，退避重试能过；仍失败才抛错。
+function Remove-PathWithRetry {
+    param([Parameter(Mandatory)][string]$Path, [int]$TimeoutSec = 20)
+    if (-not (Test-Path $Path)) { return }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $last = ""
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        try {
+            Remove-Item -Recurse -Force $Path -ErrorAction Stop
+            return
+        } catch {
+            $last = $_.Exception.Message
+            Start-Sleep -Milliseconds 400
+        }
+    }
+    throw "删除失败（重试 $TimeoutSec 秒仍被占用）：$Path | $last"
+}
+
+# 覆盖单个文件：同样重试（例如客户端被看门狗拉起，Maskit.exe 又被占用）。
+function Copy-FileWithRetry {
+    param([Parameter(Mandatory)][string]$Source,
+          [Parameter(Mandatory)][string]$Destination,
+          [int]$TimeoutSec = 20)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $last = ""
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        try {
+            Copy-Item -Path $Source -Destination $Destination -Force -ErrorAction Stop
+            return
+        } catch {
+            $last = $_.Exception.Message
+            Start-Sleep -Milliseconds 400
+        }
+    }
+    throw "覆盖文件失败（重试 $TimeoutSec 秒仍被占用）：$Destination | $last"
+}
+
+# 把「引擎产物目录」装到目标位置：**先落到 $Dest.new 暂存，再换名就位**。
+# 与旧的「先 Remove-Item 目标目录再拷」相比：拷贝失败时目标目录毫发无损
+# （旧写法的中间态是「安装目录里没有引擎」——那才是真把程序搞坏）。
+function Install-EngineDir {
+    param([Parameter(Mandatory)][string]$SourceDir, [Parameter(Mandatory)][string]$DestDir)
+    $stage = "$DestDir.new"
+    Remove-PathWithRetry $stage
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    Copy-Item -Recurse (Join-Path $SourceDir "_internal") (Join-Path $stage "_internal")
+    Copy-Item (Join-Path $SourceDir "MaskitEngine.exe") (Join-Path $stage "MaskitEngine.exe")
+    if (-not (Test-Path (Join-Path $stage "MaskitEngine.exe"))) {
+        throw "暂存目录缺少 MaskitEngine.exe：$stage"
+    }
+    Remove-PathWithRetry $DestDir
+    Move-Item -Path $stage -Destination $DestDir
+    if (-not (Test-Path (Join-Path $DestDir "MaskitEngine.exe"))) {
+        throw "替换后校验失败，缺少 $DestDir\MaskitEngine.exe"
+    }
+}
+
+# 从备份回滚（尽力而为；没备份要明确告警，不能让异常吞掉这条信息）。
+function Restore-FromBackup {
+    if (-not (Test-Path $BackupDir)) {
+        Write-Warning "没有可用备份，无法回滚：$BackupDir"
+        return $false
+    }
+    Write-Host "正在从备份回滚 -> $TargetDir..." -ForegroundColor Yellow
+    Copy-FileWithRetry (Join-Path $BackupDir "Maskit.exe") (Join-Path $TargetDir "Maskit.exe")
+    Install-EngineDir -SourceDir (Join-Path $BackupDir "resources\engine") -DestDir (Join-Path $TargetDir "resources\engine")
+    Write-Host "✓ 已回滚到备份版本" -ForegroundColor Green
+    return $true
+}
+
+# 替换段的统一守卫：无论成功还是异常，**都保证客户端被拉起**（除非 -NoRestart）。
+# 这是本次事故的核心修复——旧脚本把 Start-App 放在最后一行，中途抛错
+# 用户得到的就是一台被停掉的客户端，而不是「失败但还能用」。
+function Invoke-SwapGuarded {
+    param([Parameter(Mandatory)][scriptblock]$Action,
+          [string]$Label = "替换安装文件",
+          [switch]$NoRollback)
+    try {
+        & $Action
+    } catch {
+        Write-Warning "$Label 失败：$($_.Exception.Message)"
+        if (-not $NoRollback) {
+            Write-Warning "尝试从备份回滚（$BackupDir）..."
+            try { [void](Restore-FromBackup) } catch { Write-Warning "回滚也失败：$($_.Exception.Message)" }
+        }
+        throw
+    } finally {
+        if (-not $NoRestart) { Start-App }
+    }
 }
 
 # 启动应用程序
@@ -76,13 +195,13 @@ if ($Restore) {
     }
     Write-Host "正在执行一键回滚..." -ForegroundColor Cyan
     Stop-RunningApp
-    
-    # 将备份目录覆盖回安装目录
-    Copy-Item -Path "$BackupDir\*" -Destination $TargetDir -Recurse -Force
-    Write-Host "✓ 已成功回滚至备份版本！" -ForegroundColor Green
-    if (-not $NoRestart) {
-        Start-App
+
+    # 逐个文件装回去（-NoRollback：回滚本身就是目的地，没有更早的版本可退）
+    Invoke-SwapGuarded -Label "回滚" -NoRollback {
+        Copy-FileWithRetry (Join-Path $BackupDir "Maskit.exe") (Join-Path $TargetDir "Maskit.exe")
+        Install-EngineDir -SourceDir (Join-Path $BackupDir "resources\engine") -DestDir (Join-Path $TargetDir "resources\engine")
     }
+    Write-Host "✓ 已成功回滚至备份版本！" -ForegroundColor Green
     exit 0
 }
 
@@ -185,22 +304,16 @@ if (-not $Full) {
         exit 1
     }
 
-    # 停止进程并替换
+    # 停止进程并替换（守卫内执行：失败也一定把客户端拉回来，见 Invoke-SwapGuarded）
     Stop-RunningApp
 
     $destEngine = Join-Path $TargetDir "resources\engine"
     Write-Host "正在替换引擎文件 -> $destEngine..." -ForegroundColor Cyan
-    if (Test-Path $destEngine) {
-        Remove-Item -Recurse -Force $destEngine
+    Invoke-SwapGuarded -Label "引擎替换到安装目录" {
+        Install-EngineDir -SourceDir (Join-Path $Root "dist_engine\MaskitEngine") -DestDir $destEngine
     }
-    New-Item -ItemType Directory -Force -Path $destEngine | Out-Null
-    Copy-Item -Recurse "dist_engine\MaskitEngine\_internal" "$destEngine\_internal"
-    Copy-Item "dist_engine\MaskitEngine\MaskitEngine.exe" "$destEngine\MaskitEngine.exe"
 
     Write-Host "✓ 引擎更新完成！" -ForegroundColor Green
-    if (-not $NoRestart) {
-        Start-App
-    }
     Write-Host "`n=== 本地极速更新成功！耗时约 20 秒 ===" -ForegroundColor Green
     exit 0
 }
@@ -227,12 +340,10 @@ $pyiExit = $LASTEXITCODE
 $ErrorActionPreference = $oldEAP
 if ($pyiExit -ne 0) { Write-Error "PyInstaller 打包失败"; exit 1 }
 
-# 3. 同步到 Tauri 打包源目录
-$srcEngine = "src-tauri\resources\engine"
-if (Test-Path $srcEngine) { Remove-Item -Recurse -Force $srcEngine }
-New-Item -ItemType Directory -Force -Path $srcEngine | Out-Null
-Copy-Item -Recurse "dist_engine\MaskitEngine\_internal" "$srcEngine\_internal"
-Copy-Item "dist_engine\MaskitEngine\MaskitEngine.exe" "$srcEngine\MaskitEngine.exe"
+# 3. 同步到 Tauri 打包源目录（复用 Install-EngineDir：带占用重试 + 暂存换名，
+#    避免源目录被删到一半；此处客户端仍在运行，失败也只影响构建，不影响你的安装）
+$srcEngine = Join-Path $Root "src-tauri\resources\engine"
+Install-EngineDir -SourceDir (Join-Path $Root "dist_engine\MaskitEngine") -DestDir $srcEngine
 
 # 4. 构建 Tauri 壳
 Write-Host "构建 Tauri 桌面客户端..." -ForegroundColor Yellow
@@ -261,25 +372,20 @@ if ($proc.ExitCode -ne 0) {
     exit 1
 }
 
-# 5. 替换到本地安装目录
+# 5. 替换到本地安装目录（守卫内执行：失败也一定把客户端拉回来，见 Invoke-SwapGuarded）
 Stop-RunningApp
 Write-Host "正在替换安装目录全部文件 -> $TargetDir..." -ForegroundColor Cyan
-Copy-Item -Path "src-tauri\target\release\Maskit.exe" -Destination "$TargetDir\Maskit.exe" -Force
-
 $destEngine = Join-Path $TargetDir "resources\engine"
-if (Test-Path $destEngine) { Remove-Item -Recurse -Force $destEngine }
-New-Item -ItemType Directory -Force -Path $destEngine | Out-Null
-Copy-Item -Recurse "dist_engine\MaskitEngine\_internal" "$destEngine\_internal"
-Copy-Item "dist_engine\MaskitEngine\MaskitEngine.exe" "$destEngine\MaskitEngine.exe"
+Invoke-SwapGuarded -Label "全量替换到安装目录" {
+    Copy-FileWithRetry (Join-Path $Root "src-tauri\target\release\Maskit.exe") (Join-Path $TargetDir "Maskit.exe")
+    Install-EngineDir -SourceDir (Join-Path $Root "dist_engine\MaskitEngine") -DestDir $destEngine
+}
 
 Write-Host "✓ 全量更新完成！" -ForegroundColor Green
 
-# 6. 打包最新浏览器扩展
+# 6. 打包最新浏览器扩展（客户端已在守卫的 finally 里拉起，扩展打包与它无关）
 Write-Host "`n打包最新浏览器扩展..." -ForegroundColor Yellow
 & $py313 scripts\pack-extension.py
 Write-Host "扩展打包完成（dist_extension 目录）" -ForegroundColor Cyan
 
-if (-not $NoRestart) {
-    Start-App
-}
 Write-Host "`n=== 本地全量部署成功！已成功应用全部前端与客户端改动 ===" -ForegroundColor Green

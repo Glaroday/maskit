@@ -24,6 +24,13 @@ import math
 import re
 from urllib.parse import urlsplit
 
+# 共享常量（纯 stdlib 模块，不引入 mitmproxy）：分档标记同时被 event_store 的
+# 读侧降噪谓词引用（`[疑似真实凭据]` 是真阳性的保护标记），必须单一定义源。
+from credential_labels import (
+    CREDENTIAL_ECHO_REAL_MARKER,
+    CREDENTIAL_ECHO_SAMPLE_MARKER,
+)
+
 # ========== 严重度 ==========
 CRITICAL = "CRITICAL"
 HIGH = "HIGH"
@@ -726,6 +733,32 @@ def _split_code_blocks(text):
     return parts
 
 
+def _code_block_ranges(text):
+    """扫描 ``` 围栏，返回代码块在原文里的**字符区间** [(start, end)]。
+
+    与 `_split_code_blocks` 同源，但产出绝对偏移：判断「某个正则命中是否落在代码块内」
+    必须知道位置，而 `_split_code_blocks` 只给文本片段（拼回原文时偏移已丢失）。
+    围栏行本身（```与闭合围栏）算作块内：紧邻围栏的命令行同样属于示例。
+    未闭合的围栏视为一直延伸到文末（与 `_split_code_blocks` 的语义一致）。
+    """
+    ranges = []
+    pos = 0
+    start = None
+    for line in (text or "").split("\n"):
+        line_start = pos
+        # +1 = 被 split 吃掉的换行符（末行没有，多算一位不影响区间包含判定）
+        pos += len(line) + 1
+        if line.strip().startswith("```"):
+            if start is None:
+                start = line_start
+            else:
+                ranges.append((start, line_start + len(line)))
+                start = None
+    if start is not None:
+        ranges.append((start, pos))
+    return ranges
+
+
 # ========== 凭据检测正则（复用 transparent.RULES 的形态，但纯 stdlib 不依赖 mitmproxy）==========
 # 审计规则专项 P2：响应侧凭据回流扫描——恶意 relay 回显其他用户 key/模型幻觉出看似真实的 key。
 _CREDENTIAL_PATTERNS = [
@@ -738,6 +771,16 @@ _CREDENTIAL_PATTERNS = [
     (re.compile(r"AKIA[A-Z0-9]{16}"), "aws_ak"),
     (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "jwt"),
 ]
+
+
+def credential_echo_kinds():
+    """本模块实际产出的凭据回流 kind（顺序与 `_CREDENTIAL_PATTERNS` 一致）。
+
+    event_store 的读侧降噪谓词按 kind 名拼接 LIKE 前缀，两边各写一遍必然漂移；
+    kind 名单的唯一定义源是 `credential_labels.CREDENTIAL_ECHO_KINDS`，
+    由 `tests/test_audit.py::test_credential_echo_kinds_stay_in_sync` 守死一致。
+    """
+    return tuple(kind for _rx, kind in _CREDENTIAL_PATTERNS)
 
 
 def _url_evidence(url, payload_length):
@@ -842,16 +885,36 @@ def scan_response_poison(text, request_text=None):
 
     # 凭据回流扫描（审计规则专项 P2）：检测回复中出现 API key/token/JWT 形态的串。
     # 场景：恶意 relay 回显其他用户 key（钓鱼/嫁祸），或模型幻觉出看似真实的 key。
+    #
+    # ⚠️ 分级降档（W1-1，2026-09-22 审批）：本规则**无法区分真实凭据与教学示例**——
+    # 编程助手在代码块里写 `.env` 模板、CI 密钥示例是家常便饭，实测生产库这类命中
+    # 以 MEDIUM 灌满审计页，还被套上「响应投毒 / Unicode 控制符」的文案解释，
+    # 用户读到的是「我被攻击了」。故按**客观结构**分档，既不删规则、也不判意图：
+    #   · 代码块内 或 低熵（短串/有序序列/Shannon 熵 <= 阈值） → LOW  + [示例形态]
+    #     （默认 floor=MEDIUM 下不入库；门槛调到 LOW 仍可查，不丢可查性）
+    #   · 其余（非代码块 + 高熵）                            → MEDIUM + [疑似真实凭据]
+    # 与 S9 同哲学：形态可判、意图不可判 → 示例形态只记不报，真阳性照旧可见。
+    code_ranges = _code_block_ranges(text) if text else []
     for rx, kind in _CREDENTIAL_PATTERNS:
         for m in rx.finditer(text):
             # 请求里本来就有这串 = 用户自己发上去的 key 被原样回显，不是「回流」。
             # 这种情况归 S1 error_leak 管（它专门看 4xx/5xx 的报错体）。
             if request_text and m.group() in request_text:
                 continue
+            value = m.group()
+            in_code = any(s <= m.start() < e for s, e in code_ranges)
+            is_sample = (
+                in_code
+                or len(value) < _ENV_VALUE_MIN_LEN
+                or _is_ordered_seq(value)
+                or _value_entropy(value) <= _ENV_VALUE_MIN_ENTROPY
+            )
             results.append({
                 "signal": "response_poison",
-                "severity": MEDIUM,
-                "evidence": _redact_evidence(m.group(), kind),
+                "severity": LOW if is_sample else MEDIUM,
+                "evidence": (_redact_evidence(value, kind)
+                             + (f" {CREDENTIAL_ECHO_SAMPLE_MARKER}" if is_sample
+                                else f" {CREDENTIAL_ECHO_REAL_MARKER}")),
                 "kind": f"credential_echo:{kind}",
             })
 

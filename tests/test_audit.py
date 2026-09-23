@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "engine"))
 sys.path.insert(0, str(ROOT))
 
 import audit_signals as sig
+import credential_labels as markers
 import event_store
 
 
@@ -451,11 +452,102 @@ class DedupeAndEchoTests(unittest.TestCase):
         self.assertNotIn("destructive_fs", kinds)
 
     def test_credential_echo_suppressed_when_in_request(self):
-        """自己发上去的 key 被原样回显不是「回流」，那是 S1 error_leak 的活。"""
+        """自己发上去的 key 被原样回显不是「回流」，那是 S1 error_leak 的活。
+
+        W1-1 后该样本（`ghp_` + 30 个 `a`，低熵）**契约变更**：仍会被检出（不丢可查性），
+        但档位降为 LOW 并带 `[示例形态]` —— 默认 floor=MEDIUM 下不再入库，
+        免得把示例值刷成「响应投毒」。
+        """
         key = "ghp_" + "a" * 30
         body = f"你的令牌 {key} 已失效"
-        self.assertTrue(sig.scan_response_poison(body))
+        hits = sig.scan_response_poison(body)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], sig.LOW)
+        self.assertIn(markers.CREDENTIAL_ECHO_SAMPLE_MARKER, hits[0]["evidence"])
         self.assertEqual(sig.scan_response_poison(body, request_text=f"用 {key} 试试"), [])
+
+
+class CredentialEchoTierTests(unittest.TestCase):
+    """W1-1：凭据回流按**客观结构**（代码块内 / 值熵）分档，不删规则、不判意图。
+
+    误报源（2026-09-22 截图）：编程助手在代码块里写 `.env` 模板 / CI 密钥示例，
+    被 MEDIUM 报成「响应投毒」。分档后示例形态降为 LOW（默认不入库），
+    真阳性（非代码块 + 高熵）仍是 MEDIUM 并带反向标记，绝不被读侧降噪误吞。
+    """
+
+    # 高熵样本：`ghp_` + 36 位混合大小写/数字，Shannon 熵 > 3.0
+    HIGH_ENTROPY = "ghp_" + "aB3xK9mQ2pL7zR4tY6wN1vC8sD5fG0hJ2kM4"
+
+    def _one(self, text):
+        hits = [f for f in sig.scan_response_poison(text)
+                if f["kind"] == "credential_echo:github_token"]
+        self.assertEqual(len(hits), 1, text)
+        return hits[0]
+
+    def test_code_block_hit_is_sample_tier(self):
+        """① 代码块内高熵串 → LOW（示例形态）。讲解 .env 模板是最典型的真实场景。"""
+        text = "配置示例：\n```bash\nexport GH_TOKEN=" + self.HIGH_ENTROPY + "\n```\n"
+        hit = self._one(text)
+        self.assertEqual(hit["severity"], sig.LOW)
+        self.assertIn(markers.CREDENTIAL_ECHO_SAMPLE_MARKER, hit["evidence"])
+
+    def test_low_entropy_outside_code_block_is_sample_tier(self):
+        """② 代码块外低熵（'a'*30）→ LOW。熵不够就不算真凭据，但保留可查性。"""
+        hit = self._one("你的令牌 ghp_" + "a" * 30 + " 已失效")
+        self.assertEqual(hit["severity"], sig.LOW)
+        self.assertIn(markers.CREDENTIAL_ECHO_SAMPLE_MARKER, hit["evidence"])
+
+    def test_ordered_sequence_exclusion_is_applied_to_the_matched_value(self):
+        """有序序列排除用的是既有 `_is_ordered_seq`（判定「**整个值**落在字母/数字表内」）。
+
+        带 `ghp_` 前缀 + 字母表的串不会命中该分支（前缀让它不再「整值有序」），
+        只能靠 Shannon 熵兜底，而这类串的熵确实高于阈值 → 仍留在 MEDIUM。
+        这是**刻意的保守取向**：分档只降「确凿的示例形态」（代码块内 / 低熵），
+        模糊形态宁可留在默认视图里可见，也不为了降噪把它藏起来。
+        """
+        self.assertTrue(sig._is_ordered_seq("abcdefghijklmnopqrstuvwxyz"))
+        self.assertFalse(sig._is_ordered_seq(self.HIGH_ENTROPY))
+
+    def test_short_value_outside_code_block_is_sample_tier(self):
+        """长度低于凭据值下限（20）→ LOW，即使它看起来「高熵」。
+
+        用 Slack 形态（`xox[bpsa]-` + 10 字符，共 15 字）构造：先断言其熵确实
+        高于阈值，才能证明降档是由**长度分支**触发的，而不是碰巧被熵判掉。
+        """
+        value = "xoxb-aB3xK9mQ2p"
+        self.assertLess(len(value), sig._ENV_VALUE_MIN_LEN)
+        self.assertGreater(sig._value_entropy(value), sig._ENV_VALUE_MIN_ENTROPY)
+        hits = [f for f in sig.scan_response_poison("例子：" + value)
+                if f["kind"] == "credential_echo:slack_token"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], sig.LOW)
+
+    def test_high_entropy_outside_code_block_is_real_tier(self):
+        """③ 代码块外高熵 → MEDIUM 且带 `[疑似真实凭据]`（真阳性必须照旧可见）。"""
+        hit = self._one("刚刚你的令牌 " + self.HIGH_ENTROPY + " 被上游回显了")
+        self.assertEqual(hit["severity"], sig.MEDIUM)
+        self.assertIn(markers.CREDENTIAL_ECHO_REAL_MARKER, hit["evidence"])
+
+    def test_position_is_decided_per_hit_not_per_text(self):
+        """④ 位置判据必须**逐命中**生效：代码块豁免绝不能扩成整段豁免。
+
+        否则「代码块里写过一次示例」会让同一回复里正文中的真凭据一起降档——
+        那才是真正的漏报。
+        """
+        text = ("示例：\n```\nexport A=" + self.HIGH_ENTROPY + "\n```\n"
+                "而你真正的令牌 " + self.HIGH_ENTROPY.replace("xK9m", "qW7z") + " 被回显了")
+        hits = [f for f in sig.scan_response_poison(text)
+                if f["kind"] == "credential_echo:github_token"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual([h["severity"] for h in hits], [sig.LOW, sig.MEDIUM])
+
+    def test_credential_echo_kinds_stay_in_sync(self):
+        """kind 名单的唯一定义源是 credential_labels.CREDENTIAL_ECHO_KINDS。
+
+        event_store 的读侧降噪谓词按 kind 名拼 LIKE 前缀：规则表加了新 kind
+        却忘了登记，历史噪音就漏隐藏；登记了却删了规则，谓词白写。
+        """
+        self.assertEqual(sig.credential_echo_kinds(), markers.CREDENTIAL_ECHO_KINDS)
 
 
 class IdentitySwapTierAndDedupeTests(unittest.TestCase):
@@ -720,3 +812,170 @@ class AuditAlertCaliberTests(unittest.TestCase):
 
     def test_audit_high_count_never_raises_on_empty_db(self):
         self.assertEqual(event_store._audit_high_count(0), 0)
+
+
+class CredentialEchoReadSideFilterTests(unittest.TestCase):
+    """W1-2：凭据回流的**历史**噪音在读侧隐藏，但不删库、不误藏真阳性。
+
+    W1-1 上线前落库的 credential_echo 一律 MEDIUM 且无形态标记，是「代码块里的
+    示例值被报成响应投毒」的存量噪音——**只隐藏这种无标记的旧记录**。
+    W1-1 之后写入的两种形态都带标记、都在受保护之列：`[示例形态]`（LOW，
+    代码块内/低熵）与 `[疑似真实凭据]`（MEDIUM，非代码块 + 高熵），由
+    `_audit_visibility_filter` 的 `NOT LIKE` 保护子句守死。
+    示例形态也必须可见：分档设计承诺「门槛调到 LOW 仍可查，不丢可查性」，
+    把它一并隐藏会让用户调低门槛后一条都看不到（静默失效）。
+
+    证据样本**全部由引擎真实产出派生**（`audit_signals.scan_response_poison`），
+    不手写字符串：两侧各写一遍必然漂移——历史上正是这样让谓词按 `kind` 字段
+    （`credential_echo:<kind>`）写前缀，而 evidence 列里只有 `<kind> len=…`，
+    谓词恒不匹配、降噪静默空转。
+    """
+
+    # 非代码块 + 高熵的 GitHub token：引擎判定为真阳性形态（MEDIUM + 保护标记）。
+    _TOKEN = "ghp_" + "aB3xK9mQ2wL7pR5tY8nC4vB6sD1fG0hJ2kM9"
+    _REAL_SUFFIX = " " + markers.CREDENTIAL_ECHO_REAL_MARKER
+
+    def _engine_evidence(self):
+        """取引擎真实产出的 credential_echo 证据（不经任何手写拼接）。"""
+        text = "Here is the token you asked for: " + self._TOKEN
+        findings = sig.scan_response_poison(text)
+        ev = [f["evidence"] for f in findings
+              if str(f.get("kind", "")).startswith("credential_echo:")]
+        self.assertTrue(ev, "引擎未产出 credential_echo 证据，样本构造失败")
+        return ev[0]
+
+    def _legacy_form(self):
+        """旧形态：W1-1 之前落库的证据（真阳性产出剥掉保护标记）。"""
+        real = self._engine_evidence()
+        self.assertTrue(real.endswith(self._REAL_SUFFIX),
+                        f"真阳性证据应带保护标记，实际: {real!r}")
+        return real[: -len(self._REAL_SUFFIX)]
+
+    def _real_form(self):
+        """新真阳性形态（引擎真实产出，带保护标记）。"""
+        return self._engine_evidence()
+
+    def _sample_form(self):
+        """新的示例形态：代码块内的高熵串 → LOW + `[示例形态]`。"""
+        text = "```env\nGITHUB_TOKEN=" + self._TOKEN + "\n```"
+        findings = sig.scan_response_poison(text)
+        ev = [f["evidence"] for f in findings
+              if str(f.get("kind", "")).startswith("credential_echo:")
+              and markers.CREDENTIAL_ECHO_SAMPLE_MARKER in f["evidence"]]
+        self.assertTrue(ev, "未能构造示例形态样本")
+        return ev[0]
+
+    def setUp(self):
+        self._old_db = event_store.DB_PATH
+        self.tmp = tempfile.mkdtemp(prefix="maskit-audit-echo-")
+        event_store.DB_PATH = Path(self.tmp) / "shield-events.sqlite3"
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        event_store.DB_PATH = self._old_db
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, signal_type, severity, evidence):
+        event_store.enqueue_audit_event({
+            "signal_type": signal_type, "severity": severity, "evidence": evidence,
+            "sid": "s-echo", "host": "h", "method": "POST", "path": "/v1/chat",
+        })
+        event_store.flush_audit_queue()
+
+    def _visible_evidence(self):
+        return {e["evidence"] for e in event_store.fetch_audit_events(since=0, limit=50)}
+
+    def test_legacy_unmarked_noise_is_hidden_but_kept_in_db(self):
+        """① 旧形态（无标记）读侧不可见；② 库内原文必须还在（不删库）。
+
+        证据本体来自引擎真实产出（`_legacy_form`），不是手写常量——手写的
+        `credential_echo:<kind>` 前缀曾把这条测试变成「守着错误格式」的假绿。
+        """
+        legacy = self._legacy_form()
+        self._write("response_poison", "MEDIUM", legacy)
+        self.assertNotIn(legacy, self._visible_evidence())
+        kept = event_store.fetch_audit_events(since=0, limit=50, include_deprecated=True)
+        self.assertIn(legacy, {e["evidence"] for e in kept})
+
+    def test_real_credential_marker_is_never_hidden(self):
+        """③ 带 `[疑似真实凭据]` 的新真阳性在**真实谓词**下必须可见。
+
+        这是 W1 里唯一有「隐藏真阳性」风险的谓词，所以这一条是硬红线：
+        模式是 LIKE 前缀匹配，无法表达「以某某结尾」，保护必须显式写在 SQL 里。
+        """
+        real = self._real_form()
+        self._write("response_poison", "MEDIUM", real)
+        self.assertIn(real, self._visible_evidence())
+
+    def test_truthy_predicate_still_hides_legacy_noise(self):
+        """④ 负向对照：把谓词改成**恒真**时旧形态必须仍然被隐藏。
+
+        若过滤空转（谓词恒真 = 不过滤），本用例变红——证明上面几条「不可见」
+        确实是过滤在起作用，而不是「本来就没写进去」。
+        """
+        legacy = self._legacy_form()
+        self._write("response_poison", "MEDIUM", legacy)
+        old = event_store._DEPRECATED_AUDIT_EVIDENCE_PREFIXES
+        try:
+            event_store._DEPRECATED_AUDIT_EVIDENCE_PREFIXES = (("response_poison", "%"),)
+            self.assertNotIn(legacy, self._visible_evidence())
+        finally:
+            event_store._DEPRECATED_AUDIT_EVIDENCE_PREFIXES = old
+
+    def test_other_s6_subtypes_are_untouched(self):
+        """⑤ 同一个 signal_type（response_poison）下其他子类型不受影响。
+
+        谓词按 kind 名精确锚定，不能把 hidden_unicode / exfil_url / 注入类一起误吞。
+        """
+        others = (
+            "hidden_unicode: U+202E,U+200B (count=9) [零宽字符成规模出现]",
+            "exfil_url host=evil.example len=120 sha256=abcdef1234567890 [渲染即自动请求]",
+            "instruction_override: ignore all previous [同现载荷: exfil_url]",
+        )
+        for ev in others:
+            self._write("response_poison", "HIGH", ev)
+        visible = self._visible_evidence()
+        for ev in others:
+            self.assertIn(ev, visible)
+
+    def test_all_registered_kinds_are_covered(self):
+        """⑥ 唯一定义源里登记的每个 kind 都要有对应谓词（漏一个就漏一类历史噪音）。"""
+        covered = {p for sig_type, p in event_store._DEPRECATED_AUDIT_EVIDENCE_PREFIXES
+                   if sig_type == "response_poison"}
+        for kind in markers.CREDENTIAL_ECHO_KINDS:
+            self.assertIn(f"{kind} len=%", covered)
+
+    def test_engine_output_shape_matches_predicate(self):
+        """⑦ 端到端绑定：引擎真实产出的证据，剥掉保护标记后必须被谓词命中。
+
+        `credential_echo:<kind>` 只是扫描结果 dict 的 `kind` 字段值，而
+        `audit_events` 表没有 kind 列——谓词写成那个前缀会恒不匹配、降噪静默
+        空转（本文件曾把这个错误格式锁成契约）。这条用写入侧的真实产出验证
+        读侧谓词，两侧不再各写一遍字符串。
+        """
+        legacy = self._legacy_form()
+        kind = legacy.split(" len=", 1)[0]
+        self.assertIn(f"{kind} len=%",
+                      {p for sig_type, p in event_store._DEPRECATED_AUDIT_EVIDENCE_PREFIXES
+                       if sig_type == "response_poison"},
+                      f"引擎产出的证据前缀 {kind!r} 没有对应降噪谓词")
+        self._write("response_poison", "MEDIUM", legacy)
+        self.assertNotIn(legacy, self._visible_evidence())
+
+    def test_sample_marker_rows_stay_queryable(self):
+        """⑧ 新的 `[示例形态]` 记录必须**可见**：只降噪无标记的旧存量。
+
+        分档设计承诺「门槛调到 LOW 仍可查，不丢可查性」（见 audit_signals 的
+        分档注释）。把带标记的新记录一并隐藏，会让用户主动调低门槛后一条都
+        看不到——那是静默失效，不是降噪。
+        """
+        sample = self._sample_form()
+        self._write("response_poison", "LOW", sample)
+        self.assertIn(sample, self._visible_evidence())
+
+    def test_predicates_never_use_kind_field_prefix(self):
+        """⑨ 负向守卫：降噪谓词不得带 `credential_echo:` 前缀（本次回归的根因）。"""
+        for sig_type, pat in event_store._DEPRECATED_AUDIT_EVIDENCE_PREFIXES:
+            self.assertNotIn(
+                "credential_echo:", pat,
+                f"{sig_type} 的降噪谓词用了 kind 字段前缀，对 evidence 列必然恒不匹配: {pat!r}")

@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+### 新增 / Added
+- 审计：凭据示例不再被报成「响应投毒」（代码块/低熵形态降为仅记录），新增三档审计预设与审计阻断开关、主动探针临时启用、以及「高风险操作时间线」视图（仅该视图放宽门槛，默认视图不受影响）。
+  *Audit: credential examples are no longer reported as response poisoning (code blocks / low-entropy shapes are downgraded to record-only), plus three audit presets with a blocking switch, temporary probe enablement, and a Risky-action timeline view that relaxes the severity floor only inside that view.*
+- 审计：新增「危险命令拦截」（审计页 → 主动安全探针）——检测模型下发的删根、擦盘、删库、fork 炸弹等命令并落库到高风险操作时间线，默认只记录不改写，可切换改写或阻断，支持自定义规则与白名单。
+  *Audit: added dangerous-command interception (Audit page → Active security probe tab) — detects model-issued commands such as root deletion, disk wiping, DROP DATABASE and fork bombs into the risky-action timeline. Record-only by default, switchable to rewrite or block, with custom rules and an allow list.*
+
+### 修复 / Bug Fixes
+- 本地部署脚本：修复「替换安装文件时命中句柄占用即中止、且中止后不拉起客户端」的问题——改为等进程退出 + 删除/覆盖重试 + 引擎目录先落暂存再换名就位，并保证失败时也拉起客户端并回滚备份。
+  *Local deploy script: fixed a mid-swap abort on locked files that left the client stopped — it now waits for processes to exit, retries delete/copy, stages the engine dir before swapping it in, and always restarts the client with a backup rollback on failure.*
+- 发版流程：修复预发布版本号（`X.Y.Z-beta.N`）被过严正则误判为「版本分叉」而中止打包的问题，并让版本校验失败时回滚全部版本文件。
+  *Release: fixed prerelease versions (`X.Y.Z-beta.N`) being wrongly reported as a version mismatch due to over-strict regexes, and version-check failures now restore all version files.*
+- 发版流程：预发布判定改为「tag 含 `-` 即预发布」（不再只认 `-beta`/`-alpha`/`-rc`）。原先 `vX.Y.Z-dev` 这类 tag 会被当成正式版发布，进而产出 `latest.json` 并把 `ghcr.io/...:latest` 指向非正式构建。
+  *Release: pre-release detection now treats any tag containing `-` as a pre-release (instead of only `-beta`/`-alpha`/`-rc`). Previously a tag like `vX.Y.Z-dev` was published as a stable release, producing `latest.json` and repointing `ghcr.io/...:latest` at an unreleased build.*
+
 ### 优化 / Changed
 - 文档：修正对外能力表述——扩展站点支持改为「ChatGPT / Claude / DeepSeek 三站已实测」，附件脱敏补充「未适配站点文件本体不脱敏并弹窗提示」，规则库写明「21 类中默认开启 7 类」，NER 标注默认关闭，并说明「引擎不可用时明文直通＝不脱敏」。
   *Docs: corrected capability claims — extension site support now states the three verified sites, attachment masking notes unmasked files on unsupported sites with a popup warning, the rule library states that 7 of 21 rules are on by default, NER is marked off by default, and "engine down = unmasked passthrough" is documented.*

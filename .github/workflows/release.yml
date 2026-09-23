@@ -96,7 +96,12 @@ jobs:
           tags: |
             type=ref,event=tag
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-rc') }}
+            # `latest` 别名只给正式版：tag 里出现 `-` 就是预发布（正式版约定是纯 vX.Y.Z）。
+            # 不要枚举 -beta/-alpha/-rc —— 版本工具链（bump-version.py）接受任意后缀，
+            # 枚举法会让 v1.2.3-dev 拿到 latest，把 `ghcr.io/...:latest` 换成非正式构建
+            # （NAS/团队用户 pull latest 直接吃到）。本 job 仅在 refs/tags/v* 上跑，
+            # 所以 ref_name 一定是 tag 名，判据与 release-draft 里的 is_prerelease 同口径。
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - name: Fetch NER model for All-in-One Docker image
         shell: bash
         run: |
@@ -389,7 +394,15 @@ jobs:
           set -euo pipefail
           unsigned_count=$(find release-assets -name UNSIGNED.txt -type f | wc -l)
           is_prerelease=false
-          if [[ "$GITHUB_REF_NAME" == *"-beta"* || "$GITHUB_REF_NAME" == *"-alpha"* || "$GITHUB_REF_NAME" == *"-rc"* ]]; then
+          # 判定口径：tag 里出现 `-` 即为预发布（正式版约定是纯 vX.Y.Z）。
+          # **不要枚举 -beta/-alpha/-rc**：`bump-version.py` 实测接受任意后缀
+          # （`bump-version.py 1.2.3-dev` 也返回 Success 并改写 6 处版本文件），
+          # 枚举法会让 v1.2.3-dev 走进正式版分支——生成并上传 latest.json，
+          # 全体现网客户端把它当正式更新拉走，而这个后果不可撤回。
+          # 方向保守：多判成预发布只是「这次不发自动更新」（Release 标 Pre-release、
+          # latest.json 不产出）；误判成正式版是用户可见且不可逆的。
+          # 与 docker job 的 `latest` 别名判据（同一工作流内）必须同口径。
+          if [[ "$GITHUB_REF_NAME" == *"-"* ]]; then
             is_prerelease=true
           fi
 
