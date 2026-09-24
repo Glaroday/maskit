@@ -7406,21 +7406,6 @@ class MaskOffloadTests(unittest.TestCase):
                                 "单条上限过小会让长叶子整条不做语义识别")
 
     def test_call_budget_can_finish_a_max_length_leaf(self):
-        """单次调用上限必须够跑完一条达到长度上限的文本。
-
-        不够时会形成一个很贵的稳态：超时 → `complete=False` → 负缓存**不写** →
-        同一段文本每轮都从头冷推。实测 20000 字撞上旧的 2.0s 上限：
-        2123 / 2013 / 2049 ms，缓存条数恒为 0（真实流量里的长系统提示词就是这样）。
-        成本模型实测约 0.25ms/字（见 ner_engine 顶部注释）。
-        """
-        import ner_engine
-        need_s = ner_engine.MAX_TEXT_CHARS * 0.25 / 1000.0
-        self.assertGreaterEqual(
-            ner_engine.CALL_BUDGET_S, need_s,
-            "单次上限 %.1fs 低于跑完 %d 字所需的 %.1fs：会长叶子每轮重付冷推理"
-            % (ner_engine.CALL_BUDGET_S, ner_engine.MAX_TEXT_CHARS, need_s))
-
-    def test_call_budget_can_finish_a_max_length_leaf(self):
         """单次调用上限必须够跑完一条达到长度上限的文本，**并且留出余量**。
 
         不够时会形成一个很贵的稳态：超时（`deadline`）→ `complete=False` → 负缓存
@@ -7448,6 +7433,35 @@ class MaskOffloadTests(unittest.TestCase):
             "每 MB 预算 %.0fs 低于实测成本 %.0fs 太多（注释与取值必须同源）"
             % (tr._NER_REQ_BUDGET_PER_MB_S, per_mb_need))
         self.assertGreaterEqual(tr._NER_REQ_BUDGET_MAX_S, tr._NER_REQ_BUDGET_BASE_S)
+
+    def test_real_too_long_skip_lands_in_the_mask_event(self):
+        """端到端（不用 mock）：真发生一次跳过，事件里必须看得见。
+
+        上面两条用例都是 mock `request_skips` 验证接线，只能证明「没断线」；这条走真实
+        链路：引擎按请求记账 → 专职线程取回 → MASK 事件 → 待落库字段，任一段断掉都会红。
+        超长叶子在「无汉字短路」之后、模型初始化之前就计数，所以不需要语义模型。
+        """
+        import ner_engine
+        long_text = "系统提示词" * 4001          # 20005 字，超过单条上限
+        self.assertGreater(len(long_text), ner_engine.MAX_TEXT_CHARS,
+                           "用例前提：文本必须超过单条上限")
+        events = []
+        flow = self._flow({"model": "gpt-4o-mini",
+                           "messages": [{"role": "user",
+                                         "content": "张三是13812345678 " + long_text}]})
+        old = tr.NER_ENABLED
+        tr.NER_ENABLED = True
+        try:
+            with mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))), \
+                 mock.patch.object(tr, "_maybe_reload", lambda force=False: None):
+                _drive_request(flow)
+        finally:
+            tr.NER_ENABLED = old
+        mask = [kw for typ, kw in events if typ == "MASK"]
+        self.assertTrue(mask, "未发出 MASK 事件")
+        self.assertTrue(mask[0].get("ner_truncated"), "真实降级未写进 MASK 事件")
+        self.assertEqual(mask[0].get("ner_skip_reasons"), {"too_long": 1},
+                         "跳过原因与条数应如实上报（不是统一个笼统标记）")
 
     def test_ner_degradation_reaches_restore_event_too(self):
         """降级必须同时出现在 MASK 与 RESTORE 上。

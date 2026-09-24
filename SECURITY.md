@@ -163,3 +163,5 @@ Data Maskit 是一个**本地脱敏代理**：拦截本机 LLM API 请求，敏�
 - 数据目录 ACL 启动时自动收紧（`_harden_data_dir_acl`）
 - 扩展桥接端点全部挂在 `/api/` 命名空间内（受 Host / Origin / 令牌三重校验），根空间只有静态资源
 - 扩展 `host_permissions` 只有 `127.0.0.1` / `localhost`；无 `storage.sync`、无远程代码、无请求正文日志
+- 语义识别（NER）降级恒可见：跳过原因（`too_long` / `deadline` / `infer_failed` / `budget_exhausted` / `model_unavailable` / `model_missing` / `om_compose` / `runtime`）既进事件（`ner_truncated` + `ner_skip_reasons`，MASK 与 RESTORE 都带）也进设置页计数，引擎与前端键集合一致由 `tests/test_regressions.py` 的契约测试锁住——**静默降级等于「以为开了、其实没脱」**
+- 已登记的上游依赖告警：RustSec **[RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html)**（`glib::VariantStrIter` 迭代器实现 UB，`informational = "unsound"`）。`glib` 经 Tauri → GTK 引入，**仅 Linux 目标存在**（`cargo tree -i glib` 在 Windows 目标下为空），本项目发布物（Windows NSIS / macOS DMG / Python 引擎镜像）不含该依赖；官方仅 `>=0.20.0` 修复，需整条 gtk-rs/Tauri 升级（上游通道），故**不**在本地改依赖或锁版本
