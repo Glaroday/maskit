@@ -180,8 +180,11 @@ const NER_SKIP_ITEMS: { key: string; labelKey: string }[] = [
   { key: 'budget_exhausted', labelKey: 'settings.sw.nerSkipBudget' },
   { key: 'infer_failed', labelKey: 'settings.sw.nerSkipInfer' },
   { key: 'deadline', labelKey: 'settings.sw.nerSkipDeadline' },
+  { key: 'model_unavailable', labelKey: 'settings.sw.nerSkipModelUnavailable' },
   { key: 'init_failed', labelKey: 'settings.sw.nerSkipInit' },
   { key: 'model_missing', labelKey: 'settings.sw.nerSkipModelMissing' },
+  { key: 'om_compose', labelKey: 'settings.sw.nerSkipCompose' },
+  { key: 'runtime', labelKey: 'settings.sw.nerSkipRuntime' },
 ]
 
 function detectClientType(u: UpstreamConfig): string {
@@ -1875,16 +1878,24 @@ export default function SettingsPage({ embeddedTab }: { embeddedTab?: string } =
                   </p>
                 )}
                 {/* 跳过原因计数（审计 M7）：`available` 为 true 只说明引擎能跑，
-                    **不说明每一段文本都做了识别**。`MAX_TEXT_CHARS=2000` 会让超长叶子整条
+                    **不说明每一段文本都做了识别**。`MAX_TEXT_CHARS` 会让超长叶子整条
                     跳过，预算耗尽也会中途停手——这些此前只写一条进程级日志，界面上
                     完全看不出，用户只会觉得「开了 NER 但没效果」。
                     只列非零项：一排 0 是噪声，不是信息。 */}
                 {!!(cfg as Record<string, unknown> | undefined)?.ner_enabled && status?.ner?.available
                   && (() => {
                     const skips = status.ner.skips || {}
-                    const parts = NER_SKIP_ITEMS
-                      .filter((it) => Number(skips[it.key] || 0) > 0)
-                      .map((it) => tf('settings.sw.nerSkipItem', { label: t(it.labelKey), n: Number(skips[it.key]) }))
+                    // 直接遍历**引擎报上来的键**，而不是只遍历本文件这份清单：
+                    // 漏登记一个键就等于该降级在界面上不存在，而引擎新增原因时最容易忘的
+                    // 恰好就是这里加一行（历史上 call_timeout / model_unavailable 就是这么漏的）。
+                    // 未登记的键回退到原始键名，宁可粗糙也不能消失。
+                    const labelOf = (k: string) => {
+                      const labelKey = NER_SKIP_ITEMS.find((it) => it.key === k)?.labelKey
+                      return (labelKey && t(labelKey)) || k
+                    }
+                    const parts = Object.keys(skips)
+                      .filter((k) => Number(skips[k] || 0) > 0)
+                      .map((k) => tf('settings.sw.nerSkipItem', { label: labelOf(k), n: Number(skips[k]) }))
                     if (parts.length === 0) return null
                     return (
                       <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">

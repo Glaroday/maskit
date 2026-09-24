@@ -1,3 +1,4 @@
+import asyncio
 import re
 import json
 import io
@@ -19,6 +20,39 @@ sys.path.insert(0, str(ROOT))
 import panel
 import transparent as tr
 import event_store
+
+
+def _unlink_with_retry(path, attempts=40, delay=0.05):
+    """删除文件，容忍 Windows 上「句柄尚未释放」的短暂占用。
+
+    Windows 不允许删除仍被打开的文件（POSIX 可以），而后台写库线程/连接池可能还
+    握着测试库几十毫秒 —— 直接 unlink 会让用例偶发失败（本地实测约 1/5，且只在
+    Windows 上）。这是收尾清理的时序问题，不是被测行为，所以退避重试；
+    重试用尽仍失败则如实抛出，不静默吞掉。
+    """
+    for _ in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            time.sleep(delay)
+    path.unlink(missing_ok=True)
+
+
+def _drive_request(flow):
+    """同步驱动脱敏钩子（单元测试用）。
+
+    `transparent.request` 自 2026-09-24 起是 async 钩子：脱敏重活必须 offload 出
+    mitmproxy 事件循环，否则一条长会话会把全部连接冻住（502 事故）。这里用
+    asyncio.run 驱动它，走的仍是生产同一条路径（含专职线程池）。
+    用属性查找调用，测试若 mock.patch.object(tr, "request") 依然生效。
+    """
+    res = tr.request(flow)
+    if asyncio.iscoroutine(res):
+        return asyncio.run(res)
+    return res
+
+
 
 
 class ShieldEngineTests(unittest.TestCase):
@@ -423,7 +457,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 sid = flow.metadata.get("session_id")
                 self.assertTrue(sid)
                 flow.response = SimpleNamespace(
@@ -653,7 +687,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("codex.example.test", "/backend-api/conversation", {
                 "messages": [{"role": "user", "content": "张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr.DIAGNOSTIC_UNMATCHED = old_diag
             tr._emit = old_emit
@@ -668,7 +702,7 @@ class ShieldEngineTests(unittest.TestCase):
             body = {"messages": [{"role": "user", "content": "客户张三 电话13812345678"}]}
             flow = self._flow("example.com", "/v1/chat/completions", body)
             before = flow.request.content
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(flow.request.content, before)
             self.assertNotIn("session_id", flow.metadata)
         self._with_no_reload(run)
@@ -683,7 +717,7 @@ class ShieldEngineTests(unittest.TestCase):
                 {"messages": [{"role": "user", "content": "客户张三"}]},
                 headers={"authorization": auth, "x-api-key": api_key},
             )
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(flow.request.headers["authorization"], auth)
             self.assertEqual(flow.request.headers["x-api-key"], api_key)
             sent = json.loads(flow.request.content)
@@ -732,7 +766,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 # request() 内部会生成新 sid，从 flow.metadata 取
                 sid = flow.metadata.get("session_id")
                 self.assertTrue(sid, "request 应设置 session_id")
@@ -811,7 +845,7 @@ class ShieldEngineTests(unittest.TestCase):
                 ),
                 metadata={},
             )
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._emit = old_emit
             tr._maybe_reload = old_reload
@@ -845,7 +879,7 @@ class ShieldEngineTests(unittest.TestCase):
                 ),
                 metadata={},
             )
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._emit = old_emit
             tr._maybe_reload = old_reload
@@ -917,7 +951,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三的电话是13812345678"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.loads(flow.request.content)
             masked_prompt = sent["messages"][0]["content"]
             self.assertNotIn("张三", masked_prompt)
@@ -943,7 +977,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户的电话是13812345678"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             flow.response = SimpleNamespace(
                 headers={"content-type": " Text/Event-Stream ; charset=utf-8"},
@@ -967,7 +1001,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户的电话是13812345678"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             raw = json.dumps({"choices": [{"message": {"content": masked}}]},
                              ensure_ascii=False).encode("utf-8")
@@ -996,7 +1030,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             flow.response = SimpleNamespace(
                 headers={"content-type": "application/json"},
@@ -1019,7 +1053,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/completions", {
                 "prompt": "请总结李四的邮箱lisi@example.com"
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked_prompt = json.loads(flow.request.content)["prompt"]
             self.assertNotIn("李四", masked_prompt)
             self.assertNotIn("lisi@example.com", masked_prompt)
@@ -1038,7 +1072,7 @@ class ShieldEngineTests(unittest.TestCase):
                 "system": "你会保护password=ServerPass123!",
                 "messages": [{"role": "user", "content": "账号root，token=abcdefghijklmnopqrstuvwxyz123456"}],
             })
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.loads(flow.request.content)
             self.assertNotIn("ServerPass123", sent["system"])
             self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", sent["messages"][0]["content"])
@@ -1058,7 +1092,7 @@ class ShieldEngineTests(unittest.TestCase):
                 "instructions": "不要泄露sk-proj-abcdefghijklmnopqrstuvwxyz123456",
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "联系张三"}]}],
             })
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.loads(flow.request.content)
             masked = sent["instructions"] + "|" + sent["input"][0]["content"][0]["text"]
             self.assertNotIn("sk-proj-abcdefghijklmnopqrstuvwxyz123456", masked)
@@ -1088,7 +1122,7 @@ class ShieldEngineTests(unittest.TestCase):
                     {"role": "tool", "tool_call_id": "call_1", "content": "张三的电话是13812345678"},
                 ],
             })
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.dumps(json.loads(flow.request.content), ensure_ascii=False)
             self.assertNotIn("张三", sent)
             self.assertNotIn("13812345678", sent)
@@ -1105,7 +1139,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("anthropic.com", "/v1/messages", {
                 "messages": [{"role": "user", "content": "客户张三"}],
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
             flow.response = SimpleNamespace(
@@ -1128,7 +1162,7 @@ class ShieldEngineTests(unittest.TestCase):
             f1 = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(f1)
+            _drive_request(f1)
             tok1 = re.search(tr._PLACEHOLDER_RX, json.loads(f1.request.content)["messages"][0]["content"]).group(0)
 
             # 第二轮：历史里带着上一轮的占位符（客户端没还原干净的情况）
@@ -1138,7 +1172,7 @@ class ShieldEngineTests(unittest.TestCase):
                     {"role": "user", "content": "张三的电话呢"},
                 ]
             })
-            tr.request(f2)
+            _drive_request(f2)
             tok2 = re.search(tr._PLACEHOLDER_RX, json.loads(f2.request.content)["messages"][1]["content"]).group(0)
             self.assertEqual(tok1, tok2, "同一原文应复用同一占位符")
 
@@ -1159,7 +1193,7 @@ class ShieldEngineTests(unittest.TestCase):
                 tr.FAIL_CLOSED = True
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {})
                 flow.request.content = b'{"messages": [bad json'
-                tr.request(flow)
+                _drive_request(flow)
                 self.assertEqual(flow.response.status_code, 400)
                 self.assertIn(b"shield_invalid_json", flow.response.content)
             finally:
@@ -1172,7 +1206,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
@@ -1203,7 +1237,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
             body = (
@@ -1233,7 +1267,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
@@ -1263,7 +1297,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             flow.response = SimpleNamespace(
                 headers={"content-type": "application/x-ndjson"},
@@ -1302,7 +1336,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             flow.response = SimpleNamespace(
                 headers={"content-type": "text/event-stream"},
@@ -1331,7 +1365,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
@@ -1372,7 +1406,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
@@ -1422,13 +1456,13 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}], "stream": True,
             }, headers={"accept-encoding": "gzip, br"})
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(flow.request.headers["accept-encoding"], "identity")
             # 非流式：保留客户端原始压缩协商，省带宽
             flow2 = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}],
             }, headers={"accept-encoding": "gzip, br"})
-            tr.request(flow2)
+            _drive_request(flow2)
             self.assertEqual(flow2.request.headers["accept-encoding"], "gzip, br")
         self._with_no_reload(run)
 
@@ -1441,7 +1475,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "客户张三"}], "stream": True,
                 }, headers={"accept-encoding": "gzip"})
-                tr.request(flow)
+                _drive_request(flow)
                 self.assertEqual(flow.request.headers["accept-encoding"], "gzip")
             finally:
                 tr.STREAM_EXCLUDE_HOSTS = old
@@ -1457,7 +1491,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "客户张三"}], "stream": True,
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 flow.response = SimpleNamespace(
                     headers={"content-type": "text/event-stream", "content-encoding": "gzip"},
                     status_code=200, content=b"", stream=None,
@@ -1488,7 +1522,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "客户张三"}], "stream": True,
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 sid = flow.metadata["session_id"]
                 flow.response = SimpleNamespace(
                     headers={"content-type": "text/event-stream"}, status_code=200, content=b"",
@@ -1524,7 +1558,7 @@ class ShieldEngineTests(unittest.TestCase):
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "客户张三"}]}],
                 "stream": True,
             })
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             masked_text = flow.request.content.decode("utf-8", errors="replace")
             token = re.search(tr._PLACEHOLDER_RX, masked_text).group(0)
@@ -1573,7 +1607,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 sid = flow.metadata["session_id"]
                 masked = json.loads(flow.request.content)["messages"][0]["content"]
                 token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
@@ -1614,7 +1648,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三"}], "stream": True,
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 sid = flow.metadata.get("session_id")
                 flow.response = SimpleNamespace(
                     headers={"content-type": "application/json"}, status_code=200,
@@ -1623,7 +1657,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow2 = self._flow("api.openai.com", "/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三"}],
                 })
-                tr.request(flow2)
+                _drive_request(flow2)
                 sid2 = flow2.metadata.get("session_id")
                 flow2.response = SimpleNamespace(
                     headers={"content-type": "application/json"}, status_code=200,
@@ -1761,7 +1795,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "查询张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             args = json.dumps({"name": masked, "phone": "{{PHONE_abcdef}}"}, ensure_ascii=False)
             flow.response = SimpleNamespace(
@@ -1778,7 +1812,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/responses", {
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "查询张三"}]}],
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["input"][0]["content"][0]["text"]
             args = json.dumps({"name": masked}, ensure_ascii=False)
             flow.response = SimpleNamespace(
@@ -1797,7 +1831,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/responses", {
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "查询张三"}]}],
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["input"][0]["content"][0]["text"]
             args = json.dumps({"name": masked}, ensure_ascii=False)
             event = {
@@ -1819,7 +1853,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/responses", {
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "我是张三又是李四"}]}],
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["input"][0]["content"][0]["text"]
             event = {
                 "type": "response.output_item.done",
@@ -1840,7 +1874,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/responses", {
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "我是张三"}]}],
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["input"][0]["content"][0]["text"]
             event = {"type": "response.content_part.done", "part": {"type": "output_text", "text": "收到：" + masked}}
             flow.response = SimpleNamespace(
@@ -1858,7 +1892,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "客户张三"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             a, b = masked[:4], masked[4:]
             chunks = [
@@ -1882,7 +1916,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "邮箱test@example.com"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             # 把整个回复（含占位 token）按字节切成 3 段，模拟真实流式分片
             full = "收到" + masked + "谢谢"
@@ -1940,7 +1974,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._reverse_flow("/openai/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "你好"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             # host/scheme 被改写为真实上游
             self.assertEqual(flow.request.host, "api.openai.com")
             self.assertEqual(flow.request.scheme, "https")
@@ -1960,7 +1994,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._reverse_flow("/unknown/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "你好"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
             finally:
                 tr._emit_skip = old_skip
             self.assertEqual(skipped.get("reason"), "no_reverse_route")
@@ -2013,7 +2047,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._reverse_flow("/anthropic/v1/messages", {
                 "messages": [{"role": "user", "content": "联系人张三电话13812345678"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             self.assertNotIn("张三", masked)
             self.assertNotIn("13812345678", masked)
@@ -2043,7 +2077,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._reverse_flow("/openai/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "电话13812345678"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
             finally:
                 tr._emit = old_emit
                 tr.mask = old_mask
@@ -2071,7 +2105,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._reverse_flow("/openai/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "电话13812345678"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
             finally:
                 tr._emit = old_emit
                 tr.mask = old_mask
@@ -2094,7 +2128,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._reverse_flow("/openai/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三电话13812345678"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 masked = json.loads(flow.request.content)["messages"][0]["content"]
                 # 回复还原本会话值 + 新出现一个未脱敏过的手机号（幻觉 PII）
                 flow.response = SimpleNamespace(
@@ -2132,7 +2166,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow1 = self._reverse_flow("/openai/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三电话13812345678"}]
                 })
-                tr.request(flow1)
+                _drive_request(flow1)
                 req_content = json.loads(flow1.request.content)["messages"][0]["content"]
                 m_tokens = tr._PLACEHOLDER_RX.findall(req_content)
                 self.assertTrue(m_tokens, "首轮必须完成脱敏生成占位符")
@@ -2142,7 +2176,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow2 = self._reverse_flow("/openai/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "请告诉我张三的联系方式"}]
                 })
-                tr.request(flow2)
+                _drive_request(flow2)
                 flow2.response = SimpleNamespace(
                     headers={"content-type": "application/json"},
                     content=json.dumps({"choices": [{"message": {"content": "张三的电话是" + token}}]}, ensure_ascii=False).encode("utf-8"),
@@ -2166,7 +2200,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._reverse_flow("/anthropic/v1/messages", {
                 "messages": [{"role": "user", "content": "联系人张三电话13812345678"}]
             }, listen_port=18703)
-            tr.request(flow)
+            _drive_request(flow)
             # 路由仍生效：host 改写为真实上游
             self.assertEqual(flow.request.host, "api.anthropic.com")
             # 不脱敏：原文保留
@@ -2197,7 +2231,7 @@ class ShieldEngineTests(unittest.TestCase):
                 flow = self._reverse_flow("/openai/v1/chat/completions", {
                     "messages": [{"role": "user", "content": "联系人张三"}]
                 })
-                tr.request(flow)
+                _drive_request(flow)
                 masked = json.loads(flow.request.content)["messages"][0]["content"]
                 flow.response = SimpleNamespace(
                     headers={"content-type": "application/json"},
@@ -2217,17 +2251,17 @@ class ShieldEngineTests(unittest.TestCase):
             tr.UPSTREAMS = list(tr.DEFAULT_UPSTREAMS)
             # openai
             f1 = self._reverse_flow("/openai/v1/chat/completions", {"messages": [{"role": "user", "content": "a"}]})
-            tr.request(f1)
+            _drive_request(f1)
             self.assertEqual(f1.request.host, "api.openai.com")
             self.assertEqual(f1.request.path, "/v1/chat/completions")
             # deepseek
             f2 = self._reverse_flow("/deepseek/v1/chat/completions", {"messages": [{"role": "user", "content": "b"}]})
-            tr.request(f2)
+            _drive_request(f2)
             self.assertEqual(f2.request.host, "api.deepseek.com")
             self.assertEqual(f2.request.path, "/v1/chat/completions")
             # anthropic
             f3 = self._reverse_flow("/anthropic/v1/messages", {"messages": [{"role": "user", "content": "c"}]})
-            tr.request(f3)
+            _drive_request(f3)
             self.assertEqual(f3.request.host, "api.anthropic.com")
             self.assertEqual(f3.request.path, "/v1/messages")
         self._with_no_reload(run)
@@ -2239,7 +2273,7 @@ class ShieldEngineTests(unittest.TestCase):
             tr.UPSTREAMS = list(tr.DEFAULT_UPSTREAMS)
             flow = self._reverse_flow("/openai/v1/beta/chat", {"messages": [{"role": "user", "content": "张三"}]})
             flow.request.method = "POST"
-            tr.request(flow)
+            _drive_request(flow)
             self.assertIsNone(getattr(flow, "response", None), "不应再返回 404")
             self.assertEqual(flow.request.host, "api.openai.com")
             self.assertNotIn("张三", json.loads(flow.request.content)["messages"][0]["content"])
@@ -2257,7 +2291,7 @@ class ShieldEngineTests(unittest.TestCase):
             try:
                 flow = self._reverse_flow("/openai/v1/models", {})
                 flow.request.method = "GET"
-                tr.request(flow)
+                _drive_request(flow)
             finally:
                 tr._emit_skip = old_skip
                 tr.DIAGNOSTIC_UNMATCHED = False
@@ -2279,7 +2313,7 @@ class ShieldEngineTests(unittest.TestCase):
             try:
                 flow = self._reverse_flow("/openai/v1/files", {"purpose": "fine-tune"})
                 flow.request.method = "POST"
-                tr.request(flow)
+                _drive_request(flow)
             finally:
                 tr.FAIL_CLOSED = True
             self.assertIsNone(getattr(flow, "response", None))
@@ -2302,7 +2336,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._reverse_flow("/openai/v1/some-new-endpoint",
                                       {"text": "张三 13800138000"})
             flow.request.method = "POST"
-            tr.request(flow)
+            _drive_request(flow)
             sent = (flow.request.content or b"").decode("utf-8", "replace")
             self.assertEqual(flow.request.host, "api.openai.com")
             self.assertIsNone(getattr(flow, "response", None), "脱敏后照常转发，不阻断")
@@ -2324,7 +2358,7 @@ class ShieldEngineTests(unittest.TestCase):
                          "/openai/v2/chat"):
                 flow = self._reverse_flow(path, {"text": "联系 13800138000"})
                 flow.request.method = "POST"
-                tr.request(flow)
+                _drive_request(flow)
                 sent = (flow.request.content or b"").decode("utf-8", "replace")
                 with self.subTest(path=path):
                     self.assertNotIn("13800138000", sent, f"{path} 明文上行了")
@@ -2339,7 +2373,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._reverse_flow("/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "你好"}]
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(flow.request.host, "api.openai.com")
             self.assertEqual(flow.request.scheme, "https")
             # 多端口不剥前缀，path 保持 /v1/chat/completions
@@ -2353,11 +2387,11 @@ class ShieldEngineTests(unittest.TestCase):
             tr.CAPTURE_MODE = "reverse"
             tr.UPSTREAMS = list(tr.DEFAULT_UPSTREAMS)
             f1 = self._reverse_flow("/v1/chat/completions", {"messages": [{"role": "user", "content": "a"}]}, listen_port=18701)
-            tr.request(f1)
+            _drive_request(f1)
             self.assertEqual(f1.request.host, "api.openai.com")
             self.assertEqual(f1.request.path, "/v1/chat/completions")
             f2 = self._reverse_flow("/v1/messages", {"messages": [{"role": "user", "content": "b"}]}, listen_port=18703)
-            tr.request(f2)
+            _drive_request(f2)
             self.assertEqual(f2.request.host, "api.anthropic.com")
             self.assertEqual(f2.request.path, "/v1/messages")
         self._with_no_reload(run)
@@ -2371,7 +2405,7 @@ class ShieldEngineTests(unittest.TestCase):
             flow = self._reverse_flow("/openai/v1/chat/completions", {
                 "messages": [{"role": "user", "content": "x"}]
             }, listen_port=99999)
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(flow.request.host, "api.openai.com")
             # 前缀模式剥掉 /openai
             self.assertEqual(flow.request.path, "/v1/chat/completions")
@@ -2399,7 +2433,7 @@ class ShieldEngineTests(unittest.TestCase):
                 "top_n": 2,
             }
             flow = self._reverse_flow("/cohere/v1/rerank", body, listen_port=18799)
-            tr.request(flow)
+            _drive_request(flow)
 
             # 验证请求体已脱敏
             self.assertIsNone(getattr(flow, "response", None), "正常脱敏不阻断")
@@ -3592,11 +3626,11 @@ class PanelConfigTests(unittest.TestCase):
             result = panel.prune_event_log(now=now, retention_days=7)
             kept = event_store.fetch_events(since=0, sensitive_only=False)
         finally:
-            event_store.DB_PATH.unlink(missing_ok=True)
+            _unlink_with_retry(event_store.DB_PATH)
             wal = event_store.DB_PATH.with_name(event_store.DB_PATH.name + "-wal")
             shm = event_store.DB_PATH.with_name(event_store.DB_PATH.name + "-shm")
-            wal.unlink(missing_ok=True)
-            shm.unlink(missing_ok=True)
+            _unlink_with_retry(wal)
+            _unlink_with_retry(shm)
             event_store.DB_PATH = old_db
             panel.DB_PATH = old_panel_db
 

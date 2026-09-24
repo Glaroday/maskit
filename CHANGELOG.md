@@ -2,7 +2,7 @@
 
 本文件记录对用户可见的变更；格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [Unreleased]
+## [0.5.0] - 2026-09-24
 
 ### 新增 / Added
 - 审计：凭据示例不再被报成「响应投毒」（代码块/低熵形态降为仅记录），新增三档审计预设与审计阻断开关、主动探针临时启用、以及「高风险操作时间线」视图（仅该视图放宽门槛，默认视图不受影响）。
@@ -11,6 +11,28 @@
   *Audit: added dangerous-command interception (Audit page → Active security probe tab) — detects model-issued commands such as root deletion, disk wiping, DROP DATABASE and fork bombs into the risky-action timeline. Record-only by default, switchable to rewrite or block, with custom rules and an allow list.*
 
 ### 修复 / Bug Fixes
+- 引擎：修复长会话脱敏阻塞整个代理、在途请求被上游掐断后返回 502 的问题——脱敏重活移出 mitmproxy 事件循环，并给语义识别加单请求总预算、扩充结果缓存。
+  *Engine: fixed long conversations blocking the whole proxy and surfacing 502s when in-flight upstream connections were dropped — masking now runs off the mitmproxy event loop, with a per-request NER budget and a larger result cache.*
+- 引擎：共享全局态（占位符复用表、自定义词映射、配置热重载）改为互斥 + 原子发布，修掉多线程下的后缀撞车与半填充词表；PEM 私钥规则由 O(n²) 降为线性（1.49MB 病态输入 880ms → 25ms）。
+  *Engine: shared state (placeholder reuse tables, custom-word mappings, hot reload) is now mutex-protected and published atomically, fixing cross-thread suffix collisions and partially published word lists; the PEM private-key rule is now linear instead of O(n²) (1.49 MB pathological input: 880 ms → 25 ms).*
+- 引擎：占位符复用表改为按窗口批量回收，表满时签发 300 个新占位符由 144ms 降到 1.6ms；TTL 与容量语义不变。
+  *Engine: reuse-table pruning is now batched per time window — 300 new placeholders against a full table dropped from 144 ms to 1.6 ms, with TTL and capacity semantics unchanged.*
+- 引擎：自定义词映射重建改为「锁外派生 + 锁内换表」（锁序 _SYNC_LOCK → _STATE_LOCK），配置保存时不再让在途脱敏干等。
+  *Engine: custom-word mapping rebuild now derives outside the state lock and only swaps tables under it (lock order _SYNC_LOCK → _STATE_LOCK), so live masking no longer waits on a config save.*
+- 引擎：语义识别（NER）限流口径修正 —— 单请求总预算由固定 2s 改为按体积伸缩（10s 打底、每 MB +120s、封顶 60s），单条长度上限 2000→20000 字；本轮发生降级时 MASK 事件带 ner_truncated 与原因，不再静默。旧口径可用 `tests/measure_ner_coverage.py --budget 2.0` 复现（200 条/43KB 实测 74~101/200 个人名明文出网，截断点随机器负载浮动，所以不给单一数字），修复后 0。
+  *Engine: corrected NER throttling — the per-request budget is now size-aware (10 s base, +120 s/MB, capped at 60 s) instead of a fixed 2 s, and the per-text limit went from 2 000 to 20 000 chars; a degraded round is now flagged in the MASK event via ner_truncated and its reasons. Reproduce the old behaviour with `tests/measure_ner_coverage.py --budget 2.0` (74–101 of 200 names leaked in a 43 KB conversation; the cut point floats with machine load, hence a range), 0 after.*
+- 引擎：语义识别的时间闸门按**实测**成本重新标定（单位成本 93µs/字节）。单次调用上限 2s→10s：旧值跑不完一条上限长度文本，导致超长无实体文本每轮重付冷推理且永不进缓存（实测 20000 字 2123/2013/2049ms → 修复后 4806ms 一次、之后 1ms）。请求级每 MB 系数 20s→120s：旧值比实测成本小约 8 倍，中等体积请求会在半途静默停手。
+  *Engine: re-calibrated the NER time gates against measured cost (93 µs/byte). Per-call limit 2 s → 10 s: the old value could not finish a max-length text, so long entity-free text re-paid cold inference every round and never entered the cache (measured 2 123/2 013/2 049 ms at 20 000 chars → 4 806 ms once, then 1 ms). Per-MB request budget 20 s → 120 s: the old value was ~8× below measured cost, so mid-sized requests silently stopped halfway.*
+- 引擎：跳过原因统一记账（按请求 + 进程级）并加锁；单次超时/推理失败改在发生处记账（`deadline`/`infer_failed`），不再用一个笼统键把异常误报成超时。
+  *Engine: skip reasons are now accounted uniformly (per request and process-wide) behind a lock; call timeout and inference failure are recorded where they happen (`deadline` / `infer_failed`) instead of one blanket key that mislabelled exceptions as timeouts.*
+- 前端：设置页与事件详情弹窗共用同一份跳过原因标签；设置页改为遍历引擎上报的键（未登记的回退原始键名），不再因为漏加一行就把整条降级从界面上消失。
+  *Frontend: the settings page and the event detail dialog now share one set of skip-reason labels; the settings page iterates the keys the engine actually reports (unknown ones fall back to the raw key), so a missing line can no longer hide a whole degradation reason from the UI.*
+- 引擎：单次语义识别调用上限 2s→6s —— 旧值低于「跑完一条上限长度文本」的成本，于是超长且无实体的文本每轮都重付冷推理且永不进缓存（实测 20000 字 4806ms/轮 → 修复后 1ms）。
+  *Engine: raised the per-call NER time limit from 2 s to 6 s — the old value was below the cost of finishing a max-length text, so long entity-free text re-paid cold inference every round and never entered the cache (measured 4 806 ms per round at 20 000 chars → 1 ms after).*
+- 引擎：浏览器扩展链路（`/api/ext/mask`、`/api/ext/mask-file`）补上语义识别总预算与降级上报——响应带 `ner_skipped`，事件带降级标记；降级但零命中时也记一条，不再静默。
+  *Engine: the browser-extension endpoints (`/api/ext/mask`, `/api/ext/mask-file`) now open a total NER budget and report degradation — the response carries `ner_skipped` and the event is flagged; a degraded round with zero hits is still recorded instead of staying silent.*
+- 前端：事件详情弹窗新增「本轮语义识别降级」提示（原因 × 条数，中英双语）；MASK 与 RESTORE 两条事件都带该信息，详情回源 RESTORE 时同样可见。
+  *Frontend: the event detail dialog now shows a “semantic recognition degraded this round” notice (reason × count, bilingual); the flag is carried on both MASK and RESTORE events, so detail lookups that resolve to RESTORE show it too.*
 - 本地部署脚本：修复「替换安装文件时命中句柄占用即中止、且中止后不拉起客户端」的问题——改为等进程退出 + 删除/覆盖重试 + 引擎目录先落暂存再换名就位，并保证失败时也拉起客户端并回滚备份。
   *Local deploy script: fixed a mid-swap abort on locked files that left the client stopped — it now waits for processes to exit, retries delete/copy, stages the engine dir before swapping it in, and always restarts the client with a backup rollback on failure.*
 - 发版流程：修复预发布版本号（`X.Y.Z-beta.N`）被过严正则误判为「版本分叉」而中止打包的问题，并让版本校验失败时回滚全部版本文件。

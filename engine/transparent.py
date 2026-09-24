@@ -14,7 +14,10 @@ mitmproxy 本地显式代理 - 只拦目标站点聊天接口，脱敏请求 + �
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
+import asyncio
 import codecs
+import concurrent.futures
+import threading
 import contextlib
 import datetime
 import ipaddress
@@ -66,7 +69,13 @@ RULES = [
     # PEM 私钥整块替换（最高危凭据，形态固定零误报）——审计规则专项 P0。
     # 多行匹配：-----BEGIN ... PRIVATE KEY----- 到 -----END ... PRIVATE KEY-----
     # 整块替换成单个占位符，不逐行扫描。
-    (re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]{20,}?-----END[^-]*PRIVATE KEY-----"), "PRIVATE_KEY", 0),
+    #
+    # ⚠️ 中间段绝不能写成 `[\s\S]{20,}?`（2026-09-24 修）：没有 END 时惰性量词会从
+    # **每一个** BEGIN 位置一路尝试到字符串末尾，实测 1.49MB + 200 个未闭合私钥头
+    # 耗 870ms（典型 O(n²)，且这段跑在脱敏管线上，等于把请求拖慢）。
+    # 换成「不跨 `--`」的定长字符类后，每个起点扫到下一个 `--` 就失败：真实 PEM
+    # 正文是 base64（字母表里没有 `-`），所以语义不变，代价降为线性。
+    (re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----(?:[^-]|-(?!-)){20,}?-----END[^-]*PRIVATE KEY-----"), "PRIVATE_KEY", 0),
     (re.compile(r"(?<![A-Za-z0-9_-])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_-])"), "API_KEY", 0),
     # GitHub fine-grained PAT: github_pat_<22>_<59+>（2022 GA，现为 GitHub 推荐默认形态）。
     # 老的 ghp_ 规则匹配不到它（前缀不同），实测 github_pat_... 整串漏检。
@@ -1048,6 +1057,40 @@ def _new_token(label):
     return "{{%s_%s}}" % (lab, _rand_suffix())
 
 
+# ===================== 共享态互斥锁（2026-09-24）=====================
+# 为什么需要：脱敏不再是「只有 mitmproxy 事件循环一个线程」在跑。代理链路的脱敏
+# 现在跑在 `_MASK_POOL` 专职线程，panel 的扩展桥接另有 Flask 线程，它们都会走到
+# `_recall_token` / `mask`，即都在改本文件级的全局表：`_RECENT_FWD/_REV`、
+# `_RECENT_SUFFIX`、`_CUSTOM_WORD_FWD/_REV`、`_CUSTOM_WORDS_SORTED`。
+#
+# 单条 dict 操作靠 GIL 是原子的，真正危险的是**多步序列**与**遍历**：
+#   1) `_recall_token` 的「查后缀占用 → 生成 token → 登记三张表」不是原子的：
+#      两个线程可能签出同一后缀，于是同一个 token 指向两个原文，还原时把 A 的
+#      原文填到 B 的位置（`_suffix_index_add` 的注释已写明「替换错值比不替换
+#      危险得多」）。
+#   2) `_prune_recent` / `_sync_custom_word_mappings` 会遍历并成批删改这些表，
+#      与并发写入相撞会抛 `RuntimeError: dictionary changed size`（请求直接失败）。
+#
+# 配置项（词表 / 规则开关 / 上游表等）不走本锁：`_maybe_reload` 一律**整体换对象**
+# 发布，读者只会看到上一代或新一代。曾经对 `CUSTOM_WORDS` 用就地 `clear()+update()`，
+# 读者可能看到半填充词表并把它当当前词表发布 —— 那一轮少脱敏用户自定义词，明文出网。
+#
+# 锁序（**必须遵守**）：`panel._EXT_LOCK` → 本文件的 `_SYNC_LOCK` → `_STATE_LOCK`。
+# panel 侧先持 `_EXT_LOCK` 再进 transparent；本文件绝不持锁回调 panel 或做任何 I/O，
+# 因此不存在反向路径，没有死锁环。临界区必须保持微秒级：**严禁**在持锁期间做 NER
+# 推理、读写文件、发网络请求或遍历长会话。
+_STATE_LOCK = threading.RLock()
+
+# 自定义词映射重建的串行锁。
+# 重建分三段：① 锁内取快照（微秒级）→ ② **锁外**派生（SHA-256 + 避让探测，逐词
+# 计算，千词表就是百毫秒级）→ ③ 锁内换表。派生必须与落表同锁串行，否则两次并发
+# 重建各基于同一份旧快照、可能派生出同一个后缀（撞车即张冠李戴）；但它不该占着
+# `_STATE_LOCK`，那样配置保存时在途脱敏只能干等。
+# 锁序上它必须排在 `_STATE_LOCK` **外**（先 `_SYNC_LOCK` 再 `_STATE_LOCK`），
+# 所以 `_custom_words_sorted` / `_refresh_custom_words_sorted` 都在释放 `_STATE_LOCK`
+# 之后才调重建。
+_SYNC_LOCK = threading.Lock()
+
 # 跨请求占位符复用表（仅内存，TTL = session_ttl，带条数上限）。
 # 解决两个真实问题：
 # 1) 多轮对话里同一实体每轮拿到不同占位符，模型会当成不同的人；
@@ -1166,6 +1209,51 @@ def _recent_ttl():
 
 
 def _prune_recent(now=None):
+    """清理复用表（持 `_STATE_LOCK` 后交给实体）。
+
+    任一链路线程都可能调到，成批删改三张全局表，必须与并发签发/登记互斥。
+    """
+    with _STATE_LOCK:
+        return _prune_recent_locked(now)
+
+
+# TTL 清理的节流窗口（秒）。
+#
+# `_recall_token` 每签发一个**新**占位符就调一次清理，而清理是全表扫描：表满
+# _RECENT_MAX=2000 条时实测 **154µs/次**，一个 300 个新实体的请求光这项就约 46ms
+# （对照 `mask_ms` p50≈230ms）。节流后代价降到「每个窗口一次」。
+#
+# 注意不能只写 `len <= _RECENT_MAX` 就跳：表**正好等于**上限时那个条件为真，
+# 于是每次插入都跨过上限、每次签发都全集扫一遍（实测反而变成 143ms/300 次）。
+# 所以窗口内允许小幅超出，到 `_PRUNE_SLACK` 倍才强制回收：内存上界仍是
+# 「2000 × 1.25 条」（几十 KB 量级），代价从 O(1) 次全集扫变成每窗口一次。
+#
+# TTL 语义只放宽 ≤ 该窗口：过期条目最多多驻留 1 秒内存。这不影响正确性 ——
+# `_recall_token` / `_lookup` 本来就按 ts 自行判过期，清理只负责回收内存与 PII 驻留；
+# 且超出幅度到 `_PRUNE_SLACK` 时**不等窗口**，立刻回收。
+_PRUNE_INTERVAL_S = 1.0
+_PRUNE_SLACK = 1.25
+_prune_last = [0.0]  # time.monotonic()，不受系统时钟回拨影响
+
+
+def _prune_recent_throttled(now):
+    """按窗口节流调用 `_prune_recent`（**热路径专用**）。
+
+    调用方必须已持 `_STATE_LOCK`：读 `len(_RECENT_FWD)` 与写 `_prune_last` 要和签发
+    同处一个临界区，否则节流窗口自身就变成了竞态。
+
+    节流的只是**调用频率**，不是清理语义：`_prune_recent()` 本身逐字不变（含 TTL
+    与超容量两条判据），启动预热等一次性路径仍直接调它。
+    """
+    mono = time.monotonic()
+    if (mono - _prune_last[0] < _PRUNE_INTERVAL_S
+            and len(_RECENT_FWD) <= int(_RECENT_MAX * _PRUNE_SLACK)):
+        return
+    _prune_last[0] = mono
+    _prune_recent(now)
+
+
+def _prune_recent_locked(now=None):
     """按 TTL + 条数上限清理复用表，防止无界增长。
 
     后缀索引必须跟着一起删：它是指向 _RECENT_REV 的指针，留着指向已淘汰
@@ -1184,7 +1272,7 @@ def _prune_recent(now=None):
         _suffix_index_del(tok)
     if len(_RECENT_FWD) > _RECENT_MAX:
         evictable = [
-            (k, v) for k, v in _RECENT_FWD.items()
+            (k, v) for k, v in list(_RECENT_FWD.items())
             if not _is_custom_word_orig(k)
         ]
         # 配额只按**可淘汰**条数算：自定义词的规模由词表封顶，不该挤占普通条目的额度。
@@ -1275,10 +1363,11 @@ def _warmup_recent_from_db():
         # 超容量时的稳定排序按插入序删——正序插入保证先删**最旧**映射。
         # 曾按倒序直接写入：恢复 >2000 条时反而把最新的映射先删掉，重启后
         # 活跃会话最需要的占位符还原命中率倒挂（审计 P2）。
-        for tok, orig, label in reversed(collected):
-            _RECENT_FWD[orig] = [tok, label, now]
-            _RECENT_REV[tok] = [orig, label, now]
-            _suffix_index_add(tok)
+        with _STATE_LOCK:
+            for tok, orig, label in reversed(collected):
+                _RECENT_FWD[orig] = [tok, label, now]
+                _RECENT_REV[tok] = [orig, label, now]
+                _suffix_index_add(tok)
         count = len(collected)
         if count > 0:
             _prune_recent(now)
@@ -1289,7 +1378,17 @@ def _warmup_recent_from_db():
 
 
 def _recall_token(orig, label):
-    """取该原文的占位符：TTL 内复用旧的，否则新建并登记。"""
+    """取该原文的占位符：TTL 内复用旧的，否则新建并登记。
+
+    整体持 `_STATE_LOCK`：本函数是**签发占位符的唯一入口**，内部「查后缀占用 →
+    生成 token → 登记三张表」是多步序列，不原子会让两个线程签出同一后缀。
+    """
+    with _STATE_LOCK:
+        return _recall_token_locked(orig, label)
+
+
+def _recall_token_locked(orig, label):
+    """`_recall_token` 的实体；调用方必须已持 `_STATE_LOCK`。"""
     # 安全防套娃：如果 orig 自身就是占位符，严禁为其分配新 token！
     if isinstance(orig, str) and _PLACEHOLDER_RX.match(orig):
         # 尝试反查其真实明文
@@ -1329,7 +1428,7 @@ def _recall_token(orig, label):
     _RECENT_FWD[orig] = [token, label, now]
     _RECENT_REV[token] = [orig, label, now]
     _suffix_index_add(token)
-    _prune_recent(now)
+    _prune_recent_throttled(now)
     return token
 
 
@@ -1362,14 +1461,22 @@ _CUSTOM_WORDS_SORTED = ()
 
 
 def _sorted_custom_words():
-    """CUSTOM_WORDS 按词长降序的元组（长词优先）。"""
+    """CUSTOM_WORDS 按词长降序的元组（长词优先）。
+
+    ⚠️ 本函数**遍历** `CUSTOM_WORDS`。生产路径一律「整体换对象」发布该变量
+    （见 `_maybe_reload`），遍历时不会被并发改写；而直接就地 `clear()/update()`
+    一旦与并发脱敏同时发生就会抛 `RuntimeError: dictionary changed size during
+    iteration`（实测）。测试里改词表请直接赋新 dict。
+    """
     return tuple(sorted(CUSTOM_WORDS.items(), key=lambda kv: len(kv[0]), reverse=True))
 
 
 def _refresh_custom_words_sorted():
     """显式重建排序词表（热重载与测试直改词表后调用，用于预热）。"""
     global _CUSTOM_WORDS_SORTED
-    _CUSTOM_WORDS_SORTED = _sorted_custom_words()
+    with _STATE_LOCK:
+        _CUSTOM_WORDS_SORTED = _sorted_custom_words()
+    # 重建映射必须在**释放** `_STATE_LOCK` 之后调（锁序：_SYNC_LOCK → _STATE_LOCK）。
     _sync_custom_word_mappings()
 
 
@@ -1386,10 +1493,17 @@ def _custom_words_sorted():
     """
     global _CUSTOM_WORDS_SORTED
     cur = _sorted_custom_words()
-    if cur != _CUSTOM_WORDS_SORTED:
-        _CUSTOM_WORDS_SORTED = cur
+    # 比较与赋值必须原子：两个线程同时发现内容变了会各自发布一代，先发布的那代
+    # 可能随即被覆盖，而 `_sync_custom_word_mappings` 已经按它登记过映射。
+    with _STATE_LOCK:
+        changed = cur != _CUSTOM_WORDS_SORTED
+        if changed:
+            _CUSTOM_WORDS_SORTED = cur
+        out = _CUSTOM_WORDS_SORTED
+    # 重建映射在锁外调（它自己先拿 `_SYNC_LOCK` 再拿 `_STATE_LOCK`，不能反过来）。
+    if changed:
         _sync_custom_word_mappings()
-    return _CUSTOM_WORDS_SORTED
+    return out
 
 
 # 凭据的「结构前缀」——这部分不是秘密，是各家公开的格式标记（sk-proj- 就是
@@ -2205,62 +2319,105 @@ def _custom_combined_regex():
 
 
 def _sync_custom_word_mappings():
-    """同步自定义敏感词的永久映射表。
+    """同步自定义敏感词的永久映射表（持 `_SYNC_LOCK` 后交给实体）。
+
+    这里拿的是 `_SYNC_LOCK` 而不是 `_STATE_LOCK`：整表重建里最贵的是**逐词派生**
+    （SHA-256 + 避让探测），词表上千时持 `_STATE_LOCK` 就是百毫秒级，配置保存时
+    在途脱敏只能干等（压测实测 2.4~5.1s 的最坏值就是这类长持锁群众贡献的）。
+    现在只有「取快照」与「换表 + 补登记」两段微秒级临界区碰 `_STATE_LOCK`。
+
+    并发重建由 `_SYNC_LOCK` 串行化：两次重建若并发派生，各自基于同一份旧快照可能
+    派生出同一个后缀 —— 后缀撞车就是把 A 的原文填到 B 的位置，所以派生与落表必须
+    在同一把锁内完成。
+    """
+    with _SYNC_LOCK:
+        return _sync_custom_word_mappings_inner()
+
+
+def _sync_custom_word_mappings_inner():
+    """同步自定义敏感词的永久映射表（调用方必须已持 `_SYNC_LOCK`）。
 
     在启动、热重载或 CUSTOM_WORDS 变动时调用。
     为启用的自定义敏感词生成稳定、跨会话确定性的 6 位纯辅音占位符并永久常驻，
     永不被 TTL 清理或超量淘汰，确保多轮会话或长任务调用工具时稳定还原。
+
+    三阶段：① 锁内取快照 → ② 锁外派生目标映射 → ③ 锁内换表并补 `_RECENT_*`。
     """
     global _CUSTOM_WORD_FWD, _CUSTOM_WORD_REV
     now = time.time()
+    # ⚠️ 这里必须用纯函数 `_sorted_custom_words()`，**不能**用带缓存的
+    # `_custom_words_sorted()`：后者在发现词表变化时会回调 `_sync_custom_word_mappings()`，
+    # 而 `_SYNC_LOCK` 是不可重入的 `Lock` —— 同线程二次获取直接自锁死
+    # （实测：单测套件卡在 CustomWordSuffixCollisionTests，整个门禁被超时杀掉）。
+    # 我们就是同步本身，不需要（也不应该）再触发一次同步。
     active_words = {}
-    for word, label in _custom_words_sorted():
+    for word, label in _sorted_custom_words():
         if word and _custom_word_enabled(word, label):
             active_words[word] = label
 
-    # 清理已从配置中移除或禁用的词
-    stale_words = [w for w in list(_CUSTOM_WORD_FWD.keys()) if w not in active_words]
-    for w in stale_words:
-        tok = _CUSTOM_WORD_FWD.pop(w, None)
-        if tok:
-            _CUSTOM_WORD_REV.pop(tok, None)
+    # ① 快照。避让集合必须并入**全局后缀索引**（_RECENT_SUFFIX，含规则/NER/历史已签发的
+    #    活跃 token），不能只避让自定义词自己的后缀：否则新词一旦撞上某个活跃 token 的
+    #    后缀（标签相同时 = 完整 token 相同），下面 `_RECENT_REV[tok] = ...` 会把那个
+    #    token 静默改指向新词——换会话 / 会话过期后 restore 会把 A 的原文填到 B 的位置上。
+    #    后缀空间 19^6≈4700 万、活跃至多 2000 条，实测约 4.3e-5/词，撞上即静默错值。
+    with _STATE_LOCK:
+        prev_fwd = dict(_CUSTOM_WORD_FWD)                              # word -> token
+        prev_labels = {tok: rec[1] for tok, rec in _CUSTOM_WORD_REV.items()}
+        used_suffixes = {
+            _token_suffix(tok) for tok in _CUSTOM_WORD_REV
+        } | set(_RECENT_SUFFIX)
 
-    # 避让集合必须并入**全局后缀索引**（_RECENT_SUFFIX，含规则/NER/历史已签发的活跃
-    # token），不能只避让自定义词自己的后缀：否则新词一旦撞上某个活跃 token 的后缀
-    # （标签相同时 = 完整 token 相同），下面 `_RECENT_REV[tok] = ...` 会把那个 token
-    # 静默改指向新词——换会话 / 会话过期后 restore 会把 A 的原文填到 B 的位置上。
-    # 后缀空间 19^6≈4700 万、活跃至多 2000 条，实测约 4.3e-5/词，撞上即静默错值。
-    used_suffixes = {
-        _token_suffix(tok) for tok in _CUSTOM_WORD_REV
-    } | set(_RECENT_SUFFIX)
+    # ② 锁外派生：只有「新增词」与「标签变更词」要真的算后缀，未变词直接沿用。
+    new_fwd, new_rev, reissued = {}, {}, []
     for word, label in active_words.items():
-        if word in _CUSTOM_WORD_FWD:
-            tok = _CUSTOM_WORD_FWD[word]
-            old_label = _CUSTOM_WORD_REV.get(tok, [None, None])[1]
-            if old_label == label and _safe_label(old_label) == _safe_label(label):
-                if tok in _CUSTOM_WORD_REV:
-                    _CUSTOM_WORD_REV[tok][2] = now
-                continue
-            # 标签变更时注销旧 token，重新派生
-            _CUSTOM_WORD_REV.pop(tok, None)
-            _RECENT_REV.pop(tok, None)
-            _suffix_index_del(tok)
-
+        tok = prev_fwd.get(word)
+        if tok is not None and prev_labels.get(tok) == label:
+            new_fwd[word] = tok
+            new_rev[tok] = [word, label, now]
+            continue
+        # 旧 token 的后缀**故意不**从 used_suffixes 释放：释放后新词可能复用刚被
+        # 换掉的 token 形态（标签相同时就是同一个 token），客户端历史里那条旧
+        # 占位符会被还原成新词的原文 —— 替换错值比不替换危险得多。
         suffix = _deterministic_suffix(word, used_suffixes)
         used_suffixes.add(suffix)
-        lab = _safe_label(label)
-        tok = "{{%s_%s}}" % (lab, suffix)
-        prev = _RECENT_FWD.get(word)
-        if prev and prev[0] != tok:
-            # 预热/历史带进来的旧 token：换新 token 后必须注销，否则它会留在
-            # REV 与后缀索引里长驻成孤儿（_prune_recent 只按 FWD 扫，碰不到）
-            _RECENT_REV.pop(prev[0], None)
-            _suffix_index_del(prev[0])
-        _CUSTOM_WORD_FWD[word] = tok
-        _CUSTOM_WORD_REV[tok] = [word, label, now]
-        _RECENT_FWD[word] = [tok, label, now]
-        _RECENT_REV[tok] = [word, label, now]
-        _suffix_index_add(tok)
+        tok = "{{%s_%s}}" % (_safe_label(label), suffix)
+        new_fwd[word] = tok
+        new_rev[tok] = [word, label, now]
+        reissued.append((word, tok, label))
+
+    # ③ 锁内换表（整体换对象发布，读者只会看到上一代或新一代）。
+    with _STATE_LOCK:
+        for word, prev_tok in prev_fwd.items():
+            tok = new_fwd.get(word)
+            if tok is None:
+                # 词被移除 / 禁用：只从**永久映射**里摘掉（下面的换表已经做到），
+                # `_RECENT_FWD/_REV` 里那条必须留着 —— 客户端历史里已签发的占位符
+                # 还得靠复用表还原，TTL 到期由 `_prune_recent` 回收。
+                # 曾在这里连 `_RECENT_REV` 一起 pop，直接让 FWD/REV 不互逆
+                # （压测实测 30 例），且旧占位符再也还原不出来。
+                continue
+            if tok != prev_tok:
+                # 标签变更 → 换了 token：旧 token 要连 `_RECENT_REV` 与后缀索引
+                # 一起注销，否则它会带着旧标签长驻成孤儿（`_prune_recent` 只按 FWD
+                # 扫，碰不到）。
+                _CUSTOM_WORD_REV.pop(prev_tok, None)
+                _RECENT_REV.pop(prev_tok, None)
+                _suffix_index_del(prev_tok)
+        _CUSTOM_WORD_FWD = new_fwd
+        _CUSTOM_WORD_REV = new_rev
+        for word, tok, label in reissued:
+            prev = _RECENT_FWD.get(word)
+            if prev and prev[0] != tok:
+                # 预热/历史带进来的旧 token：换新 token 后必须注销，否则它会留在
+                # REV 与后缀索引里长驻成孤儿（_prune_recent 只按 FWD 扫，碰不到）
+                _RECENT_REV.pop(prev[0], None)
+                _suffix_index_del(prev[0])
+            _RECENT_FWD[word] = [tok, label, now]
+            _RECENT_REV[tok] = [word, label, now]
+            # 步②可能与并发签发抢同一后缀（快照到落表之间新签出的 token）：
+            # `_suffix_index_add` 撞车时把该后缀标为歧义、退出兜底匹配 —— 只会少还原，
+            # 不会还原成错值。
+            _suffix_index_add(tok)
 
 
 def _request_scope(body):
@@ -2539,13 +2696,14 @@ def _suffix_index_add(token):
     sfx = _token_suffix(token)
     if not _suffix_indexable(sfx):
         return
-    cur = _RECENT_SUFFIX.get(sfx)
-    if cur is None:
-        _RECENT_SUFFIX[sfx] = token
-    elif cur != token:
-        # _SUFFIX_AMBIGUOUS 是 object()，与任何字符串 != 恒真 -> 撞车标记不会被
-        # 后续登记抹掉；真撞车（两个不同 token 抢同一后缀）的语义不变。
-        _RECENT_SUFFIX[sfx] = _SUFFIX_AMBIGUOUS
+    with _STATE_LOCK:
+        cur = _RECENT_SUFFIX.get(sfx)
+        if cur is None:
+            _RECENT_SUFFIX[sfx] = token
+        elif cur != token:
+            # _SUFFIX_AMBIGUOUS 是 object()，与任何字符串 != 恒真 -> 撞车标记不会被
+            # 后续登记抹掉；真撞车（两个不同 token 抢同一后缀）的语义不变。
+            _RECENT_SUFFIX[sfx] = _SUFFIX_AMBIGUOUS
 
 
 def _suffix_index_del(token):
@@ -2556,8 +2714,9 @@ def _suffix_index_del(token):
     条数极少，留着不影响内存。
     """
     sfx = _token_suffix(token)
-    if sfx and _RECENT_SUFFIX.get(sfx) == token:
-        _RECENT_SUFFIX.pop(sfx, None)
+    with _STATE_LOCK:
+        if sfx and _RECENT_SUFFIX.get(sfx) == token:
+            _RECENT_SUFFIX.pop(sfx, None)
 
 
 def _suffix_real_token(token):
@@ -3160,12 +3319,13 @@ def _touch_recent(token, orig, now=None):
     只刷 REV 的话照样会被连带删掉。
     """
     now = now or time.time()
-    rev = _RECENT_REV.get(token)
-    if rev is not None:
-        rev[2] = now
-    fwd = _RECENT_FWD.get(orig)
-    if fwd is not None and fwd[0] == token:
-        fwd[2] = now
+    with _STATE_LOCK:
+        rev = _RECENT_REV.get(token)
+        if rev is not None:
+            rev[2] = now
+        fwd = _RECENT_FWD.get(orig)
+        if fwd is not None and fwd[0] == token:
+            fwd[2] = now
 
 
 def _lookup(token, sid):
@@ -4320,11 +4480,18 @@ def _seed_known(text, sid):
 
 
 # ===================== 浏览器扩展桥接（Browser Bridge v1）专用入口 =====================
-# 这两个 helper 是 panel 的 /api/ext/mask 端点复用的入口，**不参与代理链路**。
-# 它们都必须由调用方（panel 侧）持 `_EXT_LOCK` 调用：本文件的历史前提是
-# "mitmproxy event loop 单线程同步执行"，`sessions` / `_RECENT_*` 都是无锁全局态，
-# panel 的 Flask 是 threaded，不加锁会让 `_prune_recent` 的 `list()` 快照构造期
-# 撞上并发插入 → RuntimeError。
+# 这两个 helper 是 panel 的 /api/ext/mask 端点复用的入口，**不经代理链路**。
+# 它们都必须由调用方（panel 侧）持 `_EXT_LOCK` 调用：本文件的 `sessions` /
+# `_RECENT_*` 是无锁全局态，panel 的 Flask 是 threaded，不加锁会让 `_prune_recent`
+# 的 `list()` 快照构造期撞上并发插入 → RuntimeError。
+#
+# 代理链路自 2026-09-24 起也跑在自己的专职线程里（见 `_MASK_POOL`），与 panel 的
+# Flask 线程仍不同锁。代理链路的会话由事件循环侧在派发前 `_new_session()` 建好，
+# worker 里的 `mask()` 因此命中已有会话；刚建的会话 `ts` 是当前时刻，`_sweep()` 也不会
+# 回收它（idle≈0 且尚未 inflight），所以 worker 不会插入 `sessions`。
+# 但 `mask()` 里确实留着惰性 `_new_session()` 兜底，这条边界依赖「会话刚被创建」的
+# 时序。因此本文件遍历全局字典一律用 `list()` 快照（见 `_sweep` / `_prune_recent`），
+# 不去赌时序 —— 赌输的代价是 `RuntimeError: dictionary changed size` 把请求打成 502。
 
 def _mask_event_items(sid, limit=30):
     """构造与代理路径**同构**的 MASK 事件明细（items），供 panel 的 ext 端点落库。
@@ -4825,7 +4992,10 @@ def _sweep():
     # 因此再加一道硬上限：ts（每个流块由 _touch 刷新）静默超过 _INFLIGHT_MAX_IDLE
     # 即视为连接已死，强制回收。正常长生成只要还在收数据就会持续 _touch，不受影响。
     dead = []
-    for sid, s in sessions.items():
+    # 快照：本函数跑在事件循环线程，而 `sessions` 会被其他线程（panel 的 ext 桥接、
+    # 以及 worker 里 `mask()` 的惰性 `_new_session`）插入，直接遍历活字典会抛
+    # RuntimeError: dictionary changed size during iteration。
+    for sid, s in list(sessions.items()):
         idle = now - s["ts"]
         if s.get("inflight"):
             if idle > _INFLIGHT_MAX_IDLE:
@@ -4998,7 +5168,190 @@ def _reasoning_effort_hint(reasoning_value):
             f"请检查客户端模型配置的思考强度映射（pi 侧 thinkingLevelMap off→None）")
 
 
-def request(flow: http.HTTPFlow):
+# 单请求的语义识别（NER）总预算。值按 **body 体积** 伸缩，而不是一个固定秒数。
+#
+# 与 `ner_engine.CALL_BUDGET_S` 的区别是层级：那个是「每次调用」的上限，而代理链路
+# 一条长会话有几百个字符串叶子，逐叶子各拿一份等于总量无上限。
+#
+# ⚠️ 曾用固定 2.0s（2026-09-24）：那时它同时承担「防止冻住事件循环」与「限流」两个
+# 职责。冻机问题已由脱敏 offload 到专职线程解决（见 `_MASK_POOL`），而 NER 成本与
+# 正文长度近似线性（实测约 11µs/字节中文）——2.0s 在 200 条/43KB 的长会话上会让
+# **96/200 个「只有 NER 能识别」的中文人名明文出网**（实测，审计 2026-09-24）。
+# 产品承诺是「不泄漏」优先于「快」，所以预算现在只做一件事：病态输入别把单工作线程
+# 占掉几分钟（32MB 请求体全量 NER 约 6 分钟）。
+#
+# 取值依据（`tests/measure_ner_coverage.py` 可复现，均为冷缓存实测）：
+# 单位成本 ≈ **93µs/字节**中文（≈0.28ms/字）—— 43KB ≈ 3.4s、60KB ≈ 5.6s、1MB ≈ 90s；
+# 缓存命中后稳态 ≈ 1ms。因此 10s 打底 + 120s/MB、封顶 60s：常见会话（≤100KB）
+# 拿到 2 倍以上余量而能全部跑完；超过封顶的巨型请求（≳0.4MB）会降级，但**看得见**。
+# ⚠️ 别再凭印象写小这个系数：早期注释把单位成本写成 11µs/字节（差 8 倍），若按那个
+# 算，每 MB 只给 20s，等于对大 body 静默停手 —— 又一次「以为脱了、其实没脱」。
+# 超预算只停用语义识别，确定性规则（正则/词表）照常生效，**且跳过会被如实写进
+# MASK 事件**（ner_truncated / ner_skip_reasons），不再静默降级。
+_NER_REQ_BUDGET_BASE_S = 10.0
+_NER_REQ_BUDGET_PER_MB_S = 120.0
+_NER_REQ_BUDGET_MAX_S = 60.0
+
+
+def _ner_req_budget(body_bytes):
+    """按请求体体积给单请求的 NER 总预算（秒）。纯函数，便于直接断言。"""
+    mb = max(0.0, float(body_bytes or 0)) / (1024.0 * 1024.0)
+    return min(_NER_REQ_BUDGET_MAX_S,
+               _NER_REQ_BUDGET_BASE_S + mb * _NER_REQ_BUDGET_PER_MB_S)
+
+# 脱敏重活专用单工作线程。
+#
+# 为什么必须离开事件循环：`request` 若同步执行，mitmproxy 12 的
+# `addonmanager.invoke_addon` 就是直接在**事件循环线程**里 `res = func(*event.args())`
+# （全仓无 to_thread / run_in_executor）。一次 20 秒的脱敏会把全部 upstream 端口
+# 一起冻住，在途请求的上游连接被上游/中间设备判死断开，客户端看到的是引擎自己
+# 渲染的 502 Bad Gateway + `connection closed`（2026-09-24 实测事故，此前被误判成
+# 上游故障）。offload 之后，排队只增加该请求自身的延迟，不再牵连其他连接。
+#
+# workers=1 是刻意的：既保持「同一时刻只有一段脱敏在跑」这一原有前提
+# （sessions / _RECENT_* 是无锁全局态，见 _mask_event_items 上方的注释），
+# 又避免多线程同时抢 ONNX 推理。
+#
+# 残留窗口（已知、已评估）：线程里跑的同时，事件循环上的下一个请求会执行
+# `_maybe_reload()` / `_sweep()`。前者会重建词表（就地 clear/update），若刚好压在
+# 本线程遍历词表的瞬间会抛异常 —— 走既有 fail-closed 分支阻断，**不会**放行原文；
+# 后者只在会话空闲超过 TTL 时回收，本次会话刚建，不受影响。
+_MASK_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="maskit-mask")
+
+
+class _MaskResult(NamedTuple):
+    """脱敏管线在专职线程里的产出（只带纯数据回事件循环线程）。
+
+    回写 `flow.request.content` 必须在事件循环线程做：那是 mitmproxy 的对象，
+    在线程里碰它会让「钩子跑在循环上」这条隐含前提失效。
+    """
+    masked_bytes: bytes | None   # None = 零改写，客户端字节一个都不动
+    first_diff_byte: int
+    scan_scope: dict
+    role_texts: dict
+    ner_skips: dict              # 本轮语义识别降级原因计数（空 = 全程生效）
+
+
+def _ner_skips_of_this_round():
+    """本轮脱敏里语义识别的降级记账（空 dict = 全程生效）。
+
+    `_note_skip` 写的是当前**线程**的记账，本函数在 worker 线程里调用，取完即清，
+    所以拿到的一定是本次请求这一轮的结果。
+    """
+    try:
+        import ner_engine
+        return ner_engine.request_skips(reset=True)
+    except Exception:
+        return {}
+
+
+def _mask_pipeline_worker(body, sid, raw_content, enum_changed, has_dup_keys, root_is_object):
+    """在 `_MASK_POOL` 线程里跑脱敏重活（纯计算 + 本模块全局态，不碰 mitmproxy 对象）。
+
+    `body` 由调用方解析好传入，就地改写（原实现即如此，调用方后续还要用）。
+    异常一律向上抛：由调用方的 fail-closed 分支决定阻断还是记录，绝不在这里静默放行。
+    """
+    masked_bytes = None
+    first_diff_byte = -1
+    with _ner_doc_budget(_ner_req_budget(len(raw_content))):
+        # 脱敏前记录扫描范围 + 各角色文本（仅内存，归因用，不落原文）
+        scan_scope = _request_scope(body)
+        role_texts = _collect_role_texts(body)
+        # 递归脱敏所有承载正文的顶层字段。逐格式硬编码会漏掉工具调用参数等嵌套位置，
+        # 这里统一走 _mask_tree（内部路径感知：协议位置跳过、业务区强制扫描）。
+        # 注意：必须遍历 body 全部顶层 key——曾只处理白名单 key，顶层自定义业务对象
+        # （customer 等）整体绕过脱敏（审计验收点"任意 customer.id"实测漏检）。
+        # 非字符串/列表/字典（数字/bool/null）_mask_tree 原样返回，无副作用。
+        # body_changed 是单元素 list（可变），由 _mask_hit 在真的替换过时置 True。
+        body_changed = [False]
+        # 顶层**键名**也要过一遍（审计 B2 的「敏感值作键名」）。
+        #
+        # 为什么之前漏了：这里按顶层 key 逐个取值送进 `_mask_tree`，于是键名本身
+        # 一次都没经过 `mask()`。而扩展链路的 `mask_body` 是把整个 body 交给
+        # `_mask_tree`（其 dict 分支会脱敏键名）——**同一个 body 走两条链路结果不同**，
+        # `{"13800138000": "safe"}` 在扩展链路已打码、在代理链路仍原样上行。
+        #
+        # 判据与 `_mask_tree` 的 dict 分支**完全一致**（同一个白名单、同一个 `mask()`），
+        # 不另立一套，否则两边迟早再漂一次。
+        # ⚠️ `_ROOT_WRAP_KEY` 必须原样保留：非对象根（列表根）会被包成
+        # `{__shield_root__: [...]}`，键名一旦被改写，下面 `body[_ROOT_WRAP_KEY]`
+        # 直接 KeyError → 整个脱敏管线抛异常 → fail-closed 503，所有列表根请求全挂。
+        renamed = {}
+        for key in list(body.keys()):
+            new_key = key
+            if (isinstance(key, str) and key != _ROOT_WRAP_KEY
+                    and key not in _MASK_PROTECTED_KEY_NAMES):
+                masked_key = mask(key, sid)
+                if masked_key != key:
+                    new_key = masked_key
+                    body_changed[0] = True
+            # 传进去的仍是**原键**：`_leaf_exempt` 的协议位置判定必须看客户端真实的键名
+            # （同 `_mask_tree` dict 分支的注释）。
+            renamed[new_key] = _mask_tree(body[key], sid, key, flag=body_changed)
+        # 就地替换内容而非给 body 重新绑定：body 是调用方持有的对象，
+        # 下面 enum 清洗 / splice / `masked_root` 都还在用它，且要保持键的插入顺序。
+        body.clear()
+        body.update(renamed)
+
+        # has_dup_keys 必须一起算进脏标记：树里丢了被覆盖的值，判定「没改过」是假的。
+        if body_changed[0] or enum_changed or has_dup_keys:
+            # 只有真的改过才回写请求体。回写方式分三级，目标都是别把「前缀」整体挪位 ——
+            # 上游按前缀做 Prompt Cache，前缀字节一变就整段 miss：
+            #   1) 首选**字节级文本替换**（`_splice_mask`）：直接在客户端原始 JSON 文本上
+            #      做敏感值占位符替换，客户端 body 的排版（空格、缩进、数字写法、转义风格）
+            #      全部原样保留。实测一条带空格 + `\u` 转义的请求：敏感值在 byte 74，
+            #      整棵重序列化的差异位却在 byte 9 —— 中间 65 字节的前缀被白白改掉。
+            #      由等价校验确保结构正确。见 `_splice_mask`。
+            #   2) 替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验才采用；
+            #      不过（含 enum 清洗这类结构性改动，splice 表达不了）就退回下一级。
+            #   3) 退路是整棵重序列化，两个细节同样为了保前缀：
+            #      · separators 用紧凑形态：json.dumps 默认 (", ", ": ") 会在每个
+            #        逗号/冒号后插空格，把 SDK 普遍发的紧凑体整体改写（实测 113→123 字节）。
+            #      · ensure_ascii 跟随客户端已表现出的策略：正文里出现过 `\u` 转义，
+            #        说明客户端用 ensure_ascii=True，我们回写时也转义；否则这次重序列化
+            #        会把 `\u5f20\u4e09` 展开成「张三」，凭空扩大与客户端前缀的字节差异。
+            # 三级回写的都是**同一棵已经脱敏的树**，所以不存在放行原文的路径。
+            masked_root = body if root_is_object else body[_ROOT_WRAP_KEY]
+            masked_raw = None
+            # has_dup_keys 时禁用 splice：丢掉的重复键不在替换表里，而等价校验
+            # （json.loads(spliced) == masked_root）会因为「解析回来仍是那棵折叠后的树」
+            # 而误判通过，于是原文里的敏感值被原样带出去。直接重序列化脱敏树。
+            if BYTE_SPLICE and not enum_changed and not has_dup_keys:
+                try:
+                    spliced = _splice_mask(
+                        raw_content, masked_root,
+                        {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
+                    )
+                except Exception:
+                    spliced = None
+                if spliced is not None:
+                    try:
+                        if json.loads(spliced) == masked_root:
+                            masked_raw = spliced.decode("utf-8")
+                    except Exception:
+                        masked_raw = None
+            if masked_raw is None:
+                masked_raw = json.dumps(
+                    masked_root,
+                    ensure_ascii=(b"\\u" in raw_content),
+                    separators=(",", ":"),
+                )
+            # 历史里带上来的、上一轮遗留的占位符：登记进本会话，响应侧仍能还原（自愈）
+            _seed_known(masked_raw, sid)
+            # 回写由事件循环侧完成（见 _MaskResult）；这里只算出最终字节与差异位。
+            masked_bytes = masked_raw.encode("utf-8")
+            first_diff_byte = _first_diff_byte(raw_content, masked_bytes)
+        else:
+            # 零改写透传：一个敏感词都没命中，就**一个字都不动** flow.request.content。
+            # 除了省一次序列化，更重要的是保证上游收到的字节与客户端发出的完全一致
+            # （含分隔符、键序、\u 转义、数字字面量写法），这是 Prompt Cache 命中的前提。
+            # _seed_known 照常跑：客户端历史里带来的占位符本轮响应若被模型复述仍要能还原。
+            _seed_known(raw_content.decode("utf-8", "replace"), sid)
+    return _MaskResult(masked_bytes, first_diff_byte, scan_scope, role_texts,
+                       _ner_skips_of_this_round())
+
+
+async def request(flow: http.HTTPFlow):
     _maybe_reload()  # 热重载：加词即时生效
     method = getattr(flow.request, "method", "") or ""
     source = _client_source(flow)
@@ -5262,102 +5615,26 @@ def request(flow: http.HTTPFlow):
     # 「上游自己 miss」，也是决定要不要做字节级替换的唯一实测依据。
     body_rewritten = False
     first_diff_byte = -1
+    ner_skips = {}          # 管线异常时下面的 MASK 事件仍会走到（fail-open 分支），需先有默认值
     _mask_t0 = time.perf_counter()
     try:
-        # 脱敏前记录扫描范围 + 各角色文本（仅内存，归因用，不落原文）
-        scan_scope = _request_scope(body)
-        role_texts = _collect_role_texts(body)
-        # 递归脱敏所有承载正文的顶层字段。逐格式硬编码会漏掉工具调用参数等嵌套位置，
-        # 这里统一走 _mask_tree（内部路径感知：协议位置跳过、业务区强制扫描）。
-        # 注意：必须遍历 body 全部顶层 key——曾只处理白名单 key，顶层自定义业务对象
-        # （customer 等）整体绕过脱敏（审计验收点"任意 customer.id"实测漏检）。
-        # 非字符串/列表/字典（数字/bool/null）_mask_tree 原样返回，无副作用。
-        # body_changed 是单元素 list（可变），由 _mask_hit 在真的替换过时置 True。
-        body_changed = [False]
-        # 顶层**键名**也要过一遍（审计 B2 的「敏感值作键名」）。
-        #
-        # 为什么之前漏了：这里按顶层 key 逐个取值送进 `_mask_tree`，于是键名本身
-        # 一次都没经过 `mask()`。而扩展链路的 `mask_body` 是把整个 body 交给
-        # `_mask_tree`（其 dict 分支会脱敏键名）——**同一个 body 走两条链路结果不同**，
-        # `{"13800138000": "safe"}` 在扩展链路已打码、在代理链路仍原样上行。
-        #
-        # 判据与 `_mask_tree` 的 dict 分支**完全一致**（同一个白名单、同一个 `mask()`），
-        # 不另立一套，否则两边迟早再漂一次。
-        # ⚠️ `_ROOT_WRAP_KEY` 必须原样保留：非对象根（列表根）会被包成
-        # `{__shield_root__: [...]}`，键名一旦被改写，下面 `body[_ROOT_WRAP_KEY]`
-        # 直接 KeyError → 整个脱敏管线抛异常 → fail-closed 503，所有列表根请求全挂。
-        renamed = {}
-        for key in list(body.keys()):
-            new_key = key
-            if (isinstance(key, str) and key != _ROOT_WRAP_KEY
-                    and key not in _MASK_PROTECTED_KEY_NAMES):
-                masked_key = mask(key, sid)
-                if masked_key != key:
-                    new_key = masked_key
-                    body_changed[0] = True
-            # 传进去的仍是**原键**：`_leaf_exempt` 的协议位置判定必须看客户端真实的键名
-            # （同 `_mask_tree` dict 分支的注释）。
-            renamed[new_key] = _mask_tree(body[key], sid, key, flag=body_changed)
-        # 就地替换内容而非给 body 重新绑定：body 是调用方持有的对象，
-        # 下面 enum 清洗 / splice / `masked_root` 都还在用它，且要保持键的插入顺序。
-        body.clear()
-        body.update(renamed)
-
-        # has_dup_keys 必须一起算进脏标记：树里丢了被覆盖的值，判定「没改过」是假的。
-        if body_changed[0] or enum_changed or has_dup_keys:
-            # 只有真的改过才回写请求体。回写方式分三级，目标都是别把「前缀」整体挪位 ——
-            # 上游按前缀做 Prompt Cache，前缀字节一变就整段 miss：
-            #   1) 首选**字节级文本替换**（`_splice_mask`）：直接在客户端原始 JSON 文本上
-            #      做敏感值占位符替换，客户端 body 的排版（空格、缩进、数字写法、转义风格）
-            #      全部原样保留。实测一条带空格 + `\u` 转义的请求：敏感值在 byte 74，
-            #      整棵重序列化的差异位却在 byte 9 —— 中间 65 字节的前缀被白白改掉。
-            #      由等价校验确保结构正确。见 `_splice_mask`。
-            #   2) 替换结果必须通过 `json.loads(结果) == 脱敏后的树` 等价校验才采用；
-            #      不过（含 enum 清洗这类结构性改动，splice 表达不了）就退回下一级。
-            #   3) 退路是整棵重序列化，两个细节同样为了保前缀：
-            #      · separators 用紧凑形态：json.dumps 默认 (", ", ": ") 会在每个
-            #        逗号/冒号后插空格，把 SDK 普遍发的紧凑体整体改写（实测 113→123 字节）。
-            #      · ensure_ascii 跟随客户端已表现出的策略：正文里出现过 `\u` 转义，
-            #        说明客户端用 ensure_ascii=True，我们回写时也转义；否则这次重序列化
-            #        会把 `\u5f20\u4e09` 展开成「张三」，凭空扩大与客户端前缀的字节差异。
-            # 三级回写的都是**同一棵已经脱敏的树**，所以不存在放行原文的路径。
-            masked_root = body if root_is_object else body[_ROOT_WRAP_KEY]
-            masked_raw = None
-            # has_dup_keys 时禁用 splice：丢掉的重复键不在替换表里，而等价校验
-            # （json.loads(spliced) == masked_root）会因为「解析回来仍是那棵折叠后的树」
-            # 而误判通过，于是原文里的敏感值被原样带出去。直接重序列化脱敏树。
-            if BYTE_SPLICE and not enum_changed and not has_dup_keys:
-                try:
-                    spliced = _splice_mask(
-                        raw_content, masked_root,
-                        {o: t for o, t in (sessions.get(sid, {}).get("fwd") or {}).items() if t},
-                    )
-                except Exception:
-                    spliced = None
-                if spliced is not None:
-                    try:
-                        if json.loads(spliced) == masked_root:
-                            masked_raw = spliced.decode("utf-8")
-                    except Exception:
-                        masked_raw = None
-            if masked_raw is None:
-                masked_raw = json.dumps(
-                    masked_root,
-                    ensure_ascii=(b"\\u" in raw_content),
-                    separators=(",", ":"),
-                )
-            # 历史里带上来的、上一轮遗留的占位符：登记进本会话，响应侧仍能还原（自愈）
-            _seed_known(masked_raw, sid)
-            flow.request.content = masked_raw.encode("utf-8")
+        # 重活交给专职线程（见 _MASK_POOL）：本函数是 async 钩子，mitmproxy 会在
+        # 事件循环里 await 它——等待期间其他连接的收发照常进行，一条慢会话不再冻住整机。
+        _res = await asyncio.get_running_loop().run_in_executor(
+            _MASK_POOL, _mask_pipeline_worker,
+            body, sid, raw_content, enum_changed, has_dup_keys, root_is_object,
+        )
+        # scan_scope / role_texts 在脱敏前算好带回：后面的 MASK 事件与会话都要用。
+        scan_scope = _res.scan_scope
+        role_texts = _res.role_texts
+        # 本轮语义识别有没有降级（空 dict = 全程生效）：MASK 事件如实上报，
+        # 静默降级等于「以为开了、其实没脱」。
+        ner_skips = _res.ner_skips
+        if _res.masked_bytes is not None:
+            # 回写必须在事件循环线程里做（flow 是 mitmproxy 的对象）。
+            flow.request.content = _res.masked_bytes
             body_rewritten = True
-            first_diff_byte = _first_diff_byte(raw_content, flow.request.content)
-        else:
-            # 零改写透传：一个敏感词都没命中，就**一个字都不动** flow.request.content。
-            # 除了省一次序列化，更重要的是保证上游收到的字节与客户端发出的完全一致
-            # （含分隔符、键序、\u 转义、数字字面量写法），这是 Prompt Cache 命中的前提。
-            # _seed_known 照常跑：客户端历史里带来的占位符本轮响应若被模型复述仍要能还原。
-            _seed_known(raw_content.decode("utf-8", "replace"), sid)
-
+            first_diff_byte = _res.first_diff_byte
     except Exception as e:
         _drop(sid)
         emit_path_err = orig_path if CAPTURE_MODE == "reverse" else path
@@ -5461,6 +5738,10 @@ def request(flow: http.HTTPFlow):
             s_sess["upstream_name"] = matched_up["name"] if matched_up else "" 
             # 脱敏管线耗时（毫秒）：MASK 事件展示，用户可看到代理增加的开销
             s_sess["mask_ms"] = (time.perf_counter() - _mask_t0) * 1000
+            if ner_skips:
+                # 降级明细存会话：详情弹窗按 `_detailSeq` 回源的是 **RESTORE** 事件，
+                # 只挂在 MASK 上的话列表合并行看得到、弹窗看不到（半可见）。
+                s_sess["ner_skips"] = ner_skips
     except Exception:
         pass
     _emit(
@@ -5481,6 +5762,9 @@ def request(flow: http.HTTPFlow):
         short_hits=short_hits,
         stream_mode=stream_mode,
         mask_ms=round((time.perf_counter() - _mask_t0) * 1000, 1),
+        # 语义识别降级审计：本轮是否有叶子没走 NER（预算耗尽 / 单条过长 / 单次超时 /
+        # 模型不可用），以及各原因各几条。非空时事件行会标出来，用户不必再去翻日志。
+        **({"ner_truncated": True, "ner_skip_reasons": ner_skips} if ner_skips else {}),
         # 请求体形态：标准 LLM 形态不带该字段；非对象根 / 白名单外形态各记一种，
         # 便于用户在日志里发现「这条是靠兜底脱敏的」并反馈新协议形态。
         **({"body_shape": "non_object_root"} if not root_is_object
@@ -6686,6 +6970,10 @@ def _emit_restore_summary(flow, sid, host, method, path, source, ok=True, stream
         mask_ms=round(float(s.get("mask_ms") or 0), 1),
         upstream_ms=round((time.perf_counter() - float(s.get("req_t0") or time.perf_counter())) * 1000, 1),
         first_byte_ms=round(float(s.get("first_byte_ms") or 0), 1),
+        # 语义识别降级（本轮有空叶子没走 NER）：与 MASK 事件同源，从会话带过来。
+        # 两边都得有 —— 详情弹窗回源的是 RESTORE，只挂 MASK 等于弹窗里看不到降级。
+        **({"ner_truncated": True, "ner_skip_reasons": s.get("ner_skips")}
+           if s.get("ner_skips") else {}),
         **source,
     )
 
@@ -7018,7 +7306,7 @@ def _maybe_reload(force=False):
     global AUDIT_ENABLED, AUDIT_PASSIVE, AUDIT_ACTIVE_PROBES, AUDIT_SEVERITY_FLOOR, AUDIT_SIGNALS
     global FAIL_CLOSED, RESPONSE_SCAN, STREAM_RESPONSE, STREAM_EXCLUDE_HOSTS
     global SENSITIVE_DISABLED, SENSITIVE_WORD_DISABLED, SENSITIVE_WORD_WHOLE, BUILTIN_RULES, EGRESS_PROXY
-    global COMMAND_BLOCK
+    global COMMAND_BLOCK, _EXTRA_HEADER_SKIP_WARNED, _CUSTOM_WORD_RX_CACHE
     try:
         mt = _DATA_ROOT.joinpath("config.json").stat().st_mtime
     except Exception:
@@ -7036,10 +7324,13 @@ def _maybe_reload(force=False):
     SESSION_TTL = s["ttl"]
     DEBUG = s["debug"]
     DIAGNOSTIC_UNMATCHED = s["diagnostic_unmatched"]
-    CUSTOM_WORDS.clear()
-    CUSTOM_WORDS.update(s["words"])
+    # 整表换对象，不做就地 clear/update：就地重建的中间态里词表是**空的或半填充**
+    # 的，而 `_custom_words_sorted()` 一见内容变化就会把当时的 `CUSTOM_WORDS` 发布
+    # 成当前词表 —— 于是并发那一轮少脱敏用户自定义词，明文直接上行。
+    # 换成整体赋值后，读者只会看到上一代或新一代。
+    CUSTOM_WORDS = dict(s["words"])
     # 配置变更后允许对注入请求头的占位符/空值重新告警一次（用户改了配置就该重新提醒）
-    _EXTRA_HEADER_SKIP_WARNED.clear()
+    _EXTRA_HEADER_SKIP_WARNED = set()
     SENSITIVE_DISABLED = set(s.get("sensitive_disabled") or set())
     SENSITIVE_WORD_DISABLED = {
         k: set(v) for k, v in (s.get("sensitive_word_disabled") or {}).items()
@@ -7049,15 +7340,18 @@ def _maybe_reload(force=False):
     # SENSITIVE_DISABLED / SENSITIVE_WORD_DISABLED 判断哪些词仍启用，放在前面会
     # 永远按上一代配置计算（禁用词要等第二次改配置才被清掉）。
     _refresh_custom_words_sorted()
-    _CUSTOM_WORD_RX_CACHE.clear()  # 词表变更后清编译缓存
-    BUILTIN_RULES = dict(DEFAULT_BUILTIN_RULES)
+    _CUSTOM_WORD_RX_CACHE = {}  # 词表变更后丢掉编译缓存（换对象，不就地 clear）
+    br = dict(DEFAULT_BUILTIN_RULES)
     raw_br = s.get("builtin_rules") or {}
     # 旧配置 IP 键迁移（与 panel.normalize_config 一致）：IP 拆 IP_PRIVATE/IP_INTERNAL
     if "IP" in raw_br and "IP_PRIVATE" not in raw_br:
         raw_br = dict(raw_br)
         raw_br["IP_PRIVATE"] = bool(raw_br.get("IP"))
         raw_br["IP_INTERNAL"] = False
-    BUILTIN_RULES.update(raw_br)
+    br.update(raw_br)
+    # 构建完成后一次性发布：原地 update 会让读者看到「默认值已覆盖、用户开关未生效」
+    # 的中间态（用户刚禁用的规则会短暂重新生效）。
+    BUILTIN_RULES = br
     AUDIT_ENABLED = s["audit_enabled"]
     AUDIT_PASSIVE = s["audit_passive"]
     AUDIT_ACTIVE_PROBES = s["audit_active_probes"]

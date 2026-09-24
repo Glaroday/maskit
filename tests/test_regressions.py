@@ -9,10 +9,13 @@
 - P1-4 响应扫描：无请求脱敏项时也扫描模型回复中的外部 PII
 - P1-5 清空日志竞态：cutoff 前入队的事件不回写
 """
+import asyncio
 import ast
+import inspect
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -30,6 +33,19 @@ sys.path.insert(0, str(ROOT))
 
 import panel
 import transparent as tr
+def _drive_request(flow):
+    """同步驱动脱敏钩子（单元测试用）。
+
+    `transparent.request` 自 2026-09-24 起是 async 钩子：脱敏重活必须 offload 出
+    mitmproxy 事件循环，否则一条长会话会把全部连接冻住（502 事故）。这里用
+    asyncio.run 驱动它，走的仍是生产同一条路径（含专职线程池）。
+    用属性查找调用，测试若 mock.patch.object(tr, "request") 依然生效。
+    """
+    res = tr.request(flow)
+    if asyncio.iscoroutine(res):
+        return asyncio.run(res)
+    return res
+
 import event_store
 import shield_defaults as sd
 import audit_signals
@@ -126,7 +142,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                     ]},
                 ],
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.dumps(json.loads(flow.request.content), ensure_ascii=False)
             # 业务字段必须脱敏（含 URL 里的手机号）
             self.assertNotIn("张三", sent)
@@ -149,7 +165,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                     ]},
                 ],
             }, listen_port=18703)
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.dumps(json.loads(flow.request.content), ensure_ascii=False)
             self.assertNotIn("13812345678", sent, "tool input 的 url 字段里的手机号必须脱敏")
             self.assertNotIn("张三", sent)
@@ -163,7 +179,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                     {"type": "image_url", "image_url": {"url": "https://img.example.com/a.png"}},
                 ]}],
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             got = json.loads(flow.request.content)
             self.assertEqual(got["messages"][0]["content"][0]["image_url"]["url"],
                              "https://img.example.com/a.png")
@@ -175,7 +191,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
             flow = self._flow("anthropic.com", "/v1/messages", {
                 "messages": [{"role": "user", "content": "客户张三"}],
             }, listen_port=18703)
-            tr.request(flow)
+            _drive_request(flow)
             sid = flow.metadata["session_id"]
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             token = re.search(tr._PLACEHOLDER_RX, masked).group(0)
@@ -214,7 +230,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                     ]},
                 ],
             }, listen_port=18703)
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.dumps(json.loads(flow.request.content), ensure_ascii=False)
             for phone in ("13812345678", "13900001111", "13612345678", "13712345678", "13512345678", "13812345679"):
                 self.assertNotIn(phone, sent, f"input.{['type','role','model','id','url','data'][['13812345678','13900001111','13612345678','13712345678','13512345678','13812345679'].index(phone)]} 里的号码必须脱敏")
@@ -231,7 +247,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 "messages": [{"role": "user", "content": "查一下"}],
                 "customer": {"id": "11010519491231002X", "type": "13812345678"},
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             got = json.loads(flow.request.content)
             # 身份证号（GB 11643 校验位合法）→ 脱敏；type 里的手机号 → 脱敏
             self.assertNotIn("11010519491231002X", json.dumps(got, ensure_ascii=False))
@@ -248,7 +264,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                     {"role": "assistant", "content": [{"type": "text", "text": "好的"}]},
                 ],
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             got = json.loads(flow.request.content)
             self.assertEqual(got["model"], "gpt-4o-mini")
             self.assertEqual(got["messages"][0]["role"], "user")
@@ -266,7 +282,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 "functions": [{"name": "get_weather", "description": "查询张三的天气"}],
                 "messages": [{"role": "user", "content": "查天气"}],
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             got = json.loads(flow.request.content)
             self.assertEqual(got["functions"][0]["name"], "get_weather")
             self.assertNotIn("张三", got["functions"][0]["description"], "description 业务文本应脱敏")
@@ -283,7 +299,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                     node = {"n": node}
                 body = {"messages": [{"role": "user", "content": node}]}
                 flow = self._flow("api.openai.com", "/v1/chat/completions", body, listen_port=18701)
-                tr.request(flow)
+                _drive_request(flow)
                 self.assertIsNotNone(flow.response, "深度超限必须阻断")
                 self.assertEqual(flow.response.status_code, 503)
                 self.assertIn(b"shield_mask_failed", flow.response.content)
@@ -322,7 +338,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 '"content":"帮我看看这段代码"}],"stream":true}'
             ).encode("utf-8")
             flow = build(compact)
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(
                 flow.request.content, compact,
                 "无敏感词时请求体必须逐字节透传（含分隔符与键序）",
@@ -334,7 +350,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 '"content":"\\u5e2e\\u6211\\u770b\\u770b"}],"stream":true}'
             ).encode("utf-8")
             flow = build(escaped)
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(
                 flow.request.content, escaped,
                 "无敏感词时连 \\u 转义形态都必须原样保留",
@@ -346,7 +362,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 '"content":"我的手机号是13812345678"}]}'
             ).encode("utf-8")
             flow = build(dirty)
-            tr.request(flow)
+            _drive_request(flow)
             out = flow.request.content
             text = out.decode("utf-8")
             self.assertNotEqual(out, dirty, "命中敏感词必须回写")
@@ -362,7 +378,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 '"content":"\\u5e2e\\u6211\\u770b\\u770b 13812345678"}]}'
             ).encode("utf-8")
             flow = build(mixed)
-            tr.request(flow)
+            _drive_request(flow)
             out = flow.request.content
             self.assertNotIn("13812345678", out.decode("utf-8"), "手机号必须脱敏")
             self.assertIn(b"\\u5e2e", out, "客户端用 \\u 转义时回写必须沿用同一策略")
@@ -375,7 +391,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 b'"messages":[{"role":"user","content":"hello"}]}\n'
             )
             flow = build(odd)
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(
                 flow.request.content, odd,
                 "无敏感词时必须原样透传，不做任何规范化",
@@ -407,7 +423,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                 ],
                 "messages": [{"role": "user", "content": "hi"}],
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             body = json.loads(flow.request.content)
             self.assertEqual(
                 body["system"][0]["cache_control"], {"type": "ephemeral"},
@@ -447,7 +463,7 @@ class MaskPathAwarenessTests(unittest.TestCase):
                     },
                 },
             }, listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             sent = json.dumps(json.loads(flow.request.content), ensure_ascii=False)
             self.assertNotIn("张三", sent, "response_format 里的业务取值仍必须脱敏")
             self.assertIn("{{NAME_", sent, "应签发 NAME 占位符")
@@ -475,7 +491,7 @@ class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
         def run():
             flow = self._flow("api.openai.com", "/v1/chat/completions", body,
                               listen_port=18701)
-            tr.request(flow)
+            _drive_request(flow)
             holder["text"] = flow.request.content.decode("utf-8")
             holder["obj"] = json.loads(flow.request.content)
 
@@ -541,7 +557,7 @@ class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {},
                               listen_port=18701)
             flow.request.content = raw1.encode("utf-8")
-            tr.request(flow)
+            _drive_request(flow)
             holder["text"] = flow.request.content.decode("utf-8")
 
         self._with_no_reload(run1)
@@ -557,7 +573,7 @@ class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {},
                               listen_port=18701)
             flow.request.content = raw2.encode("utf-8")
-            tr.request(flow)
+            _drive_request(flow)
             holder2["text"] = flow.request.content.decode("utf-8")
 
         self._with_no_reload(run2)
@@ -577,7 +593,7 @@ class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {},
                               listen_port=18701)
             flow.request.content = raw.encode("utf-8")
-            tr.request(flow)
+            _drive_request(flow)
             holder["text"] = flow.request.content.decode("utf-8")
 
         self._with_no_reload(run)
@@ -681,7 +697,7 @@ class MaskedValueTypeCoverageTests(MaskPathAwarenessTests):
             flow = self._flow("api.openai.com", "/v1/chat/completions", {},
                               listen_port=18701)
             flow.request.content = raw.encode("utf-8")
-            tr.request(flow)
+            _drive_request(flow)
             holder["status"] = getattr(flow.response, "status_code", None)
             holder["text"] = flow.request.content.decode("utf-8")
 
@@ -807,7 +823,7 @@ class PromptCacheByteFidelityTests(unittest.TestCase):
         try:
             tr._maybe_reload = lambda force=False: None
             tr._emit = lambda *args, **kwargs: None
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._maybe_reload, tr._emit = old_reload, old_emit
         return flow
@@ -1032,7 +1048,7 @@ class CredentialRedactionTests(unittest.TestCase):
         )
 
     def test_mask_event_credential_items_have_no_original(self):
-        captured = self._capture(lambda: tr.request(self._flow(
+        captured = self._capture(lambda: _drive_request(self._flow(
             "api.openai.com", "/v1/chat/completions",
             {"messages": [{"role": "user", "content": "key=sk-1234567890abcdefghijklmnopqrst"}]})))
         mask = [kw for typ, kw in captured if typ == "MASK"][0]
@@ -1051,7 +1067,7 @@ class CredentialRedactionTests(unittest.TestCase):
         def run():
             flow = self._flow("api.openai.com", "/v1/chat/completions",
                               {"messages": [{"role": "user", "content": "key=sk-1234567890abcdefghijklmnopqrst"}]})
-            tr.request(flow)
+            _drive_request(flow)
             masked = json.loads(flow.request.content)["messages"][0]["content"]
             flow.response = SimpleNamespace(
                 headers={"content-type": "application/json"},
@@ -1077,7 +1093,7 @@ class CredentialRedactionTests(unittest.TestCase):
         connstr = "postgres://usr:Zq9xLm2pTv8w@db.internal:5432/prod"
         f1 = self._flow("api.openai.com", "/v1/chat/completions",
                         {"messages": [{"role": "user", "content": "connect " + connstr}]})
-        tr.request(f1)
+        _drive_request(f1)
         m1 = json.loads(f1.request.content)["messages"][0]["content"]
         token_match = re.search(r"\{\{CONNSTR_[A-Za-z0-9]+\}\}", m1)
         self.assertIsNotNone(token_match, "应成功提取连接串占位符")
@@ -1087,7 +1103,7 @@ class CredentialRedactionTests(unittest.TestCase):
         def run_f2():
             f2 = self._flow("api.openai.com", "/v1/chat/completions",
                             {"messages": [{"role": "user", "content": "hello"}]})
-            tr.request(f2)
+            _drive_request(f2)
             f2.response = SimpleNamespace(
                 headers={"content-type": "application/json"},
                 status_code=200,
@@ -1104,7 +1120,7 @@ class CredentialRedactionTests(unittest.TestCase):
 
     def test_non_credential_pii_keeps_original_for_detail_dialog(self):
         """非凭据 PII 仍保留 original（项目约定：明文只进详情弹窗）。"""
-        captured = self._capture(lambda: tr.request(self._flow(
+        captured = self._capture(lambda: _drive_request(self._flow(
             "api.openai.com", "/v1/chat/completions",
             {"messages": [{"role": "user", "content": "电话13812345678"}]})))
         mask = [kw for typ, kw in captured if typ == "MASK"][0]
@@ -1578,7 +1594,7 @@ class ReverseRoutingPathPrefixTests(unittest.TestCase):
             flow = self._reverse_flow("/chat/completions", {
                 "messages": [{"role": "user", "content": "你好"}]
             }, listen_port=18709)
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(flow.request.host, "api.example.com")
             self.assertEqual(flow.request.path, "/v1/chat/completions",
                              "target 路径前缀必须拼回（透传层同口径，审计 P1-3）")
@@ -1590,7 +1606,7 @@ class ReverseRoutingPathPrefixTests(unittest.TestCase):
             flow = self._reverse_flow("/upstream-a/chat/completions", {
                 "messages": [{"role": "user", "content": "你好"}]
             })
-            tr.request(flow)
+            _drive_request(flow)
             self.assertEqual(flow.request.path, "/v1/chat/completions")
         self._no_reload(run)
 
@@ -3113,7 +3129,7 @@ class StabilityFixTests(unittest.TestCase):
         tr.FILTER_ENABLED = True
         tr.is_target = lambda host, path: True
 
-        tr.request(flow)
+        _drive_request(flow)
         self.assertIsNotNone(flow.response, "超限必须直接回响应，不能放行上行")
         self.assertEqual(flow.response.status_code, 413)
         blocks = [kw for typ, kw in captured if typ == "BLOCK"]
@@ -4140,7 +4156,7 @@ class RequestCoverageTests(_RuleTestBase):
         try:
             tr._maybe_reload = lambda force=False: None
             tr._emit = lambda *a, **k: None
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._maybe_reload, tr._emit = old_reload, old_emit
         return json.loads(flow.request.content)
@@ -4441,7 +4457,7 @@ class UnknownBodyShapeTests(unittest.TestCase):
         try:
             tr._maybe_reload = lambda force=False: None
             tr._emit = lambda *a, **k: None
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._maybe_reload, tr._emit = old_reload, old_emit
         return flow.request.content.decode("utf-8"), flow
@@ -5148,7 +5164,7 @@ class FailClosedCaptureModeTests(unittest.TestCase):
         try:
             tr._emit = lambda *a, **k: None
             tr._maybe_reload = lambda force=False: None
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._emit, tr._maybe_reload = old_emit, old_reload
         return (flow.request.content or b"").decode()
@@ -6254,7 +6270,7 @@ class ReverseRoutingQueryAndCompatTests(unittest.TestCase):
         try:
             tr._emit = lambda *a, **k: None
             tr._maybe_reload = lambda force=False: None
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._emit, tr._maybe_reload = old_emit, old_reload
         # 只要没有被 503 阻断，说明成功通过 Content-Type 检查
@@ -6295,7 +6311,7 @@ class ReverseRoutingQueryAndCompatTests(unittest.TestCase):
             f1 = SimpleNamespace(request=req1, response=None, metadata={},
                                 client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
                                 server_conn=SimpleNamespace(via=None))
-            tr.request(f1)
+            _drive_request(f1)
             self.assertEqual(f1.request.content, raw_clean, "无敏感词请求体必须逐字节完全一致")
 
             # 场景 2：客户端使用 \\u 转义中文字面量（无敏感词）
@@ -6308,7 +6324,7 @@ class ReverseRoutingQueryAndCompatTests(unittest.TestCase):
             f2 = SimpleNamespace(request=req2, response=None, metadata={},
                                 client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
                                 server_conn=SimpleNamespace(via=None))
-            tr.request(f2)
+            _drive_request(f2)
             self.assertEqual(f2.request.content, raw_escaped, "未命中敏感词的转义体必须原样保留")
 
             # 场景 3：命中真实敏感词（必须使用紧凑分隔符 separators=(',', ':')）
@@ -6321,7 +6337,7 @@ class ReverseRoutingQueryAndCompatTests(unittest.TestCase):
             f3 = SimpleNamespace(request=req3, response=None, metadata={},
                                 client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
                                 server_conn=SimpleNamespace(via=None))
-            tr.request(f3)
+            _drive_request(f3)
             self.assertNotIn(b"13800138000", f3.request.content)
             self.assertIn(b"{{PHONE_", f3.request.content)
             # 紧凑格式：不应有 ", " 或 ": "（默认 json.dumps 分隔符空格）
@@ -6351,7 +6367,7 @@ class ReverseRoutingQueryAndCompatTests(unittest.TestCase):
             tr._emit = lambda *a, **k: None
             tr._maybe_reload = lambda force=False: None
             tr.FAIL_CLOSED = True
-            tr.request(flow)
+            _drive_request(flow)
         finally:
             tr._emit, tr._maybe_reload, tr.FAIL_CLOSED = old_emit, old_reload, old_fc
         self.assertIsNotNone(flow.response, "未配置路径的 POST 请求必须被拦截，绝不能静默透传放行")
@@ -7251,3 +7267,707 @@ class NerPriorityContractTests(unittest.TestCase):
                         "长实体必须优先命中，避免短实体消费后留下 '丰' 字明文")
         self.assertNotIn("丰", res[:len("{{NAME_longest}}") + 1])
 
+
+
+class MaskOffloadTests(unittest.TestCase):
+    """2026-09-24 事故回归：脱敏重活必须离开 mitmproxy 事件循环。
+
+    事故链条：`request` 曾是同步钩子，而 mitmproxy 12 的 `invoke_addon` 直接在事件
+    循环线程里 `res = func(*event.args())`。一条 300+ 条消息的会话脱敏实测 24.7 秒
+    （其中 97% 是逐字符串叶子的 NER 推理），期间全部 upstream 端口一起冻结，在途请求
+    的上游连接被上游/中间设备判死断开，客户端拿到的是引擎自己渲染的 502
+    `connection closed`（此前被误判成「上游网关故障」）。
+    """
+
+    def setUp(self):
+        tr.sessions.clear()
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update({"张三": "NAME"})
+        tr.SENSITIVE_DISABLED = set()
+        tr.SENSITIVE_WORD_DISABLED = {}
+        tr.BUILTIN_RULES = dict(tr.DEFAULT_BUILTIN_RULES)
+        tr._CUSTOM_WORD_RX_CACHE.clear()
+        tr.UPSTREAMS = list(tr.DEFAULT_UPSTREAMS)
+        tr.CAPTURE_MODE = "reverse"
+
+    def _flow(self, body):
+        return SimpleNamespace(
+            request=SimpleNamespace(
+                pretty_host="api.openai.com", path="/v1/chat/completions", method="POST",
+                headers={"content-type": "application/json"},
+                content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                host="api.openai.com", port=5802, scheme="http",
+            ),
+            response=None, metadata={},
+            client_conn=SimpleNamespace(sockname=("127.0.0.1", 18701)),
+        )
+
+    def _drive(self, flow):
+        """屏蔽热重载与事件落库（只测执行位置 / 预算接线，不产生副作用）。"""
+        with mock.patch.object(tr, "_maybe_reload", lambda force=False: None), \
+             mock.patch.object(tr, "_emit", lambda *a, **k: None):
+            return _drive_request(flow)
+
+    def test_request_hook_is_async(self):
+        """钩子必须是 async：同步钩子没法把重活交给线程，只能阻塞事件循环。"""
+        self.assertTrue(asyncio.iscoroutinefunction(tr.request),
+                        "transparent.request 必须保持 async（脱敏重活要 offload 出事件循环）")
+
+    def test_mask_pipeline_runs_off_the_caller_thread(self):
+        """脱敏管线必须在专职线程里跑（跑在事件循环线程上就会冻住全部连接）。"""
+        seen = {}
+        real = tr._mask_pipeline_worker
+
+        def spy(*a, **k):
+            seen["worker"] = threading.get_ident()
+            return real(*a, **k)
+
+        flow = self._flow({"model": "gpt-4o-mini",
+                           "messages": [{"role": "user", "content": "电话是13812345678"}]})
+        with mock.patch.object(tr, "_mask_pipeline_worker", spy):
+            self._drive(flow)
+        self.assertIn("worker", seen, "脱敏管线没有被执行")
+        self.assertNotEqual(seen["worker"], threading.get_ident(),
+                            "脱敏管线跑在调用方（事件循环）线程上：会冻住全部连接")
+        # 换线程不等于跳过脱敏：结果照旧要打码
+        self.assertNotIn("13812345678", flow.request.content.decode("utf-8"))
+
+    def test_proxy_path_opens_ner_total_budget(self):
+        """代理链路必须给 NER 开**总**预算，且预算按 body 体积伸缩。
+
+        `ner_engine.CALL_BUDGET_S` 只管「单次调用」；一条长会话有几百个字符串叶子，
+        逐叶子各拿一份等于总量无上限。但预算本身不能太小 —— 固定 2.0s 的旧值实测
+        让 200 条/43KB 会话里 96/200 个「只有 NER 能识别」的中文人名明文出网。
+        """
+        import ner_engine
+        seen = []
+        real = ner_engine.begin_budget
+
+        def spy(seconds):
+            seen.append(seconds)
+            return real(seconds)
+
+        flow = self._flow({"model": "gpt-4o-mini",
+                           "messages": [{"role": "user", "content": "张三"}]})
+        raw_len = len(flow.request.content)      # 脱敏会改写 content，先量原始长度
+        with mock.patch.object(ner_engine, "begin_budget", spy):
+            self._drive(flow)
+        self.assertEqual(seen, [tr._ner_req_budget(raw_len)],
+                         "代理链路的 NER 总预算没打开或值与体积不匹配")
+
+    def test_ner_budget_scales_with_body_and_stays_generous(self):
+        """预算按体积线性伸缩、有上下界，且对真实长会话足够宽。
+
+        实测成本（冷缓存、中文，见 tests/measure_ner_coverage.py）：43KB ≈ 3.9s、
+        1MB ≈ 11s。旧固定值 2.0s 在 200 条/43KB 上会让 96/200 个 NER-only 人名
+        明文出网 —— 所以这里守住「43KB 至少给 10s」。
+        """
+        self.assertAlmostEqual(tr._ner_req_budget(0), tr._NER_REQ_BUDGET_BASE_S, places=3)
+        self.assertGreater(tr._ner_req_budget(43 * 1024), 10.0,
+                           "43KB 长会话的预算偏小（实测需 ~3.4s）")
+        self.assertGreater(tr._ner_req_budget(500 * 1024),
+                           tr._ner_req_budget(100 * 1024), "预算必须随体积增长")
+        self.assertLessEqual(tr._ner_req_budget(20 * 1024 * 1024), tr._NER_REQ_BUDGET_MAX_S,
+                             "必须有上限：32MB 请求体全量 NER 要几分钟")
+        for weird in (None, -5, 0.0):
+            self.assertAlmostEqual(tr._ner_req_budget(weird), tr._NER_REQ_BUDGET_BASE_S,
+                                   places=3, msg="异常输入不能炸也不能放宽")
+
+    def test_ner_degradation_is_surfaced_in_mask_event(self):
+        """降级必须可见：本轮有叶子没走 NER 时，MASK 事件必须带 ner_truncated。
+
+        静默降级等于「以为开了、其实没脱」—— 这正是预算跑偏期间发生的事：事件行看
+        起来一切正常，实际那一轮语义实体全明文上行。
+        """
+        import ner_engine
+        events = []
+        flow = self._flow({"model": "gpt-4o-mini",
+                           "messages": [{"role": "user", "content": "张三是13812345678"}]})
+        with mock.patch.object(tr, "_maybe_reload", lambda force=False: None), \
+             mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))), \
+             mock.patch.object(ner_engine, "request_skips",
+                               lambda reset=False: {"budget_exhausted": 3}):
+            asyncio.run(tr.request(flow))
+        mask = [kw for typ, kw in events if typ == "MASK"]
+        self.assertTrue(mask, "未发出 MASK 事件")
+        self.assertTrue(mask[0].get("ner_truncated"), "降级未在 MASK 事件里标出")
+        self.assertEqual(mask[0].get("ner_skip_reasons"), {"budget_exhausted": 3})
+
+    def test_ner_too_long_limit_is_generous(self):
+        """单条长度上限不能太低：超过就**整条**不做 NER（比预算更容易咬人）。
+
+        真实流量里出现过 6208 字的单条正文，旧上限 2000 字让那条里的中文人名全明文。
+        """
+        import ner_engine
+        self.assertGreaterEqual(ner_engine.MAX_TEXT_CHARS, 20000,
+                                "单条上限过小会让长叶子整条不做语义识别")
+
+    def test_call_budget_can_finish_a_max_length_leaf(self):
+        """单次调用上限必须够跑完一条达到长度上限的文本。
+
+        不够时会形成一个很贵的稳态：超时 → `complete=False` → 负缓存**不写** →
+        同一段文本每轮都从头冷推。实测 20000 字撞上旧的 2.0s 上限：
+        2123 / 2013 / 2049 ms，缓存条数恒为 0（真实流量里的长系统提示词就是这样）。
+        成本模型实测约 0.25ms/字（见 ner_engine 顶部注释）。
+        """
+        import ner_engine
+        need_s = ner_engine.MAX_TEXT_CHARS * 0.25 / 1000.0
+        self.assertGreaterEqual(
+            ner_engine.CALL_BUDGET_S, need_s,
+            "单次上限 %.1fs 低于跑完 %d 字所需的 %.1fs：会长叶子每轮重付冷推理"
+            % (ner_engine.CALL_BUDGET_S, ner_engine.MAX_TEXT_CHARS, need_s))
+
+    def test_call_budget_can_finish_a_max_length_leaf(self):
+        """单次调用上限必须够跑完一条达到长度上限的文本，**并且留出余量**。
+
+        不够时会形成一个很贵的稳态：超时（`deadline`）→ `complete=False` → 负缓存
+        **不写** → 同一段文本每轮都从头冷推。实测 20000 字/60KB：旧的 2.0s 上限下是
+        2123 / 2013 / 2049 ms、缓存条数恒为 0；6.0s 能跑完（5588ms）但只剩 7% 余量，
+        机器稍慢就退回陷阱 —— 所以要求至少 1.5 倍余量。
+        单位成本实测 0.28ms/字（≈3 字节/汉字 → 93µs/字节，见 ner_engine 顶部注释）。
+        """
+        import ner_engine
+        need_s = ner_engine.MAX_TEXT_CHARS * 0.28 / 1000.0
+        self.assertGreaterEqual(
+            ner_engine.CALL_BUDGET_S, need_s * 1.5,
+            "单次上限 %.1fs 不足跑完 %d 字（实测需 %.1fs）的 1.5 倍：超长叶子会每轮重付冷推理"
+            % (ner_engine.CALL_BUDGET_S, ner_engine.MAX_TEXT_CHARS, need_s))
+
+    def test_request_budget_per_mb_matches_measured_cost(self):
+        """请求级预算的每 MB 系数必须按**实测**单位成本（93µs/字节）标定。
+
+        早期注释把单位成本写成 11µs/字节（差 8 倍），若照那个算，每 MB 只给 20s，
+        中等体积的请求会在半途静默停手 —— 又一次「以为脱了、其实没脱」。
+        """
+        per_mb_need = 1024 * 1024 * 93 / 1_000_000.0      # 1MB 中文的实测 NER 成本（秒）
+        self.assertGreaterEqual(
+            tr._NER_REQ_BUDGET_PER_MB_S, per_mb_need * 0.8,
+            "每 MB 预算 %.0fs 低于实测成本 %.0fs 太多（注释与取值必须同源）"
+            % (tr._NER_REQ_BUDGET_PER_MB_S, per_mb_need))
+        self.assertGreaterEqual(tr._NER_REQ_BUDGET_MAX_S, tr._NER_REQ_BUDGET_BASE_S)
+
+    def test_ner_degradation_reaches_restore_event_too(self):
+        """降级必须同时出现在 MASK 与 RESTORE 上。
+
+        详情弹窗按 `_detailSeq` 回源的是 **RESTORE** 事件；只挂在 MASK 上的话列表合并
+        行看得到、弹窗里看不到 —— 用户点开详情反而看不到降级，等于半可见。
+        """
+        import ner_engine
+
+        events = []
+        flow = self._flow({"model": "gpt-4o-mini",
+                           "messages": [{"role": "user", "content": "张三是13812345678"}]})
+        with mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))), \
+             mock.patch.object(tr, "_maybe_reload", lambda force=False: None), \
+             mock.patch.object(ner_engine, "request_skips",
+                               lambda reset=False: {"budget_exhausted": 2}):
+            _drive_request(flow)
+            flow.response = SimpleNamespace(
+                headers={"content-type": "application/json"},
+                status_code=200,
+                content=json.dumps({"choices": [{"message": {"content": "收到"}}]},
+                                   ensure_ascii=False).encode("utf-8"),
+            )
+            tr.response(flow)
+
+        for typ in ("MASK", "RESTORE"):
+            ev = [kw for t, kw in events if t == typ]
+            self.assertTrue(ev, "未发出 %s 事件" % typ)
+            self.assertTrue(ev[0].get("ner_truncated"), "%s 事件缺少降级标记（弹窗看不到）" % typ)
+            self.assertEqual(ev[0].get("ner_skip_reasons"), {"budget_exhausted": 2})
+
+    def test_worker_failure_still_fails_closed(self):
+        """线程里抛异常必须原样带回：仍走 fail-closed 503，绝不因为搬了执行位置就放行原文。"""
+        old = tr.FAIL_CLOSED
+        tr.FAIL_CLOSED = True
+        try:
+            flow = self._flow({"model": "gpt-4o-mini",
+                               "messages": [{"role": "user", "content": "张三是13812345678"}]})
+            with mock.patch.object(tr, "_mask_pipeline_worker", side_effect=ValueError("boom")):
+                self._drive(flow)
+            self.assertIsNotNone(flow.response, "脱敏失败必须阻断，不能放行")
+            self.assertEqual(flow.response.status_code, 503)
+        finally:
+            tr.FAIL_CLOSED = old
+
+    def test_ner_cache_holds_a_long_conversation(self):
+        """缓存必须装得下一条长会话的叶子，否则 LRU 每轮整批挤出 → 命中率≈0 → 每轮冷启全量重推。"""
+        import ner_engine
+        self.assertGreaterEqual(ner_engine._CACHE_MAX, 1024,
+                                "缓存容量必须能装下长会话的叶子数（事故根因之一）")
+        saved = list(ner_engine._CACHE.items())
+        saved_chars = ner_engine._CACHE_CHARS
+        saved_max = (ner_engine._CACHE_MAX, ner_engine._CACHE_MAX_CHARS)
+
+        def reset(max_n, max_chars):
+            ner_engine._CACHE.clear()
+            ner_engine._CACHE_CHARS = 0
+            ner_engine._CACHE_MAX, ner_engine._CACHE_MAX_CHARS = max_n, max_chars
+
+        try:
+            # 条数上限生效
+            reset(4, 10 ** 9)
+            for i in range(10):
+                ner_engine._cache_put("t%d" % i, [])
+            self.assertEqual(len(ner_engine._CACHE), 4)
+            # 同键覆盖不能把字符计数一直涨上去（否则缓存会被自己的计数挤空）
+            reset(4096, 10 ** 9)
+            for _ in range(50):
+                ner_engine._cache_put("same", [])
+            self.assertEqual(ner_engine._CACHE_CHARS, len("same"))
+            # 字符总量上限生效，且计数与实际内容始终一致
+            reset(4096, 30)
+            for i in range(10):
+                ner_engine._cache_put("k%05d" % i, [])
+            self.assertLessEqual(ner_engine._CACHE_CHARS, 30)
+            self.assertEqual(ner_engine._CACHE_CHARS,
+                             sum(len(k) for k in ner_engine._CACHE))
+        finally:
+            ner_engine._CACHE.clear()
+            ner_engine._CACHE.update(saved)
+            ner_engine._CACHE_CHARS = saved_chars
+            ner_engine._CACHE_MAX, ner_engine._CACHE_MAX_CHARS = saved_max
+
+
+
+
+class SharedStateConcurrencyTests(unittest.TestCase):
+    """2026-09-24：共享全局表的并发改造回归。
+
+    脱敏不再是「只有 mitmproxy 事件循环一个线程」在跑：代理链路的脱敏搬到了
+    `_MASK_POOL` 专职线程，panel 扩展桥接另有 Flask 线程。这里锁住三条不变量：
+
+    1) 热重载必须**换对象**发布 —— 曾经对 `CUSTOM_WORDS` 就地 `clear()+update()`，
+       并发读者可能看到半填充词表并把它当当前词表发布，那一轮少脱敏用户自定义词；
+    2) 并发签发占位符不得后缀撞车 —— 同一 token 指向两个原文，还原时张冠李戴；
+    3) 成批清理与并发签发互斥 —— 不再抛 `dictionary changed size during iteration`。
+    """
+
+    def setUp(self):
+        self._saved = {
+            "root": tr._DATA_ROOT,
+            "emit": tr._emit,
+            "words": dict(tr.CUSTOM_WORDS),
+            "builtin": dict(tr.BUILTIN_RULES),
+            "disabled": set(tr.SENSITIVE_DISABLED),
+        }
+        tr._emit = lambda *a, **k: None
+        tr.sessions.clear()
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+        tr.CUSTOM_WORDS.clear()
+        tr._CUSTOM_WORD_FWD.clear()
+        tr._CUSTOM_WORD_REV.clear()
+        tr._CUSTOM_WORDS_SORTED = ()
+        tr.SENSITIVE_DISABLED = set()
+        tr.SENSITIVE_WORD_DISABLED = {}
+        tr.BUILTIN_RULES = dict(tr.DEFAULT_BUILTIN_RULES)
+
+    def tearDown(self):
+        tr._DATA_ROOT = self._saved["root"]
+        tr._emit = self._saved["emit"]
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update(self._saved["words"])
+        tr.BUILTIN_RULES = self._saved["builtin"]
+        tr.SENSITIVE_DISABLED = self._saved["disabled"]
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+        tr.sessions.clear()
+
+    def _write_config(self, tmp, cfg):
+        (tmp / "config.json").write_text(
+            json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+    def test_reload_publishes_custom_words_atomically(self):
+        """热重载必须换对象发布，且不得就地改写上一代对象。
+
+        就地 clear/update 的中间态里 `CUSTOM_WORDS` 是空的或半填充的，而
+        `_custom_words_sorted()` 一见内容变化就把当时的内容发布成当前词表 ——
+        并发那一个请求就会漏掉用户自定义词（明文直接上行）。
+        """
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            tr._DATA_ROOT = tmp
+            self._write_config(tmp, {"sensitive": {"人名": ["甲甲"]}})
+            tr._maybe_reload(force=True)
+            first = tr.CUSTOM_WORDS
+            self.assertEqual(list(first), ["甲甲"])
+
+            self._write_config(tmp, {"sensitive": {"人名": ["乙乙", "丙丙"]}})
+            tr._maybe_reload(force=True)
+            self.assertIsNot(first, tr.CUSTOM_WORDS,
+                             "热重载必须整体换对象，不能就地 clear/update")
+            self.assertEqual(sorted(tr.CUSTOM_WORDS), ["丙丙", "乙乙"])
+            self.assertEqual(list(first), ["甲甲"],
+                             "上一代对象内容被就地改写，并发读者手里的那一代会失真")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_builtin_rule_switch_publishes_atomically(self):
+        """规则开关同理：不能出现「默认值已覆盖、用户开关未生效」的中间态。"""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            tr._DATA_ROOT = tmp
+            self._write_config(tmp, {"builtin_rules": {"PRIVATE_KEY": False, "PHONE": False}})
+            tr._maybe_reload(force=True)
+            self.assertFalse(tr.BUILTIN_RULES.get("PRIVATE_KEY"))
+            self.assertFalse(tr.BUILTIN_RULES.get("PHONE"))
+            self.assertTrue(tr.BUILTIN_RULES.get("EMAIL"),
+                            "整体发布不能把未提及的默认规则丢掉")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_concurrent_signing_keeps_reverse_maps_consistent(self):
+        """8 线程并发签发 + 并发清理：不得抛异常，且反向映射必须自洽。
+
+        后缀撞车是本测试的核心目标：`_new_token` 的「查占用 → 生成 → 登记」不原子时，
+        两个线程能签出同一后缀，于是同一个 token 指向两个原文，还原阶段会把 A 的
+        原文填到 B 的位置（错值比不还原危险得多）。
+        """
+        errs = []
+        stop = threading.Event()
+
+        def signer(tid):
+            try:
+                for i in range(30):
+                    tr.mask("联系人%d号%d 电话13900000000" % (tid, i), "sid-%d" % tid)
+            except Exception as e:  # pragma: no cover - 命中即回归
+                errs.append("%s: %s" % (type(e).__name__, e))
+
+        def pruner():
+            try:
+                while not stop.is_set():
+                    tr._prune_recent(now=time.time() + 10 ** 6)
+            except Exception as e:  # pragma: no cover - 命中即回归
+                errs.append("%s: %s" % (type(e).__name__, e))
+
+        threads = [threading.Thread(target=signer, args=(t,)) for t in range(8)]
+        threads.append(threading.Thread(target=pruner))
+        for t in threads:
+            t.start()
+        for t in threads[:8]:
+            t.join(timeout=120)
+        stop.set()
+        threads[8].join(timeout=30)
+
+        self.assertEqual(errs, [], "并发路径抛异常（多为遍历 dict 时被并发改动）")
+        self.assertNotIn(tr._SUFFIX_AMBIGUOUS, tr._RECENT_SUFFIX.values(),
+                         "后缀撞车：同一后缀指向了多个 token，还原会张冠李戴")
+        for orig, rec in list(tr._RECENT_FWD.items()):
+            token = rec[0]
+            self.assertIn(token, tr._RECENT_REV, "FWD 里的 token 在 REV 中缺失")
+            self.assertEqual(tr._RECENT_REV[token][0], orig, "FWD/REV 不再互逆")
+            sfx = tr._token_suffix(token)
+            if tr._suffix_indexable(sfx):
+                self.assertEqual(tr._RECENT_SUFFIX.get(sfx), token,
+                                 "后缀索引指向了别的 token")
+
+    def test_removing_custom_word_keeps_reuse_table_consistent(self):
+        """移除自定义词只能摸掉**永久映射**，复用表里那条必须留着。
+
+        已签发的占位符还躺在客户端历史里，下一轮请求会原样带回来；复用表是唯一能把
+        它还原成原文的地方（永久映射摸掉后仍由 TTL 管理）。两阶段重建曾在这里连
+        `_RECENT_REV` 一起 pop → FWD/REV 不互逆（压测实测 30 例），且旧占位符永久
+        无法还原。
+        """
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update({"甲词": "甲类", "乙词": "甲类"})
+        tr._refresh_custom_words_sorted()
+        masked = tr.mask("甲词和乙词", "cw-remove")
+        self.assertNotIn("甲词", masked)
+        tok = tr._RECENT_FWD["甲词"][0]
+        self.assertEqual(tr._CUSTOM_WORD_FWD["甲词"], tok)
+
+        tr.CUSTOM_WORDS.pop("甲词")
+        tr._refresh_custom_words_sorted()
+
+        self.assertNotIn("甲词", tr._CUSTOM_WORD_FWD, "永久映射应该摸掉")
+        self.assertNotIn("甲词", tr._CUSTOM_WORD_REV.values(), "永久反向映射也不能留")
+        self.assertEqual(tr._RECENT_FWD["甲词"][0], tok, "已签发的占位符不该被抢走")
+        self.assertEqual(tr._RECENT_REV[tok][0], "甲词", "FWD/REV 必须仍互逆")
+        self.assertEqual(tr.restore("带 " + tok + " 的文本", "cw-remove"),
+                         "带 甲词 的文本",
+                         "摸掉永久映射后，已签发的占位符仍要能还原")
+
+    def test_lock_order_survives_mixed_concurrent_access(self):
+        """锁序回归：`_STATE_LOCK` 与 `_SYNC_LOCK` 不得跨线程形成 ABBA，也不得自锁死。
+
+        曾经的形态（实测踩过）：`_sync_custom_word_mappings_inner` 内部调带缓存的
+        `_custom_words_sorted()`，而后者在词表变化时会**回调同步** —— `_SYNC_LOCK`
+        是不可重入的 `Lock`，同线程二次获取直接自锁死（套件卡死、门禁被超时杀掉）。
+
+        这里让三类调用并发跑一段固定时间：锁序被改坏时 join 会超时并**失败**，
+        而不是把整个套件挂死。
+        """
+        errors = []
+        stop = threading.Event()
+
+        def masker():
+            try:
+                while not stop.is_set():
+                    tr.mask("联系人张三与李四", "lockorder")
+            except Exception as e:  # pragma: no cover - 命中即回归
+                errors.append("masker: %s: %s" % (type(e).__name__, e))
+
+        def syncer():
+            try:
+                while not stop.is_set():
+                    tr._sync_custom_word_mappings()
+            except Exception as e:  # pragma: no cover - 命中即回归
+                errors.append("syncer: %s: %s" % (type(e).__name__, e))
+
+        def resorter():
+            try:
+                while not stop.is_set():
+                    # 必须**换对象**发布（生产路径也是这么做的）：就地 clear/update 会让
+                    # 正在遍历它的脱敏线程抛 RuntimeError（dictionary changed size）。
+                    tr.CUSTOM_WORDS = {"词%d" % i: "甲类" for i in range(20)}
+                    tr._custom_words_sorted()      # 该路径会回调同步（曾经的死锁点）
+            except Exception as e:  # pragma: no cover - 命中即回归
+                errors.append("resorter: %s: %s" % (type(e).__name__, e))
+
+        threads = [threading.Thread(target=masker), threading.Thread(target=syncer),
+                   threading.Thread(target=resorter)]
+        for t in threads:
+            t.start()
+        time.sleep(0.4)
+        stop.set()
+        for t in threads:
+            t.join(timeout=15)
+        self.assertFalse([t for t in threads if t.is_alive()],
+                         "锁序退化成死锁：线程在 15s 内没退出")
+        self.assertEqual(errors, [])
+
+    def test_signing_entrypoints_hold_the_state_lock(self):
+        """结构性断言：签发/清理/映射重建三个入口必须仍是持锁包装。
+
+        并发不变量靠这几处的锁成立；后人若把包装拆掉（直接调 `_xxx_locked`），
+        并发用例仍可能偶然通过，所以这里显式守住入口形态。
+
+        注意重建用的是 `_SYNC_LOCK`（锁序在 `_STATE_LOCK` 外，见其 docstring），
+        不是 `_STATE_LOCK` —— 两者职责不同，不能合并。
+        """
+        expect = {
+            tr._recall_token: ("_STATE_LOCK", "_locked("),
+            tr._prune_recent: ("_STATE_LOCK", "_locked("),
+            tr._sync_custom_word_mappings: ("_SYNC_LOCK", "_inner("),
+        }
+        for fn, (lock, inner) in expect.items():
+            src = inspect.getsource(fn)
+            self.assertIn(lock, src, "%s 必须持 %s" % (fn.__name__, lock))
+            self.assertIn(inner, src, "%s 应转交复合实体" % fn.__name__)
+        self.assertIsInstance(tr._STATE_LOCK, type(threading.RLock()),
+                              "签发路径内部会再进 _touch_recent / _prune_recent，必须可重入")
+        self.assertIsInstance(tr._SYNC_LOCK, type(threading.Lock()),
+                              "重建锁只在最外层持有，不可重入（内层再用就是设计错了）")
+
+    def test_pem_private_key_rule_is_linear_on_pathological_input(self):
+        """PEM 规则在病态输入下必须近似线性，且语义不变。
+
+        禁止写回 `-----BEGIN…[\\s\\S]{20,}?…-----END…`：没有 END 时惰性量词会从
+        每一个 BEGIN 位置一路试到字符串末尾，实测 1.49MB + 200 个未闭合私钥头
+        耗 880ms（典型 O(n²)），而这段跑在脱敏管线上，等于把请求拖慢。
+        """
+        pems = [rx for rx, label, _ in tr.RULES if label == "PRIVATE_KEY"]
+        self.assertEqual(len(pems), 1, "PEM 规则应只有一条")
+        pem = pems[0]
+
+        # ⚠️ 头/尾必须用拼接写成片段：`scripts/audit-public-release.py` 会把含**完整**
+        # BEGIN…END 私钥块的文件判为「疑似真实私钥明文」并拦下发版
+        # （AUDIT-2026-09-19 就是这么把 CI 的 version job 打红的）。拼接后扫描正则
+        # 不再命中，被测语义完全不变 —— 别为了「看着整齐」改回单一字符串。
+        head = "-----BEGIN " + "RSA PRIVATE KEY-----"
+        tail = "-----END " + "RSA PRIVATE KEY-----"
+
+        bad = (head + "\n" + "x" * 7450) * 200  # ≈1.49MB
+        t0 = time.perf_counter()
+        pem.search(bad)
+        cost = time.perf_counter() - t0
+        self.assertLess(cost, 0.25,
+                        "PEM 规则疑似退化回 O(n²)：1.49MB 病态输入耗时 %.3fs" % cost)
+
+        real = head + "\nMIIEowIBAAKCAQEAx7VvQmFzZTY0Ym9keVE=\n" + tail
+        self.assertTrue(pem.search(real), "真实 PEM 块必须仍能命中")
+        # PRIVATE_KEY 在面板里默认关闭（重规则），要验整块脱敏得先显式打开
+        with mock.patch.dict(tr.BUILTIN_RULES, {"PRIVATE_KEY": True}):
+            out = tr.mask("私钥如下：\n" + real + "\n结束", "pem-sid")
+        self.assertNotIn("MIIEowIBAAKCAQEAx7VvQmFzZTY0Ym9keVE", out,
+                         "整块正文必须被替换掉，不能只脱头尾")
+
+
+class NerSkipReasonSurfacesTests(unittest.TestCase):
+    """引擎报出的每个跳过原因，都必须在两个界面上有落点（跟语言契约测试）。
+
+    历史事故：引擎侧的键集合变了（`infer_failed`/`deadline` 才是真的推理失败/超时键，
+    而新加的原因只写「按请求」一份账、从不进全局统计），设置页那份清单没跟着走，
+    于是「本进程有部分文本未做语义识别」那行永远不显示这些原因 —— 降级在界面上等于
+    不存在。这类漂移只能靠契约测试守，不能靠注释里的「记得同步加一行」。
+    """
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def _engine_skip_keys(self):
+        keys = set()
+        for name in ("ner_engine.py", "transparent.py"):
+            src = (self.ROOT / "engine" / name).read_text(encoding="utf-8")
+            # _note_skip("k") / record_skip("k", ...) / _ner_warn_once("k", ...)
+            for m in re.finditer(r'(?:_note_skip|record_skip|_ner_warn_once)\(\s*"([a-z_]+)"', src):
+                keys.add(m.group(1))
+        return keys
+
+    def test_every_engine_skip_key_has_a_frontend_surface(self):
+        keys = self._engine_skip_keys()
+        # 非空转：正则失效时这两个断言会先失败，而不是悄悄通过
+        self.assertIn("too_long", keys)
+        self.assertIn("deadline", keys)
+        self.assertIn("model_unavailable", keys)
+        dialog = (self.ROOT / "frontend/src/components/events/EventDetailDialog.tsx").read_text(encoding="utf-8")
+        settings = (self.ROOT / "frontend/src/pages/Settings.tsx").read_text(encoding="utf-8")
+        i18n = (self.ROOT / "frontend/src/lib/i18n.tsx").read_text(encoding="utf-8")
+        for k in sorted(keys):
+            self.assertIn("%s:" % k, dialog, "详情弹窗的 NER_SKIP_LABELS 缺 %s" % k)
+            self.assertIn("'%s'" % k, settings, "设置页的 NER_SKIP_ITEMS 缺 %s" % k)
+        # 弹窗引用的标签键必须**真在字典里**（中英各一份），否则用户看到的是裸键名
+        for m in re.finditer(r"'settings\.sw\.nerSkip[A-Za-z]+'", dialog):
+            key = m.group(0).strip("'")
+            self.assertGreaterEqual(i18n.count("'%s':" % key), 2,
+                                    "i18n 缺少 %s（需中英双语）" % key)
+
+
+class NerCacheConcurrencyTests(unittest.TestCase):
+    """NER 缓存被多线程共享：计数与实际内容必须始终一致。"""
+
+    def test_concurrent_cache_put_keeps_counter_exact(self):
+        """轰炸并发写入：`_CACHE_CHARS` 必须等于实际键长之和（读改写需互斥）。
+
+        计数偏高会让缓存被自己提前挤空（反而废掉缓存修复），偏低会让字符总量
+        上限失效（内存无界）；命中后的 `move_to_end` 撞上并发 `popitem` 还会抛 KeyError。
+        """
+        import ner_engine
+        saved = list(ner_engine._CACHE.items())
+        saved_chars = ner_engine._CACHE_CHARS
+        saved_max = (ner_engine._CACHE_MAX, ner_engine._CACHE_MAX_CHARS)
+        errs = []
+        try:
+            ner_engine._CACHE.clear()
+            ner_engine._CACHE_CHARS = 0
+            ner_engine._CACHE_MAX = 64
+            ner_engine._CACHE_MAX_CHARS = 10 ** 9
+
+            def work(tid):
+                try:
+                    for i in range(200):
+                        ner_engine._cache_put("t%d-%d" % (tid, i), [])
+                except Exception as e:  # pragma: no cover - 命中即回归
+                    errs.append("%s: %s" % (type(e).__name__, e))
+
+            threads = [threading.Thread(target=work, args=(t,)) for t in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=120)
+
+            self.assertEqual(errs, [])
+            self.assertLessEqual(len(ner_engine._CACHE), ner_engine._CACHE_MAX)
+            self.assertEqual(ner_engine._CACHE_CHARS,
+                             sum(len(k) for k in ner_engine._CACHE),
+                             "字符计数与实际内容不一致：淘汰判据已失真")
+        finally:
+            ner_engine._CACHE.clear()
+            ner_engine._CACHE.update(saved)
+            ner_engine._CACHE_CHARS = saved_chars
+            ner_engine._CACHE_MAX, ner_engine._CACHE_MAX_CHARS = saved_max
+
+
+
+class RecentTableThrottleTests(unittest.TestCase):
+    """复用表清理的节流（2026-09-24 性能整改）。
+
+    `_recall_token` 原来每签发一个**新**占位符就全集扫一遍 `_RECENT_FWD`（表满
+    2000 条时 154µs/次），300 个新实体的请求光这项约 46ms —— 且写成
+    `len <= _RECENT_MAX` 跳过时更糟：表正好等于上限时该条件为真，于是每次插入都
+    跨过上限、每次签发都扫一遍，实测 143ms/300 次。现在窗口内允许小幅超出，
+    到 `_PRUNE_SLACK` 倍才强制回收。
+    """
+
+    def setUp(self):
+        self._saved = {
+            "max": tr._RECENT_MAX, "last": tr._prune_last[0],
+            "words": dict(tr.CUSTOM_WORDS), "emit": tr._emit,
+        }
+        tr._emit = lambda *a, **k: None
+        tr.CUSTOM_WORDS.clear()
+        tr._CUSTOM_WORD_FWD.clear()
+        tr._CUSTOM_WORD_REV.clear()
+        tr._CUSTOM_WORDS_SORTED = ()
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+        tr._RECENT_MAX = 200
+        tr._prune_last[0] = time.monotonic()
+
+    def tearDown(self):
+        tr._RECENT_MAX = self._saved["max"]
+        tr._prune_last[0] = self._saved["last"]
+        tr._emit = self._saved["emit"]
+        tr.CUSTOM_WORDS.clear()
+        tr.CUSTOM_WORDS.update(self._saved["words"])
+        tr._RECENT_FWD.clear()
+        tr._RECENT_REV.clear()
+        tr._RECENT_SUFFIX.clear()
+
+    def _fill(self, n):
+        now = time.time()
+        for i in range(n):
+            tr._RECENT_FWD["旧%d" % i] = ["{{NAME_a%05d}}" % i, "NAME", now]
+            tr._RECENT_REV["{{NAME_a%05d}}" % i] = ["旧%d" % i, "NAME", now]
+
+    def test_hot_path_prunes_in_batches_not_per_token(self):
+        """热路径清理次数必须是「每批一次」，不是「每个占位符一次」。"""
+        self._fill(tr._RECENT_MAX)
+        real = tr._prune_recent
+        calls = []
+
+        def spy(now=None):
+            calls.append(now)
+            return real(now)
+
+        with mock.patch.object(tr, "_prune_recent", spy):
+            for i in range(300):
+                tr._recall_token("新增%d" % i, "NAME")
+
+        self.assertLessEqual(len(calls), 10,
+                             "热路径仍在逐次全集清理：300 次签发触发了 %d 次清理" % len(calls))
+        self.assertLessEqual(len(tr._RECENT_FWD), int(tr._RECENT_MAX * tr._PRUNE_SLACK),
+                             "节流不能变成不设上限")
+
+    def test_capacity_is_still_bounded_under_sustained_load(self):
+        """持续签发下复用表必须有界（节流只放宽回收时机，不取消容量上界）。"""
+        self._fill(tr._RECENT_MAX)
+        for i in range(2000):
+            tr._recall_token("持续%d" % i, "NAME")
+        self.assertLessEqual(len(tr._RECENT_FWD), int(tr._RECENT_MAX * tr._PRUNE_SLACK))
+
+    def test_hot_path_uses_throttled_variant(self):
+        """结构性断言：签发路径必须走节流版，别被改回直接调用。"""
+        src = inspect.getsource(tr._recall_token_locked)
+        self.assertIn("_prune_recent_throttled(", src,
+                      "签发热路径必须用节流清理")
+        self.assertNotIn("_prune_recent(now)", src,
+                         "签发热路径不得直接调全集清理")
+
+    def test_direct_prune_keeps_immediate_semantics(self):
+        """`_prune_recent()` 本身语义不变：直接调仍立刻按 TTL 与上限清理。
+
+        启动预热与既有测试都依赖这条 —— 节流只发生在调用点，不进清理函数本身。
+        """
+        self._fill(tr._RECENT_MAX + 50)
+        tr._RECENT_FWD["久远"] = ["{{NAME_zombie}}", "NAME", time.time() - 90 * 86400]
+        tr._RECENT_REV["{{NAME_zombie}}"] = ["久远", "NAME", time.time() - 90 * 86400]
+        tr._prune_recent()
+        self.assertNotIn("久远", tr._RECENT_FWD, "直接调用仍须立刻清掉过期条目")
+        self.assertLessEqual(len(tr._RECENT_FWD), tr._RECENT_MAX)

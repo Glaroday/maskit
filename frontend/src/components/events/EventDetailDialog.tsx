@@ -42,6 +42,30 @@ function formatDuration(ms?: number | null): string {
 }
 
 /**
+ * 语义识别（NER）降级原因 → i18n 键。
+ *
+ * **只用 `settings.sw.nerSkip*` 这一套标签**：设置页与详情弹窗共用同一份文案，
+ * 避免两处各维护一份又互相漂移（当初就是设置页列了 6 个键、其中一个早已不产生、
+ * 而真在产生的两个没列，界面上直接看不到）。
+ *
+ * 键的空间（引擎侧）：ner_engine 的 too_long / budget_exhausted / infer_failed /
+ * deadline / model_unavailable，以及 transparent 经 `record_skip` 上报的
+ * model_missing / om_compose / runtime。未知原因（后端将来新增）直接回退到原始键名
+ * —— 降级信息宁可粗糙也绝不能不显示（不显示就等于静默降级）。
+ * 一致性由 tests/test_regressions.py::NerSkipReasonSurfacesTests 守。
+ */
+const NER_SKIP_LABELS: Record<string, string> = {
+  too_long: 'settings.sw.nerSkipTooLong',
+  budget_exhausted: 'settings.sw.nerSkipBudget',
+  infer_failed: 'settings.sw.nerSkipInfer',
+  deadline: 'settings.sw.nerSkipDeadline',
+  model_unavailable: 'settings.sw.nerSkipModelUnavailable',
+  model_missing: 'settings.sw.nerSkipModelMissing',
+  om_compose: 'settings.sw.nerSkipCompose',
+  runtime: 'settings.sw.nerSkipRuntime',
+}
+
+/**
  * 在正文里高亮「被还原回来的原文」。
  *
  * 存在的理由：还原是这个软件的核心动作，但对着一段几千字的回复，
@@ -260,6 +284,25 @@ export function EventDetailDialog({
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
                 {event.msg && <div className="whitespace-pre-wrap">{event.msg}</div>}
                 {event.reason && <div className="mt-1 text-muted-foreground">{event.reason}</div>}
+              </div>
+            )}
+
+            {/* 语义识别（NER）降级提示。
+                「静默降级」＝用户以为开了、其实没脱：正则/词表照常，但只有 NER 能识别的
+                人名/机构/地址会整段明文上行（实测长会话下漏过 101/200 个人名）。
+                所以一旦命中就必须在这条事件的详情里说清「为什么漏、漏了几条」，
+                让用户能自己决定是调大预算还是关掉语义识别。 */}
+            {event.ner_truncated && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
+                <div className="font-semibold">{t('detail.nerDegraded')}</div>
+                <div className="mt-1 text-muted-foreground">{t('detail.nerDegradedHint')}</div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {Object.entries(event.ner_skip_reasons ?? {}).map(([k, n]) => (
+                    <Badge key={k} variant="outline" className="text-[11px] font-normal">
+                      {t(NER_SKIP_LABELS[k] || k)} × {n}
+                    </Badge>
+                  ))}
+                </div>
               </div>
             )}
 

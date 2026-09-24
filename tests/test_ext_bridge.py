@@ -10,6 +10,7 @@
 - (A)/(B) 判据只有一条：响应带 `blocking is True` 才是 (A)。403
   `ext_bridge_disabled` / `ext_bridge_disabled` 之流属 (B)，**响应里不许出现 blocking**。
 """
+import ast
 import json
 import os
 import re
@@ -352,6 +353,41 @@ class ExtOriginTests(ExtBridgeTestCase):
 
 class MaskRestoreTests(ExtBridgeTestCase):
     """T1 mask→restore 闭环 / T2 跨 chunk 劈半 / T3 final 冲刷 / T4 孤儿占位符。"""
+
+    def test_ner_budget_and_degradation_are_reported(self):
+        """扩展链路必须给语义识别开**总**预算，并把降级上报（响应 + MASK 事件）。
+
+        本端点此前完全没有总预算：`CALL_BUDGET_S` 只管单次调用，管不了「一个请求体里
+        有多少个字符串叶子」，大 body 会按秒级占住 Flask 线程（扩展侧 HTTP 超时更短）。
+        而降级只写日志不上报就是静默降级：用户看到「已脱敏」，实际只有 NER 能识别的
+        人名/机构/地址整段明文上行（代理链路实测漏过 101/200 个人名）。
+        """
+        import ner_engine
+        text = "联系人张阿明，电话 13800001234"
+        seen = []
+        real = ner_engine.begin_budget
+
+        def spy(seconds):
+            seen.append(seconds)
+            return real(seconds)
+
+        events = []
+        with mock.patch.object(ner_engine, "begin_budget", spy), \
+             mock.patch.object(ner_engine, "request_skips",
+                               lambda reset=False: {"budget_exhausted": 1}), \
+             mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))):
+            r = self._mask(text)
+        j = r.get_json()
+        self.assertTrue(j.get("ok"), j)
+        self.assertEqual(len(seen), 1, "扩展链路没开语义识别总预算")
+        self.assertAlmostEqual(seen[0], tr._ner_req_budget(len(text.encode("utf-8"))), places=3,
+                               msg="预算应与代理链路同口径（按体积伸缩）")
+        self.assertEqual(j.get("ner_skipped"), {"budget_exhausted": 1},
+                         "降级必须随响应回给扩展")
+        mask = [kw for typ, kw in events if typ == "MASK"]
+        self.assertTrue(mask, "降级轮没落 MASK 事件（0 命中时也必须记，否则静默降级）")
+        self.assertTrue(mask[0].get("ner_truncated"), "降级未在 MASK 事件里标出")
+        self.assertEqual(mask[0].get("ner_skip_reasons"), {"budget_exhausted": 1})
 
     def test_t1_roundtrip_phone_email_secret(self):
         j = self._mask(FULL_BODY).get_json()
@@ -1631,3 +1667,84 @@ class UnsupportedBodyWarnTests(ExtBridgeTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtLockCoverageTests(unittest.TestCase):
+    """机械守住「panel 侧碰 transparent 共享态必须持 _EXT_LOCK」。
+
+    原来靠人工逐个线程核（`_watchdog` / `_do` / `_audit_scan_worker` / Flask 线程都有
+    碰 `tr.*` 的可能），漏一个就是并发改 transparent 的全局表 —— 而脱敏搬进专职线程
+    后，这类并发才真正会出现（后缀撞车 / 半填充词表 / 遍历时 dict 变长）。
+
+    改成扫 `panel.py` 的 AST：所有会碰共享可变态的 `tr.<name>` 访问必须落在某个
+    `with _EXT_LOCK:` 块内；新增裸调用会让本用例直接变红。
+    """
+
+    # 会读或改 transparent 共享可变态的入口。新增此类入口时一并加进来。
+    # 故意**不含** `_emit` / `_emit_skip`：它们只 `enqueue_event()`，进的是事件库
+    # （自带队列与批量写线程的并发设计），不属 `_STATE_LOCK` 领地 —— 而且不该在
+    # 持状态锁时写库。
+    STATE_TOUCHING = {
+        "mask", "mask_body", "restore", "restore_stream_chunk",
+        "_maybe_reload", "_sweep", "_new_session", "_touch", "_mask_event_items",
+        "_take_orphans_without_session", "_prune_recent", "_recall_token",
+        "_sync_custom_word_mappings", "_drop",
+        "sessions", "_RECENT_REV", "_CUSTOM_WORD_REV", "_CUSTOM_WORD_FWD",
+        "_RECENT_FWD", "_RECENT_SUFFIX",
+    }
+    # 豁免：这些访问在「只在锁内被调用」的 helper 里，AST 看不到调用链。
+    # 豁免不是白名单豁免 —— 下面第二个用例会校验这些 helper 的**所有调用点**确实在锁内。
+    ALLOWED_OUTSIDE = {
+        ("_sweep_throttled", "_sweep"),
+        ("_convert_and_mask_legacy_office", "mask_body"),
+        ("mask_ooxml_bytes", "mask_body"),
+    }
+
+    def _analyze(self):
+        """返回 (tr 属性访问, 普通函数调用) 两张表，各带「是否在 _EXT_LOCK 内 / 所在函数」。"""
+        path = Path(__file__).resolve().parents[1] / "engine" / "panel.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        attrs, calls = [], []
+
+        def walk(node, locked, func):
+            for child in ast.iter_child_nodes(node):
+                l2, f2 = locked, func
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    f2 = child.name
+                if isinstance(child, ast.With) and any(
+                        ast.unparse(item.context_expr) == "_EXT_LOCK" for item in child.items):
+                    l2 = True
+                if (isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name)
+                        and child.value.id == "tr"):
+                    attrs.append((child.attr, locked, func, child.lineno))
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                    calls.append((child.func.id, locked, func, child.lineno))
+                walk(child, l2, f2)
+
+        walk(tree, False, "<module>")
+        return attrs, calls
+
+    def test_state_touching_calls_are_under_ext_lock(self):
+        attrs, _ = self._analyze()
+        bad = [
+            "line %d: tr.%s in %s()" % (ln, attr, func)
+            for attr, locked, func, ln in attrs
+            if attr in self.STATE_TOUCHING and not locked
+            and (func, attr) not in self.ALLOWED_OUTSIDE
+        ]
+        self.assertEqual(bad, [], "panel 侧碰 transparent 共享态的调用必须持 _EXT_LOCK：\n" + "\n".join(bad))
+
+    def test_exempted_helpers_are_only_called_under_lock(self):
+        """豁免的 helper 必须真的只在锁内被调 —— 否则豁免本身就是个洞。
+
+        豁免可传递：`mask_ooxml_bytes` 是锁内专用，它内部再调
+        `_convert_and_mask_legacy_office` 同样只在锁内路径上（两者都在豁免名单里）。
+        """
+        _, calls = self._analyze()
+        helpers = {func for func, _ in self.ALLOWED_OUTSIDE}
+        bad = [
+            "line %d: %s() 在锁外被调用（%s）" % (ln, name, func)
+            for name, locked, func, ln in calls
+            if name in helpers and not locked and func not in helpers
+        ]
+        self.assertEqual(bad, [], "锁内专用 helper 被锁外调用：\n" + "\n".join(bad))

@@ -15,7 +15,7 @@ Data Maskit 控制面板 - 本地 Flask 服务
 # 本程序基于「希望有用」的目的分发，但不附带任何担保；亦无对适销性或特定用途
 # 适用性的默示担保。详见 GNU Affero 通用公共许可证。
 # 你应已随本程序收到一份 GNU AGPL 副本；若无，见 <https://www.gnu.org/licenses/>。
-__version__ = '0.4.0'
+__version__ = '0.5.0'
 import json
 import codecs
 import copy
@@ -5818,7 +5818,14 @@ def api_logs_export():
 # 会对 `_RECENT_FWD` 做 `list()` 快照，构造期并发插入会 RuntimeError → 用模块级
 # `_EXT_LOCK` 把 transparent 调用段整体串行化。
 #
-# ⚠️ 锁序规矩：**禁止在 `_EXT_LOCK` 临界区内调用任何会碰 panel 配置锁（cfg_lock）
+# 2026-09-24 补充：代理链路的脱敏也搬到了自己的专职线程（`transparent._MASK_POOL`），
+# 于是「panel 侧之间」的 `_EXT_LOCK` 不再足以保护 transparent 的全局表。
+# 全局表本身的互斥改由 `transparent._STATE_LOCK` 负责（签发占位符、复用表清理、
+# 映射重建）；`_EXT_LOCK` 继续管 panel 侧自己的不变量（`_EXT_STATS`、会话 inflight 等）。
+#
+# ⚠️ 锁序规矩：`_EXT_LOCK` → `transparent._STATE_LOCK`，**永远不能反向**。
+# transparent 不回调 panel、不持锁做 I/O，所以不存在反向路径；
+# **禁止在 `_EXT_LOCK` 临界区内调用任何会碰 panel 配置锁（cfg_lock）
 # 的函数**（load_config / save_config / _sync_runtime_config 等）。`tr._maybe_reload`
 # 今天只读 transparent 自己的配置文件，实测不碰 panel 锁；一旦它将来改读 panel
 # 配置，就是 `_EXT_LOCK → cfg_lock` 与反向的经典死锁，届时应先重构锁边界。
@@ -5991,14 +5998,25 @@ def api_ext_mask():
             # _emit_restore_summary 的 **source 摊成 payload 里一个孤立的 kind 键。
             # 入口维度改用事件字段 ingress（与 source 正交）。
             tr._new_session(sid)
-            masked = tr.mask_body(text, sid)
+            # 给本链路的语义识别开**总**预算（与代理链路同口径，见 transparent._ner_req_budget）。
+            # 本端点此前**完全没有**总预算：`ner_engine.CALL_BUDGET_S` 只管单次调用，
+            # 而一个请求体里有多少个字符串叶子是没有上限的 —— 大 body 会按秒级占住
+            # Flask 工作线程，而扩展侧 HTTP 超时更短，用户看到的就是「网页请求失败」。
+            with tr._ner_doc_budget(tr._ner_req_budget(len(text.encode("utf-8")))):
+                masked = tr.mask_body(text, sid)
+            # 本轮降级（有空叶子没走 NER）：随响应回给扩展，并写进下面的 MASK 事件
+            ner_skips = tr._ner_skips_of_this_round()
             s = tr.sessions[sid]
             items = tr._mask_event_items(sid)
+            if ner_skips:
+                s["ner_skips"] = ner_skips
             s["inflight"] = True
             _EXT_STATS["mask"] += 1              # += 是读改写三步，必须在锁内
         hit_count = len(s.get("last_hits") or set())
-        # 仅当真实命中敏感词并发生打码时才产生 MASK 事件，彻底消除大量 0 命中的空白噪声日志
-        if _ext_cfg().get("ext_record_events", True) and hit_count > 0:
+        # 仅当真实命中敏感词并发生打码时才产生 MASK 事件，彻底消除大量 0 命中的空白噪声日志。
+        # 例外：本轮发生语义识别降级时即使 0 命中也要记 —— 降级意味着「本该识别出人名/
+        # 机构/地址的文本没被识别」，而这恰好是最可能漏码的情形，不记就等于静默降级。
+        if _ext_cfg().get("ext_record_events", True) and (hit_count > 0 or ner_skips):
             # dialog / req_preview 落库前必须过凭据清洗（审计 B1）。
             # 这两个字段是**客户端原始请求体**，`items` 里凭据类只有 digest+preview，
             # 但同一行 payload 的 dialog 会把 API Key 原文一起写进 SQLite ——
@@ -6014,8 +6032,11 @@ def api_ext_mask():
                      items=items, host=str(data.get("host") or ""), path="/ext/mask",
                      dialog=scrubbed_dialog[:4000],
                      req_preview=scrubbed_dialog[:800],
-                     mask_ms=round((time.perf_counter() - t0) * 1000, 1))
-        return jsonify({"ok": True, "masked_text": masked, "sid": sid})
+                     mask_ms=round((time.perf_counter() - t0) * 1000, 1),
+                     **({"ner_truncated": True, "ner_skip_reasons": ner_skips}
+                        if ner_skips else {}))
+        return jsonify({"ok": True, "masked_text": masked, "sid": sid,
+                        **({"ner_skipped": ner_skips} if ner_skips else {})})
     except Exception as e:
         # (A) 类：引擎明确失败 → 无条件阻断（红线 2），无开关。
         # 失败路径**必须留一条日志**，否则用户只看到「网页全站请求失败」、事件页
@@ -6359,22 +6380,30 @@ def api_ext_mask_file():
             if sid not in tr.sessions:
                 tr._new_session(sid)
             masked_bytes, hit_count = mask_ooxml_bytes(raw_bytes, filename, sid, tr)
+            # 文件链路的总预算在 mask_ooxml_bytes 内部已开（_EXT_FILE_NER_BUDGET_S），
+            # 这里把它的降级结果取出来上报：预算超了必须看得见，否则用户以为整份文件都脱了。
+            ner_skips = tr._ner_skips_of_this_round()
             s = tr.sessions[sid]
             items = tr._mask_event_items(sid)
+            if ner_skips:
+                s["ner_skips"] = ner_skips
             s["inflight"] = True
             _EXT_STATS["mask"] += 1
 
-        if _ext_cfg().get("ext_record_events", True) and hit_count > 0:
+        if _ext_cfg().get("ext_record_events", True) and (hit_count > 0 or ner_skips):
             tr._emit("MASK", ingress="ext", sid=sid,
                      count=hit_count,
                      new_count=len(s.get("new_orig") or set()),
                      items=items, host=str(data.get("host") or ""), path="/ext/mask-file",
                      dialog=f"[文件脱敏: {filename}]",
                      req_preview=f"Uploaded document: {filename} ({len(raw_bytes)} bytes)",
-                     mask_ms=round((time.perf_counter() - t0) * 1000, 1))
+                     mask_ms=round((time.perf_counter() - t0) * 1000, 1),
+                     **({"ner_truncated": True, "ner_skip_reasons": ner_skips}
+                        if ner_skips else {}))
 
         masked_b64 = base64.b64encode(masked_bytes).decode("ascii")
-        return jsonify({"ok": True, "base64": masked_b64, "sid": sid, "hit_count": hit_count})
+        return jsonify({"ok": True, "base64": masked_b64, "sid": sid, "hit_count": hit_count,
+                        **({"ner_skipped": ner_skips} if ner_skips else {})})
     except Exception as e:
         try:
             _emit_log(f"[panel] ext mask-file 失败: {type(e).__name__}")
@@ -6576,11 +6605,16 @@ def api_demo_mask():
         return jsonify({"ok": False, "error": "文本过长（最多 4000 字）"}), 400
     try:
         import transparent as tr
-        tr._maybe_reload(force=True)
-        sid = f"demo-{secrets.token_hex(4)}"
-        tr._new_session(sid, source={"kind": "demo"})
-        masked = tr.mask(text, sid)
-        sess = tr.sessions.get(sid) or {}
+        # 持 `_EXT_LOCK`：本端点早于扩展桥接的锁约定，一直裸调 transparent。
+        # 它会 `_maybe_reload` + 建会话 + mask，即与代理链路、扩展桥接一起改
+        # transparent 的全局表（脱敏搬进专职线程后这件事才真正并发）。
+        with _EXT_LOCK:
+            tr._maybe_reload(force=True)
+            sid = f"demo-{secrets.token_hex(4)}"
+            tr._new_session(sid, source={"kind": "demo"})
+            masked = tr.mask(text, sid)
+            # 取副本：下面的展示组装在锁外做，不再依赖锁内的会话对象
+            sess = dict(tr.sessions.get(sid) or {})
         fwd = sess.get("fwd") or {}
         labels = sess.get("labels") or {}
         # 只返回占位符与标签，不回传原文敏感值
@@ -6591,9 +6625,10 @@ def api_demo_mask():
                 "label": labels.get(original) or "X",
                 "original_len": len(str(original or "")),
             })
-        # 清理 demo 会话，避免污染真实映射
+        # 清理 demo 会话，避免污染真实映射（与代理/扩展链路同一张会话表，同锁）
         try:
-            tr.sessions.pop(sid, None)
+            with _EXT_LOCK:
+                tr.sessions.pop(sid, None)
         except Exception:
             pass
         return jsonify({

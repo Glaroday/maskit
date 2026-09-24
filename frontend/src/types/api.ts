@@ -140,6 +140,14 @@ export interface ShieldEvent {
    * 它说明模型在改写输出格式，是「哪天彻底还原不回来」的前兆。
    */
   degraded?: number
+  /**
+   * 本轮语义识别（NER）是否发生降级：true = 有字符串叶子没走语义识别。
+   * **只在降级时后端才写这个键**（正常一轮没有它）；原因与条数见 ner_skip_reasons。
+   * MASK 与 RESTORE 两条事件都带（详情弹窗按 _detailSeq 回源 RESTORE）。
+   */
+  ner_truncated?: boolean
+  /** 降级明细：原因 → 本轮由此原因跳过的叶子数。键见 EventDetailDialog 的 NER_SKIP_LABELS。 */
+  ner_skip_reasons?: Record<string, number>
   items: SlimItem[] | EventItem[]
   dialog?: string
   dialog_req?: string

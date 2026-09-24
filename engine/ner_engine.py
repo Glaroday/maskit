@@ -36,13 +36,48 @@ _LAST_ERROR = ""
 # 单条文本长度上限：超过即跳过语义识别并留一次日志。宁可这一条不做识别，
 # 也不能让一条超长文本把整个代理冻住（单线程事件循环被占满 = 打字机卡死 +
 # 其他客户端超时）。实测 10 万字符单次调用要 69 秒。
-MAX_TEXT_CHARS = 2000
+# 单条文本长度上限（字）。
+#
+# ⚠️ 曾有 2000 字上限，超过就**整条不做 NER**（且只在全局日志里留一行）。实测用户
+# 真实流量里出现过 6208 字的单条正文（会话被拼成一个大字符串），那条里的中文人名
+# 全部明文上行 —— 比总预算更容易咬人，因为它是「整条不认」而不是「后面的不认」。
+#
+# 放到 20000 的理由：单次推理成本本身已由 `CALL_BUDGET_S`（每次调用 10s，见下）兜住，
+# `_decode_chunks` 也是分窗口跑的，所以长文本的代价是「拿部分实体」而不是失控。
+# 20000 字 ≈ 4s 冷推理，在请求级总预算（见 transparent._ner_req_budget）之内。
+MAX_TEXT_CHARS = 20000
 # 单次调用时间预算（秒）：长度在上限内但推理异常变慢时按时收手，只返回已收集实体。
-CALL_BUDGET_S = 2.0
+# 单次调用的推理时间上限（秒）。
+#
+# ⚠️ 它必须 ≥「一条长度达到 MAX_TEXT_CHARS 的文本能跑完」的耗时**并留出余量**，否则会
+# 形成一个很贵的稳态：超时 → `complete=False` → 负缓存**不写**（见 extract_entities
+# 里的注释）→ 下一轮同一段文本又从头冷推。
+# 实测（`tests/measure_ner_coverage.py`）：20000 字/60KB 需 5588ms；旧的 2.0s 上限下
+# 是每轮 2123/2013/2049ms 且缓存条数恒为 0。取 10.0s = 约 1.8 倍余量，因为余量不足时
+# 闸门之间就是不自洽的：6.0s 虽然在本机能跑完（5588ms），但机器稍慢或 CPU 受争就退回
+# 那个陷阱（实测单位成本 93µs/字节，与机器负载直接相关）。
+# 总量仍由请求级预算 `transparent._ner_req_budget` 兜住，单次上限放大更需它兜底。
+CALL_BUDGET_S = 10.0
 # 结果缓存：同一条文本在长会话里反复出现（系统提示词、重复的历史消息），
 # 不缓存就是每次重新推理。键是文本本身，容量固定（OrderedDict LRU），命中即零成本。
-_CACHE_MAX = 256
+#
+# ⚠️ 容量值得够**装下一条长会话的全部可识别叶子**（2026-09-24 事故）。
+# `mask()` 对每个字符串叶子各调一次，而客户端每轮都把整段历史重发；一条 300+ 条
+# 消息的会话叶子数会超过 256，LRU 于是每轮把上一轮的结果整批挤出 → 命中率≈0 →
+# 每轮都按冷启动全量重推（实测同一条 6.6MB 会话：冷启 24.7 秒，缓存装得下时第二轮
+# 只要 0.7 秒）。代价是一条长会话单个请求 20+ 秒，且脱敏是同步跑在 mitmproxy
+# 事件循环上的，整机连接一起冻结。
+# 字符总量上限是第二道闸：4096 条超长文本按条数算仍可吃下几十 MB 文本。
+_CACHE_MAX = 4096
+_CACHE_MAX_CHARS = 4_000_000
 _CACHE = OrderedDict()
+_CACHE_CHARS = 0
+# 缓存会被多个线程同时碰：代理链路的 `_MASK_POOL` 专职线程 + panel 扩展桥接的
+# Flask 线程（两者都会走到 `mask()` → `extract_entities`）。`_CACHE_CHARS` 的
+# 读-改-写、以及命中后的 `move_to_end`（查完再动）都不是原子的：前者会漂到与实际
+# 内容不符（计数偏高会让缓存被自己挤空，反而废掉这个修复），后者可能撞上并发的
+# `popitem` 抛 KeyError。锁只护这两处缓存操作，推理本身不持锁。
+_CACHE_LOCK = threading.Lock()
 
 
 def _cache_put(key, entities):
@@ -53,11 +88,19 @@ def _cache_put(key, entities):
     负缓存解决的是同源问题：无实体的长文本此前每次请求都重跑推理
     （≤2000 字约 500ms/次）。它与「没跑完」必须区分开，所以调用方只在
     `_decode_chunks` 报 complete 时才调这里。
+
+    淘汰按「条数超限 **或** 字符总量超限」两者任一触发，取更长历史给新增让路。
     """
-    _CACHE[key] = [dict(e) for e in entities]
-    _CACHE.move_to_end(key)
-    while len(_CACHE) > _CACHE_MAX:
-        _CACHE.popitem(last=False)
+    global _CACHE_CHARS
+    # 同键覆盖要先扣掉旧值，否则字符计数只增不减，缓存会被自己挤空。
+    with _CACHE_LOCK:
+        if _CACHE.pop(key, None) is not None:
+            _CACHE_CHARS -= len(key)
+        _CACHE[key] = [dict(e) for e in entities]
+        _CACHE_CHARS += len(key)
+        while _CACHE and (len(_CACHE) > _CACHE_MAX or _CACHE_CHARS > _CACHE_MAX_CHARS):
+            old, _ = _CACHE.popitem(last=False)
+            _CACHE_CHARS -= len(old)
 # 预算窗口的宽限（秒）：调用方漏调 end_budget（异常路径）时超过它就自愈，
 # 免得某个线程被永久停掉语义识别——Flask 会复用线程，永久停用等于静默降级。
 _BUDGET_LEAK_GRACE_S = 60.0
@@ -65,23 +108,72 @@ _BUDGET_LEAK_GRACE_S = 60.0
 _local = threading.local()
 # 跳过原因计数 + 「只记一次」集合：失败必须可见，但每个请求都刷日志同样不可接受。
 _SKIP_STATS = {}
+# 全局跳过计数的锁：蒙版专职线程与扩展链路的 Flask 线程会并发 read-modify-write
+# （此前无锁，极端情况下会丢计数）。只在真发生跳过时拿，不是热路径。
+_SKIP_LOCK = threading.Lock()
 _SKIP_LOGGED = set()
 
 
+def _bump_skip_stat(key):
+    """进程级跳过计数 +1（设置页读 status().skips）。"""
+    with _SKIP_LOCK:
+        _SKIP_STATS[key] = _SKIP_STATS.get(key, 0) + 1
+
+
+def _log_skip_once(key, msg):
+    """同类原因每个进程只写一条日志（长会话会把日志刷满）。"""
+    if key in _SKIP_LOGGED:
+        return
+    _SKIP_LOGGED.add(key)
+    try:
+        _logger.warning("[ner_engine] %s（同类问题后续不再重复记录）", msg)
+    except Exception:
+        pass
+
+
 def _warn_once(key, msg):
-    """记录一次可诊断的跳过原因（同类只写一条日志）。"""
-    _SKIP_STATS[key] = _SKIP_STATS.get(key, 0) + 1
-    if key not in _SKIP_LOGGED:
-        _SKIP_LOGGED.add(key)
-        try:
-            _logger.warning("[ner_engine] %s（同类问题后续不再重复记录）", msg)
-        except Exception:
-            pass
+    """记一次**进程级**跳过原因（计数 + 首条日志）。
+
+    ⚠️ 叶子级跳过请用 `_note_skip(key, msg)`：它同时记「按请求」那份账，而事件与
+    详情弹窗里的降级标记完全依赖那份（只调本函数 = 界面上永远是静默降级）。
+    """
+    _bump_skip_stat(key)
+    _log_skip_once(key, msg)
 
 
 def record_skip(key: str, msg: str = "") -> None:
-    """记录一次跳过原因并纳入 status().skips 统计（供外部如 transparent 的坐标降级调用）。"""
-    _warn_once(key, msg or f"NER 跳过: {key}")
+    """记录一次跳过原因（计数 + 首条日志 + 按请求记账），供外部如 transparent 的坐标降级调用。"""
+    _note_skip(key, msg or f"NER 跳过: {key}")
+
+
+def _note_skip(key: str, msg: str = "") -> None:
+    """记录一次**叶子级**跳过：按请求记账 + 进程级计数 +（给了 msg 时）首条日志。
+
+    按请求那份写在 threading.local 里，调用方（transparent 的脱敏管线跑在专职线程）
+    用 `request_skips()` 取出，写进 MASK/RESTORE 事件 —— 静默降级等于「以为开了、
+    其实没脱」。进程级那份供设置页展示。
+    """
+    try:
+        s = getattr(_local, "skips", None)
+        if s is None:
+            s = _local.skips = {}
+        s[key] = s.get(key, 0) + 1
+    except Exception:
+        pass
+    _bump_skip_stat(key)
+    if msg:
+        _log_skip_once(key, msg)
+
+
+def request_skips(reset: bool = False) -> Dict:
+    """取（或取完清空）本线程自上次 `begin_budget` 以来的跳过计数。
+
+    返回形如 `{"budget_exhausted": 3, "too_long": 1}`；空字典 = 本轮语义识别全程生效。
+    """
+    s = dict(getattr(_local, "skips", None) or {})
+    if reset:
+        _local.skips = {}
+    return s
 
 
 def begin_budget(seconds):
@@ -89,8 +181,10 @@ def begin_budget(seconds):
 
     期间「截止时间已过」等同于「预算耗尽」，extract_entities 直接跳过推理；
     必须由调用方配对调用 end_budget（transparent._ner_doc_budget 已封装）。
+    同时把本轮的跳过记账清零，供 `request_skips()` 如实上报。
     """
     _local.doc_active = True
+    _local.skips = {}
     # 不钳到 >=0：负值/0 用来表达「预算窗口已经过去」，便于测试与自愈判定
     _local.deadline = time.monotonic() + float(seconds)
 
@@ -188,6 +282,8 @@ def status() -> Dict:
         "max_text_chars": MAX_TEXT_CHARS,
         "call_budget_s": CALL_BUDGET_S,
         "cache_size": len(_CACHE),
+        "cache_max": _CACHE_MAX,
+        "cache_chars": _CACHE_CHARS,
         "skips": dict(_SKIP_STATS),
     }
 
@@ -286,7 +382,7 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
         except Exception as e:
             # 单块推理失败：记一次日志后收手，返回已收集的部分实体。
             # 曾完全静默 break，用户侧只表现为「部分文本没打码」。
-            _warn_once("infer_failed", f"推理异常，本段仅返回已识别结果：{type(e).__name__}: {e}")
+            _note_skip("infer_failed", f"推理异常，本段仅返回已识别结果：{type(e).__name__}: {e}")
             complete = False
             break
 
@@ -358,7 +454,7 @@ def _decode_chunks(text: str, deadline: float) -> Tuple[List[Dict], bool]:
         # 时间预算：超时就收手。必须是**块间**检查——单块推理无法中断，
         # 但只要不再开新块，耗时就不会继续线性膨胀。
         if time.monotonic() > deadline:
-            _warn_once("deadline", "达到单次推理时间预算，本次仅返回已识别结果")
+            _note_skip("deadline", "达到单次推理时间预算，本次仅返回已识别结果")
             complete = False
             break
         pos += STRIDE
@@ -382,23 +478,30 @@ def extract_entities(text: str) -> List[Dict]:
         return []
 
     if len(text) > MAX_TEXT_CHARS:
-        _warn_once("too_long",
+        _note_skip("too_long",
                    f"文本 {len(text)} 字超过 {MAX_TEXT_CHARS} 字上限，该条未做语义实体识别")
         return []
 
-    cached = _CACHE.get(text)
+    with _CACHE_LOCK:
+        cached = _CACHE.get(text)
+        if cached is not None:
+            _CACHE.move_to_end(text)
     if cached is not None:
-        _CACHE.move_to_end(text)
         return [dict(e) for e in cached]
 
     if not _init_ner():
+        _note_skip("model_unavailable")
         return []
 
     deadline = _current_deadline()
     if deadline is None:
-        _warn_once("budget_exhausted", "本次脱敏的语义识别总预算已耗尽，剩余文本未做实体识别")
+        _note_skip("budget_exhausted",
+                   "本次脱敏的语义识别总预算已耗尽，剩余文本未做实体识别")
         return []
 
+    # 单次调用超时（`deadline` 键）与推理异常（`infer_failed` 键）由 `_decode_chunks`
+    # 在发生处自己记账，这里**不要**再补一个笼统的键：同一个现象挂两个名字会让
+    # 设置页与弹窗各显示一半，且会把异常误报成超时。
     raw_entities, complete = _decode_chunks(text, deadline)
     if not raw_entities:
         # 负缓存（审计 M6 同源问题）：无实体的长文本此前**每次请求都重跑推理**
