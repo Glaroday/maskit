@@ -7435,11 +7435,17 @@ class MaskOffloadTests(unittest.TestCase):
         self.assertGreaterEqual(tr._NER_REQ_BUDGET_MAX_S, tr._NER_REQ_BUDGET_BASE_S)
 
     def test_real_too_long_skip_lands_in_the_mask_event(self):
-        """端到端（不用 mock）：真发生一次跳过，事件里必须看得见。
+        """端到端（不用 mock 跳过分账）：真发生一次跳过，事件里必须看得见。
 
         上面两条用例都是 mock `request_skips` 验证接线，只能证明「没断线」；这条走真实
         链路：引擎按请求记账 → 专职线程取回 → MASK 事件 → 待落库字段，任一段断掉都会红。
-        超长叶子在「无汉字短路」之后、模型初始化之前就计数，所以不需要语义模型。
+
+        ⚠️ 必须把 `is_ner_available` 固定为 True，否则本用例会变成**环境依赖**：
+        CI 上不带语义模型（`engine/models/` 是 gitignore 的），而 transparent 在调
+        `extract_entities` **之前**就有一道模型可用性前置检查 —— 模型缺失时它直接记
+        `model_missing` 返回，叶子根本到不了 `too_long`（实测：本地绿、CI 红，报
+        `{'model_missing': 1} != {'too_long': 1}`）。
+        而 `too_long` 在 `extract_entities` 内部排在模型初始化**之前**，本来就不依赖模型。
         """
         import ner_engine
         long_text = "系统提示词" * 4001          # 20005 字，超过单条上限
@@ -7452,7 +7458,8 @@ class MaskOffloadTests(unittest.TestCase):
         old = tr.NER_ENABLED
         tr.NER_ENABLED = True
         try:
-            with mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))), \
+            with mock.patch.object(ner_engine, "is_ner_available", lambda: True), \
+                 mock.patch.object(tr, "_emit", lambda typ, **kw: events.append((typ, kw))), \
                  mock.patch.object(tr, "_maybe_reload", lambda force=False: None):
                 _drive_request(flow)
         finally:
