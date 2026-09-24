@@ -85,6 +85,10 @@ function compareSemver(a: string, b: string): number {
  * （见 engine/panel.py `security_headers`）。CSP 拦截在 Firefox 里抛的正是
  * `TypeError: NetworkError when attempting to fetch resource.`，
  * 与真的网络不通表现一致，排查时容易误判成「网络问题」。
+ *
+ * 报错文案只说「更新服务」不写 GitHub：这条路径失败后还会退到服务端探测，
+ * 两个源都可能失败。写死 "GitHub API HTTP xxx" 会在服务端失败时把人引向
+ * 错误方向——实测踩过这个坑（请求压根没到 GitHub，文案却说是 GitHub 的问题）。
  */
 async function fetchLatestFromGitHub(): Promise<{ version?: string; notes?: string; pub_date?: string }> {
   const controller = new AbortController()
@@ -94,7 +98,7 @@ async function fetchLatestFromGitHub(): Promise<{ version?: string; notes?: stri
       headers: { Accept: 'application/vnd.github.v3+json' },
       signal: controller.signal,
     })
-    if (!resp.ok) throw new Error(`GitHub API HTTP ${resp.status}`)
+    if (!resp.ok) throw new Error(`更新服务返回 HTTP ${resp.status}`)
     const d = (await resp.json()) as { tag_name?: string; body?: string; published_at?: string }
     return { version: d.tag_name, notes: d.body, pub_date: d.published_at }
   } finally {
